@@ -89,6 +89,56 @@ const startFunctionFixture = async (streams = functionSingleStreams) => {
   };
 };
 
+const supportedCapabilities = { functionTools: true, customTools: true, parallelToolCalls: true };
+
+const startCustomFixture = async () => {
+  const requests: unknown[] = [];
+  const streams = [
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell","type":"custom","custom":{"name":"shell","input":"ls"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+    [
+      'data: {"choices":[{"delta":{"content":"done"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  ];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end((streams[requests.length - 1] ?? ['data: [DONE]\r\n\r\n']).join(''));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
+const startRejectedFixture = async () => {
+  const requests: unknown[] = [];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(400, { 'content-type': 'application/json' });
+    response.end('{"error":"invalid tool"}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
 test('rejects invalid startup configuration', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   try {
@@ -96,7 +146,7 @@ test('rejects invalid startup configuration', async () => {
     await assert.rejects(() => startBridge({ apiKey: 'bridge-key', upstreams: [], statePath: join(dir, 'state.db') }), /Upstream Pool/);
     await assert.rejects(() => startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: 'http://127.0.0.1:1', apiKey: 'upstream-key' }],
+      upstreams: [{ baseUrl: 'http://127.0.0.1:1', apiKey: 'upstream-key', capabilities: supportedCapabilities }],
       statePath: dir,
     }), /State Store/);
   } finally {
@@ -111,7 +161,7 @@ test('bridges a text stream into ordered Responses SSE', async () => {
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
       statePath: join(dir, 'state.db'),
     });
     const unauthorized = await fetch(`${bridge.url}/v1/responses`, {
@@ -166,7 +216,7 @@ test('function-single Compatibility Fixture continues a Response Chain', async (
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
       statePath: join(dir, 'state.db'),
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
@@ -225,7 +275,7 @@ test('function-parallel Compatibility Fixture preserves call order in a Response
   ];
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath: join(dir, 'state.db'),
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -258,7 +308,7 @@ test('function-parallel Compatibility Fixture preserves call order in a Response
         ],
       },
       {
-        model: 'gpt-test', stream: true, stream_options: { include_usage: true },
+        model: 'gpt-test', stream: true, stream_options: { include_usage: true }, parallel_tool_calls: true,
         messages: [
           { role: 'user', content: 'Weather and time?' },
           { role: 'assistant', tool_calls: [
@@ -287,7 +337,7 @@ test('keeps mixed text and Function Tool SSE events aligned to Output Item order
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath: join(dir, 'state.db'),
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -309,7 +359,7 @@ test('orders out-of-order Function Tool chunks by their Chat call index', async 
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath: join(dir, 'state.db'),
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -338,7 +388,7 @@ test('rejects a missing Response Chain ancestor without creating a response', as
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath: join(dir, 'state.db'),
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -380,7 +430,7 @@ test('rejects a legacy Response Chain ancestor without saved context', async () 
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath,
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath,
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -412,7 +462,7 @@ test('rejects an incomplete Response Chain ancestor', async () => {
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath,
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath,
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -433,7 +483,7 @@ test('rejects Function Tool output that is not associated with the Response Chai
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath: join(dir, 'state.db'),
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -451,7 +501,7 @@ test('rejects Function Tool output that is not associated with the Response Chai
     assert.equal(second.status, 400);
     assert.deepEqual(await second.json(), {
       error: {
-        message: 'Function Tool call was not found', type: 'invalid_request_error', param: null,
+        message: 'Tool call was not found', type: 'invalid_request_error', param: null,
         code: 'function_call_not_found',
       },
     });
@@ -470,7 +520,7 @@ test('rejects a delayed Function Tool result from an earlier Response', async ()
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key' }], statePath: join(dir, 'state.db'),
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -496,6 +546,148 @@ test('rejects a delayed Function Tool result from an earlier Response', async ()
   } finally {
     await bridge?.close();
     await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('custom-supported Compatibility Fixture selects a native Custom Tool upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const incompatible = await startCompatibilityFixture();
+  const compatible = await startCustomFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: incompatible.url, apiKey: 'upstream-key', capabilities: { functionTools: true } },
+        { baseUrl: compatible.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'List files.', tools: [{ type: 'custom', name: 'shell', description: 'Runs shell' }] }),
+    });
+    assert.equal(first.status, 200);
+    const firstEvents = sseTypes(await first.text()) as unknown as Array<{ type: string; item?: { type: string; call_id: string; input: string }; response?: { id: string } }>;
+    const call = firstEvents.find((event) => event.type === 'response.output_item.done')?.item;
+    assert.deepEqual(call, { id: 'call_shell', type: 'custom_tool_call', status: 'completed', call_id: 'call_shell', name: 'shell', input: 'ls' });
+    assert.equal(incompatible.requests.length, 0);
+    assert.deepEqual(compatible.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'List files.' }],
+      tools: [{ type: 'custom', custom: { name: 'shell', description: 'Runs shell' } }],
+    });
+
+    const responseId = firstEvents.find((event) => event.type === 'response.completed')?.response?.id;
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, previous_response_id: responseId,
+        input: [{ type: 'custom_tool_call_output', call_id: 'call_shell', output: 'file.txt' }],
+      }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual(compatible.requests[1], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'user', content: 'List files.' },
+        { role: 'assistant', tool_calls: [{ id: 'call_shell', type: 'custom', custom: { name: 'shell', input: 'ls' } }] },
+        { role: 'tool', tool_call_id: 'call_shell', content: 'file.txt' },
+      ],
+      tools: [{ type: 'custom', custom: { name: 'shell', description: 'Runs shell' } }],
+    });
+  } finally {
+    await bridge?.close();
+    await incompatible.close();
+    await compatible.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('custom-incompatible Compatibility Fixture rejects before contacting an upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'List files.', tools: [{ type: 'custom', name: 'shell' }] }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: { message: 'No upstream supports the requested capabilities', type: 'invalid_request_error', param: null, code: 'unsupported_capabilities' },
+    });
+    assert.deepEqual(upstream.requests, []);
+    assert.deepEqual(bridge.state.responses(), []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('parallel-incompatible Compatibility Fixture rejects before contacting an upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startFunctionFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, customTools: true, parallelToolCalls: false } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Weather?', parallel_tool_calls: true, tools: [{ type: 'function', name: 'weather' }] }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: { message: 'No upstream supports the requested capabilities', type: 'invalid_request_error', param: null, code: 'unsupported_capabilities' },
+    });
+    assert.deepEqual(upstream.requests, []);
+    assert.deepEqual(bridge.state.responses(), []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('declared-capability-client-4xx Compatibility Fixture does not switch upstreams', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const rejected = await startRejectedFixture();
+  const fallback = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: rejected.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+        { baseUrl: fallback.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+    });
+    assert.equal(rejected.requests.length, 1);
+    assert.equal(fallback.requests.length, 0);
+    assert.deepEqual(bridge.state.responses(), []);
+  } finally {
+    await bridge?.close();
+    await rejected.close();
+    await fallback.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
