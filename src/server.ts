@@ -2,20 +2,29 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
-type Upstream = { baseUrl: string; apiKey: string };
+type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
+type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
 type BridgeOptions = { apiKey: string; upstreams: Upstream[]; statePath: string; port?: number };
 type StoredEvent = { sequence: number; type: string };
 type ResponseEvent = { type: string; [key: string]: unknown };
 type FunctionTool = { type: 'function'; name: string; description?: string; parameters?: unknown };
-type InputItem = { type: 'message'; role: 'user'; content: string } | { type: 'function_call_output'; call_id: string; output: string };
+type CustomTool = { type: 'custom'; name: string; description?: string; format?: unknown };
+type Tool = FunctionTool | CustomTool;
+type FunctionToolOutput = { type: 'function_call_output'; call_id: string; output: string };
+type CustomToolOutput = { type: 'custom_tool_call_output'; call_id: string; output: string };
+type InputItem = { type: 'message'; role: 'user'; content: string } | FunctionToolOutput | CustomToolOutput;
 type OutputItem =
   | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
-  | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string };
-type StoredResponse = { id: string; parentId?: string; model: string; input: InputItem[]; tools: FunctionTool[]; output: OutputItem[] };
+  | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string }
+  | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string };
+type StoredResponse = { id: string; parentId?: string; model: string; input: InputItem[]; tools: Tool[]; parallelToolCalls: boolean; output: OutputItem[] };
+type ChatToolCall =
+  | { id: string; type: 'function'; function: { name: string; arguments: string } }
+  | { id: string; type: 'custom'; custom: { name: string; input: string } };
 type ChatMessage =
   | { role: 'user'; content: string }
   | { role: 'tool'; tool_call_id: string; content: string }
-  | { role: 'assistant'; content?: string; tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> };
+  | { role: 'assistant'; content?: string; tool_calls?: ChatToolCall[] };
 
 class StateStore {
   #db: DatabaseSync;
@@ -31,6 +40,7 @@ class StateStore {
           model TEXT NOT NULL DEFAULT 'gpt-4.1',
           input_json TEXT NOT NULL DEFAULT '[]',
           tools_json TEXT NOT NULL DEFAULT '[]',
+          parallel_tool_calls INTEGER NOT NULL DEFAULT 0,
           context_complete INTEGER NOT NULL DEFAULT 1,
           output_text TEXT NOT NULL DEFAULT ''
         ) STRICT;
@@ -51,6 +61,7 @@ class StateStore {
       this.#addColumn("model TEXT NOT NULL DEFAULT 'gpt-4.1'");
       this.#addColumn("input_json TEXT NOT NULL DEFAULT '[]'");
       this.#addColumn("tools_json TEXT NOT NULL DEFAULT '[]'");
+      this.#addColumn('parallel_tool_calls INTEGER NOT NULL DEFAULT 0');
       this.#addColumn('context_complete INTEGER NOT NULL DEFAULT 0');
     } catch (error) {
       throw new Error(`State Store is not writable: ${error instanceof Error ? error.message : String(error)}`);
@@ -65,8 +76,8 @@ class StateStore {
 
   createResponse(response: Omit<StoredResponse, 'output'>) {
     this.#db.prepare(
-      'INSERT INTO responses (id, parent_id, status, model, input_json, tools_json, context_complete) VALUES (?, ?, ?, ?, ?, ?, 1)',
-    ).run(response.id, response.parentId ?? null, 'in_progress', response.model, JSON.stringify(response.input), JSON.stringify(response.tools));
+      'INSERT INTO responses (id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, context_complete) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+    ).run(response.id, response.parentId ?? null, 'in_progress', response.model, JSON.stringify(response.input), JSON.stringify(response.tools), Number(response.parallelToolCalls));
   }
 
   appendOutputItem(responseId: string, outputIndex: number, item: OutputItem) {
@@ -103,7 +114,7 @@ class StateStore {
       if (seen.has(next)) throw new Error('Response Chain is cyclic');
       seen.add(next);
       const row: Record<string, unknown> | undefined = this.#db.prepare(
-        'SELECT id, parent_id, status, model, input_json, tools_json, context_complete FROM responses WHERE id = ?',
+        'SELECT id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, context_complete FROM responses WHERE id = ?',
       ).get(next) as Record<string, unknown> | undefined;
       if (!row) throw new Error('Previous response was not found');
       if (Number(row.context_complete) !== 1) throw new Error('Previous response was not found');
@@ -116,7 +127,8 @@ class StateStore {
         parentId: row.parent_id === null ? undefined : String(row.parent_id),
         model: String(row.model),
         input: JSON.parse(String(row.input_json)) as InputItem[],
-        tools: JSON.parse(String(row.tools_json)) as FunctionTool[],
+        tools: JSON.parse(String(row.tools_json)) as Tool[],
+        parallelToolCalls: Boolean(row.parallel_tool_calls),
         output,
       });
       next = row.parent_id === null ? undefined : String(row.parent_id);
@@ -161,52 +173,67 @@ const normalizeInput = (input: unknown): InputItem[] | undefined => {
   for (const item of input) {
     if (!item || typeof item !== 'object') return undefined;
     const value = item as Record<string, unknown>;
-    if (value.type !== 'function_call_output' || typeof value.call_id !== 'string' || typeof value.output !== 'string') return undefined;
-    items.push({ type: 'function_call_output', call_id: value.call_id, output: value.output });
+    if ((value.type !== 'function_call_output' && value.type !== 'custom_tool_call_output') || typeof value.call_id !== 'string' || typeof value.output !== 'string') return undefined;
+    items.push({ type: value.type, call_id: value.call_id, output: value.output });
   }
   return items;
 };
 
-const normalizeTools = (tools: unknown): FunctionTool[] | undefined => {
+const normalizeTools = (tools: unknown): Tool[] | undefined => {
   if (tools === undefined) return undefined;
   if (!Array.isArray(tools)) return undefined;
-  const normalized: FunctionTool[] = [];
+  const normalized: Tool[] = [];
   for (const tool of tools) {
     if (!tool || typeof tool !== 'object') return undefined;
     const value = tool as Record<string, unknown>;
-    if (value.type !== 'function' || typeof value.name !== 'string' || value.name.length === 0) return undefined;
+    if ((value.type !== 'function' && value.type !== 'custom') || typeof value.name !== 'string' || value.name.length === 0) return undefined;
     if (value.description !== undefined && typeof value.description !== 'string') return undefined;
-    normalized.push({
-      type: 'function', name: value.name,
-      ...(typeof value.description === 'string' ? { description: value.description } : {}),
-      ...(value.parameters !== undefined ? { parameters: value.parameters } : {}),
-    });
+    if (value.type === 'function') {
+      normalized.push({
+        type: 'function', name: value.name,
+        ...(typeof value.description === 'string' ? { description: value.description } : {}),
+        ...(value.parameters !== undefined ? { parameters: value.parameters } : {}),
+      });
+    } else {
+      normalized.push({
+        type: 'custom', name: value.name,
+        ...(typeof value.description === 'string' ? { description: value.description } : {}),
+        ...(value.format === undefined ? {} : { format: value.format }),
+      });
+    }
   }
   return normalized;
 };
 
-const toChatTools = (tools: FunctionTool[]) => tools.map((tool) => ({
+const toChatTools = (tools: Tool[]) => tools.map((tool) => tool.type === 'function' ? {
   type: 'function' as const,
   function: {
     name: tool.name,
     ...(tool.description === undefined ? {} : { description: tool.description }),
     ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
   },
-}));
+} : {
+  type: 'custom' as const,
+  custom: {
+    name: tool.name,
+    ...(tool.description === undefined ? {} : { description: tool.description }),
+    ...(tool.format === undefined ? {} : { format: tool.format }),
+  },
+});
 
 const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   const messages: ChatMessage[] = response.input.map((item) => item.type === 'message'
     ? { role: 'user', content: item.content }
     : { role: 'tool', tool_call_id: item.call_id, content: item.output });
-  const functionCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' }> => item.type === 'function_call');
+  const toolCalls = response.output.filter((item): item is Exclude<OutputItem, { type: 'message' }> => item.type !== 'message');
   const text = response.output.find((item): item is Extract<OutputItem, { type: 'message' }> => item.type === 'message');
-  if (text || functionCalls.length) {
+  if (text || toolCalls.length) {
     messages.push({
       role: 'assistant',
       ...(text ? { content: text.content.map((part) => part.text).join('') } : {}),
-      ...(functionCalls.length ? { tool_calls: functionCalls.map((item) => ({
-        id: item.call_id, type: 'function' as const, function: { name: item.name, arguments: item.arguments },
-      })) } : {}),
+      ...(toolCalls.length ? { tool_calls: toolCalls.map((item): ChatToolCall => item.type === 'function_call'
+        ? { id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }
+        : { id: item.call_id, type: 'custom', custom: { name: item.name, input: item.input } }) } : {}),
     });
   }
   return messages;
@@ -246,6 +273,9 @@ const assertOptions = (options: BridgeOptions) => {
   for (const upstream of options.upstreams) {
     try { new URL(upstream.baseUrl); } catch { throw new Error('Upstream Pool contains an invalid URL'); }
     if (!upstream.apiKey.trim()) throw new Error('Upstream Pool contains an empty API key');
+    if (upstream.capabilities && Object.values(upstream.capabilities).some((value) => typeof value !== 'boolean')) {
+      throw new Error('Upstream Pool contains an invalid capability profile');
+    }
   }
 };
 
@@ -273,12 +303,12 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       }
       const input = normalizeInput(payload.input);
       if (!input) {
-        sendError(response, 400, 'Only text and Function Tool output input are supported', 'unsupported_input');
+        sendError(response, 400, 'Only text and Tool output input are supported', 'unsupported_input');
         return;
       }
       const tools = normalizeTools(payload.tools);
       if (payload.tools !== undefined && !tools) {
-        sendError(response, 400, 'Only Function Tools are supported', 'unsupported_tools');
+        sendError(response, 400, 'Only Function and Custom Tools are supported', 'unsupported_tools');
         return;
       }
       if (payload.previous_response_id !== undefined && (typeof payload.previous_response_id !== 'string' || !payload.previous_response_id)) {
@@ -286,7 +316,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         return;
       }
       if (input.some((item) => item.type === 'function_call_output') && !payload.previous_response_id) {
-        sendError(response, 400, 'Function Tool output requires previous_response_id', 'missing_previous_response_id');
+        sendError(response, 400, 'Tool output requires previous_response_id', 'missing_previous_response_id');
         return;
       }
 
@@ -295,28 +325,45 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         try { ancestors = state.chain(payload.previous_response_id); }
         catch { sendError(response, 400, 'Previous response was not found', 'previous_response_not_found'); return; }
       }
-      const callIds = new Set((ancestors.at(-1)?.output ?? [])
-        .filter((item): item is Extract<OutputItem, { type: 'function_call' }> => item.type === 'function_call')
-        .map((item) => item.call_id));
-      if (input.some((item) => item.type === 'function_call_output' && !callIds.has(item.call_id))) {
-        sendError(response, 400, 'Function Tool call was not found', 'function_call_not_found');
+      const callKinds = new Map((ancestors.at(-1)?.output ?? [])
+        .filter((item): item is Exclude<OutputItem, { type: 'message' }> => item.type !== 'message')
+        .map((item) => [item.call_id, item.type]));
+      if (input.some((item) => {
+        const kind = callKinds.get(item.type === 'message' ? '' : item.call_id);
+        return item.type !== 'message' && kind !== (item.type === 'function_call_output' ? 'function_call' : 'custom_tool_call');
+      })) {
+        sendError(response, 400, 'Tool call was not found', 'function_call_not_found');
         return;
       }
       const effectiveTools = tools ?? [...ancestors].reverse().find((item) => item.tools.length > 0)?.tools ?? [];
+      const chainTools = [...ancestors.flatMap((item) => item.tools), ...effectiveTools];
+      const needs = {
+        functionTools: chainTools.some((tool) => tool.type === 'function'),
+        customTools: chainTools.some((tool) => tool.type === 'custom'),
+        parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
+      };
+      const upstream = options.upstreams.find(({ capabilities }) => (
+        (!needs.functionTools || capabilities?.functionTools === true)
+        && (!needs.customTools || capabilities?.customTools === true)
+        && (!needs.parallelToolCalls || capabilities?.parallelToolCalls === true)
+      ));
+      if (!upstream) {
+        sendError(response, 400, 'No upstream supports the requested capabilities', 'unsupported_capabilities');
+        return;
+      }
       const messages: ChatMessage[] = [
         ...ancestors.flatMap(toChatMessages),
-        ...toChatMessages({ id: '', model: '', input, tools: [], output: [] }),
+        ...toChatMessages({ id: '', model: '', input, tools: [], parallelToolCalls: false, output: [] }),
       ];
       const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
       const upstreamBody: Record<string, unknown> = {
         model, stream: true, stream_options: { include_usage: true }, messages,
         ...(effectiveTools.length ? { tools: toChatTools(effectiveTools) } : {}),
-        ...(typeof payload.parallel_tool_calls === 'boolean' ? { parallel_tool_calls: payload.parallel_tool_calls } : {}),
+        ...(needs.parallelToolCalls ? { parallel_tool_calls: true } : {}),
       };
 
       let upstreamResponse: Response;
       try {
-        const upstream = options.upstreams[0];
         upstreamResponse = await fetch(new URL('/v1/chat/completions', upstream.baseUrl), {
           method: 'POST',
           headers: { authorization: `Bearer ${upstream.apiKey}`, 'content-type': 'application/json', accept: 'text/event-stream' },
@@ -326,13 +373,19 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         sendError(response, 503, 'Upstream unavailable', 'upstream_unavailable');
         return;
       }
+      if (upstreamResponse.status >= 400 && upstreamResponse.status < 500) {
+        sendError(response, 400, 'Upstream rejected request', 'upstream_rejected');
+        return;
+      }
       if (!upstreamResponse.ok || !upstreamResponse.body) {
         sendError(response, 503, 'Upstream unavailable', 'upstream_unavailable');
         return;
       }
 
       const id = `resp_${randomUUID().replaceAll('-', '')}`;
-      state.createResponse({ id, parentId: payload.previous_response_id, model, input, tools: tools ?? [] });
+      state.createResponse({
+        id, parentId: payload.previous_response_id, model, input, tools: tools ?? [], parallelToolCalls: payload.parallel_tool_calls === true,
+      });
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       sse(response, state, id, { type: 'response.created', response: { id, object: 'response', status: 'in_progress', model, output: [] } });
 
@@ -340,11 +393,11 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       let completed = false;
       let nextOutputIndex = 0;
       let textOutputIndex: number | undefined;
-      const calls = new Map<number, { id?: string; name?: string; arguments: string; outputIndex: number }>();
+      const calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
       try {
         for await (const data of parseUpstream(upstreamResponse.body)) {
           if (data === '[DONE]') { completed = true; break; }
-          const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown; tool_calls?: Array<{ index?: unknown; id?: unknown; function?: { name?: unknown; arguments?: unknown } }> } }> };
+          const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown; tool_calls?: Array<{ index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown }; custom?: { name?: unknown; input?: unknown } }> } }> };
           const delta = chunk.choices?.[0]?.delta;
           if (typeof delta?.content === 'string' && delta.content.length) {
             if (textOutputIndex === undefined) textOutputIndex = nextOutputIndex++;
@@ -352,18 +405,23 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
             sse(response, state, id, { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: textOutputIndex, content_index: 0, delta: delta.content });
           }
           for (const call of delta?.tool_calls ?? []) {
-            if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Function Tool call');
+            if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
+            if (call.type !== undefined && call.type !== 'function' && call.type !== 'custom') throw new Error('Invalid upstream Tool call');
+            const kind = call.type === 'custom' ? 'custom' : 'function';
             const current = calls.get(Number(call.index)) ?? {
-              arguments: '', outputIndex: Number(call.index) + (textOutputIndex === undefined ? 0 : 1),
+              kind, input: '', outputIndex: Number(call.index) + (textOutputIndex === undefined ? 0 : 1),
             };
+            if (current.kind !== kind) throw new Error('Inconsistent upstream Tool call');
             nextOutputIndex = Math.max(nextOutputIndex, current.outputIndex + 1);
             if (typeof call.id === 'string') current.id = call.id;
-            if (typeof call.function?.name === 'string') current.name = call.function.name;
-            if (typeof call.function?.arguments === 'string') {
-              current.arguments += call.function.arguments;
+            const name = current.kind === 'function' ? call.function?.name : call.custom?.name;
+            const inputDelta = current.kind === 'function' ? call.function?.arguments : call.custom?.input;
+            if (typeof name === 'string') current.name = name;
+            if (typeof inputDelta === 'string') {
+              current.input += inputDelta;
               sse(response, state, id, {
-                type: 'response.function_call_arguments.delta', item_id: current.id ?? `fc_${Number(call.index)}`,
-                output_index: current.outputIndex, delta: call.function.arguments,
+                type: current.kind === 'function' ? 'response.function_call_arguments.delta' : 'response.custom_tool_call_input.delta',
+                item_id: current.id ?? `tc_${Number(call.index)}`, output_index: current.outputIndex, delta: inputDelta,
               });
             }
             calls.set(Number(call.index), current);
@@ -376,12 +434,16 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           item: { id: `msg_${id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: outputText }] },
         });
         for (const [index, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
-          if (!call.id || !call.name) throw new Error('Incomplete upstream Function Tool call');
+          if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
           orderedOutput.push({
             index: call.outputIndex,
-            item: { id: call.id, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.arguments },
+            item: call.kind === 'function'
+              ? { id: call.id, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.input }
+              : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: call.input },
           });
-          sse(response, state, id, { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.arguments });
+          sse(response, state, id, call.kind === 'function'
+            ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
+            : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input });
         }
         const output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
         for (const [index, item] of output.entries()) {
