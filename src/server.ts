@@ -21,17 +21,18 @@ export type BridgeOptions = {
 };
 type StoredEvent = { sequence: number; type: string };
 type ResponseEvent = { type: string; [key: string]: unknown };
-type FunctionTool = { type: 'function'; name: string; description?: string; parameters?: unknown };
+type FunctionTool = { type: 'function'; name: string; description?: string; parameters?: unknown; strict?: boolean };
 type CustomTool = { type: 'custom'; name: string; description?: string; format?: unknown };
 type WebSearchTool = { type: 'web_search' };
-type Tool = FunctionTool | CustomTool | WebSearchTool;
+type NamespaceTool = { type: 'namespace'; name: string; description: string; tools: FunctionTool[] };
+type Tool = FunctionTool | CustomTool | WebSearchTool | NamespaceTool;
 type FunctionToolOutput = { type: 'function_call_output'; call_id: string; output: string };
 type CustomToolOutput = { type: 'custom_tool_call_output'; call_id: string; output: string };
 type InputMessage = { type: 'message'; role: 'user' | 'developer'; content: string };
 type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput;
 type OutputItem =
   | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
-  | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string }
+  | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string; namespace?: string }
   | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string }
   | { id: string; type: 'web_search_call'; status: string; [key: string]: unknown };
 type NativeUpstreamMapping = { baseUrl: string; identity: string; responseId: string };
@@ -569,6 +570,21 @@ const normalizeInput = (input: unknown): InputItem[] | undefined => {
   return items;
 };
 
+const TOOL_NAME_MAX = 64;
+const ALIAS_HASH_LEN = 8;
+
+const normalizeFunctionTool = (value: Record<string, unknown>): FunctionTool | undefined => {
+  if (typeof value.name !== 'string' || value.name.length === 0) return undefined;
+  if (value.description !== undefined && typeof value.description !== 'string') return undefined;
+  if (value.strict !== undefined && typeof value.strict !== 'boolean') return undefined;
+  return {
+    type: 'function', name: value.name,
+    ...(typeof value.description === 'string' ? { description: value.description } : {}),
+    ...(value.parameters !== undefined ? { parameters: value.parameters } : {}),
+    ...(typeof value.strict === 'boolean' ? { strict: value.strict } : {}),
+  };
+};
+
 const normalizeTools = (tools: unknown): Tool[] | undefined => {
   if (tools === undefined) return undefined;
   if (!Array.isArray(tools)) return undefined;
@@ -580,14 +596,31 @@ const normalizeTools = (tools: unknown): Tool[] | undefined => {
       normalized.push({ type: 'web_search' });
       continue;
     }
+    if (value.type === 'namespace') {
+      if (typeof value.name !== 'string' || value.name.length === 0) return undefined;
+      if (typeof value.description !== 'string') return undefined;
+      if (!Array.isArray(value.tools)) return undefined;
+      const children: FunctionTool[] = [];
+      const seenChildren = new Set<string>();
+      for (const child of value.tools) {
+        if (!child || typeof child !== 'object') return undefined;
+        const childValue = child as Record<string, unknown>;
+        if (childValue.type !== 'function') return undefined;
+        const normalizedChild = normalizeFunctionTool(childValue);
+        if (!normalizedChild) return undefined;
+        if (seenChildren.has(normalizedChild.name)) return undefined;
+        seenChildren.add(normalizedChild.name);
+        children.push(normalizedChild);
+      }
+      normalized.push({ type: 'namespace', name: value.name, description: value.description, tools: children });
+      continue;
+    }
     if ((value.type !== 'function' && value.type !== 'custom') || typeof value.name !== 'string' || value.name.length === 0) return undefined;
     if (value.description !== undefined && typeof value.description !== 'string') return undefined;
     if (value.type === 'function') {
-      normalized.push({
-        type: 'function', name: value.name,
-        ...(typeof value.description === 'string' ? { description: value.description } : {}),
-        ...(value.parameters !== undefined ? { parameters: value.parameters } : {}),
-      });
+      const normalizedFunction = normalizeFunctionTool(value);
+      if (!normalizedFunction) return undefined;
+      normalized.push(normalizedFunction);
     } else {
       normalized.push({
         type: 'custom', name: value.name,
@@ -599,25 +632,110 @@ const normalizeTools = (tools: unknown): Tool[] | undefined => {
   return normalized;
 };
 
-const toChatTools = (tools: Tool[]) => tools.filter((tool): tool is FunctionTool | CustomTool => tool.type !== 'web_search').map((tool) => tool.type === 'function' ? {
-  type: 'function' as const,
-  function: {
-    name: tool.name,
-    ...(tool.description === undefined ? {} : { description: tool.description }),
-    ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
-  },
-} : {
-  type: 'custom' as const,
-  custom: {
-    name: tool.name,
-    ...(tool.description === undefined ? {} : { description: tool.description }),
-    ...(tool.format === undefined ? {} : { format: tool.format }),
-  },
-});
+const sanitizeToolNamePart = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+const namespaceToolAlias = (namespace: string, name: string, reserved: Set<string>) => {
+  const hash = createHash('sha256').update(`${namespace}\0${name}`).digest('hex').slice(0, ALIAS_HASH_LEN);
+  const readable = sanitizeToolNamePart(`${namespace}_${name}`);
+  const maxPrefix = TOOL_NAME_MAX - 1 - hash.length;
+  let prefix = readable.slice(0, Math.max(maxPrefix, 0)).replace(/_+$/g, '');
+  if (!prefix || !/^[a-zA-Z0-9]/.test(prefix)) prefix = `ns_${prefix}`.slice(0, Math.max(maxPrefix, 2));
+  let alias = `${prefix}_${hash}`.slice(0, TOOL_NAME_MAX);
+  let n = 0;
+  while (reserved.has(alias)) {
+    n += 1;
+    const suffix = `_${hash}${n}`;
+    alias = `${prefix.slice(0, Math.max(TOOL_NAME_MAX - suffix.length, 1))}${suffix}`.slice(0, TOOL_NAME_MAX);
+    if (n > 1000) throw new Error('Tool Namespace alias conflict');
+  }
+  return alias;
+};
+
+const buildNamespaceAliasMaps = (tools: Tool[]) => {
+  const reserved = new Set<string>();
+  for (const tool of tools) {
+    if (tool.type === 'function' || tool.type === 'custom') reserved.add(tool.name);
+  }
+  const aliasToRef = new Map<string, { name: string; namespace: string }>();
+  const refToAlias = new Map<string, string>();
+  for (const tool of tools) {
+    if (tool.type !== 'namespace') continue;
+    for (const child of tool.tools) {
+      const key = `${tool.name}\0${child.name}`;
+      if (refToAlias.has(key)) throw new Error('Tool Namespace alias conflict');
+      const alias = namespaceToolAlias(tool.name, child.name, reserved);
+      reserved.add(alias);
+      aliasToRef.set(alias, { name: child.name, namespace: tool.name });
+      refToAlias.set(key, alias);
+    }
+  }
+  return { aliasToRef, refToAlias };
+};
+
+const toChatTools = (tools: Tool[]) => {
+  const { refToAlias } = buildNamespaceAliasMaps(tools);
+  const chatTools: Array<
+    | { type: 'function'; function: { name: string; description?: string; parameters?: unknown; strict?: boolean } }
+    | { type: 'custom'; custom: { name: string; description?: string; format?: unknown } }
+  > = [];
+  for (const tool of tools) {
+    if (tool.type === 'web_search') continue;
+    if (tool.type === 'namespace') {
+      for (const child of tool.tools) {
+        const alias = refToAlias.get(`${tool.name}\0${child.name}`);
+        if (!alias) throw new Error('Tool Namespace alias missing');
+        chatTools.push({
+          type: 'function',
+          function: {
+            name: alias,
+            ...(child.description === undefined ? {} : { description: child.description }),
+            ...(child.parameters === undefined ? {} : { parameters: child.parameters }),
+            ...(child.strict === undefined ? {} : { strict: child.strict }),
+          },
+        });
+      }
+      continue;
+    }
+    if (tool.type === 'function') {
+      chatTools.push({
+        type: 'function',
+        function: {
+          name: tool.name,
+          ...(tool.description === undefined ? {} : { description: tool.description }),
+          ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
+          ...(tool.strict === undefined ? {} : { strict: tool.strict }),
+        },
+      });
+    } else {
+      chatTools.push({
+        type: 'custom',
+        custom: {
+          name: tool.name,
+          ...(tool.description === undefined ? {} : { description: tool.description }),
+          ...(tool.format === undefined ? {} : { format: tool.format }),
+        },
+      });
+    }
+  }
+  return chatTools;
+};
+
+const toChatToolChoice = (toolChoice: unknown, tools: Tool[]) => {
+  if (!toolChoice || typeof toolChoice !== 'object') return undefined;
+  const value = toolChoice as Record<string, unknown>;
+  if (value.type !== 'function' || typeof value.name !== 'string') return undefined;
+  if (typeof value.namespace === 'string') {
+    const alias = buildNamespaceAliasMaps(tools).refToAlias.get(`${value.namespace}\0${value.name}`);
+    if (!alias) return null;
+    return { type: 'function' as const, function: { name: alias } };
+  }
+  return { type: 'function' as const, function: { name: value.name } };
+};
 
 const WEB_SEARCH_UNAVAILABLE_HINT = 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.';
 
 const toChatMessages = (response: StoredResponse): ChatMessage[] => {
+  const { refToAlias } = buildNamespaceAliasMaps(response.tools);
   const messages: ChatMessage[] = response.input.map((item) => item.type === 'message'
     ? { role: item.role === 'developer' ? 'system' : 'user', content: item.content }
     : { role: 'tool', tool_call_id: item.call_id, content: item.output });
@@ -627,9 +745,17 @@ const toChatMessages = (response: StoredResponse): ChatMessage[] => {
     messages.push({
       role: 'assistant',
       ...(text ? { content: text.content.map((part) => part.text).join('') } : {}),
-      ...(toolCalls.length ? { tool_calls: toolCalls.map((item): ChatToolCall => item.type === 'function_call'
-        ? { id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }
-        : { id: item.call_id, type: 'custom', custom: { name: item.name, input: item.input } }) } : {}),
+      ...(toolCalls.length ? { tool_calls: toolCalls.map((item): ChatToolCall => {
+        if (item.type !== 'function_call') {
+          return { id: item.call_id, type: 'custom', custom: { name: item.name, input: item.input } };
+        }
+        const alias = item.namespace ? refToAlias.get(`${item.namespace}\0${item.name}`) : undefined;
+        if (item.namespace && !alias) throw new Error('Tool Namespace alias missing');
+        return {
+          id: item.call_id, type: 'function',
+          function: { name: alias ?? item.name, arguments: item.arguments },
+        };
+      }) } : {}),
     });
   }
   return messages;
@@ -942,7 +1068,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       }
       const tools = normalizeTools(payload.tools);
       if (payload.tools !== undefined && !tools) {
-        sendError(response, 400, 'Only Function and Custom Tools are supported', 'unsupported_tools');
+        sendError(response, 400, 'Only Function, Custom, Tool Namespace, and web_search tools are supported', 'unsupported_tools');
         return;
       }
       if (payload.previous_response_id !== undefined && (typeof payload.previous_response_id !== 'string' || !payload.previous_response_id)) {
@@ -973,7 +1099,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       const effectiveTools = tools ?? [...ancestors].reverse().find((item) => item.tools.length > 0)?.tools ?? [];
       const chainTools = [...ancestors.flatMap((item) => item.tools), ...effectiveTools];
       const needs = {
-        functionTools: chainTools.some((tool) => tool.type === 'function'),
+        functionTools: chainTools.some((tool) => tool.type === 'function' || tool.type === 'namespace'),
         customTools: chainTools.some((tool) => tool.type === 'custom'),
         webSearch: chainTools.some((tool) => tool.type === 'web_search'),
         parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
@@ -999,9 +1125,24 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         return;
       }
       const nativeResponses = !degradeWebSearch && (needs.webSearch || nativeParent !== undefined);
-      const chatTools = toChatTools(effectiveTools);
-      const forcedWebSearchChoice = payload.tool_choice !== undefined && typeof payload.tool_choice === 'object' && payload.tool_choice !== null
-        && (payload.tool_choice as { type?: unknown }).type === 'web_search';
+      let chatTools: ReturnType<typeof toChatTools>;
+      let namespaceAliases: ReturnType<typeof buildNamespaceAliasMaps>;
+      let chatToolChoice: ReturnType<typeof toChatToolChoice> | 'auto' | undefined;
+      try {
+        chatTools = toChatTools(effectiveTools);
+        namespaceAliases = buildNamespaceAliasMaps(effectiveTools);
+        const forcedWebSearchChoice = payload.tool_choice !== undefined && typeof payload.tool_choice === 'object' && payload.tool_choice !== null
+          && (payload.tool_choice as { type?: unknown }).type === 'web_search';
+        const mappedToolChoice = toChatToolChoice(payload.tool_choice, effectiveTools);
+        if (mappedToolChoice === null) {
+          sendError(response, 400, 'tool_choice targets an unknown Tool Namespace function', 'unsupported_tools');
+          return;
+        }
+        chatToolChoice = degradeWebSearch && forcedWebSearchChoice ? 'auto' : mappedToolChoice;
+      } catch {
+        sendError(response, 400, 'Tool Namespace aliases conflict', 'unsupported_tools');
+        return;
+      }
       const messages: ChatMessage[] = [
         ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
         ...ancestors.flatMap(toChatMessages),
@@ -1012,7 +1153,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         model, stream: true, stream_options: { include_usage: true }, messages,
         ...(chatTools.length ? { tools: chatTools } : {}),
         ...(needs.parallelToolCalls ? { parallel_tool_calls: true } : {}),
-        ...(degradeWebSearch && forcedWebSearchChoice ? { tool_choice: 'auto' } : {}),
+        ...(chatToolChoice === undefined ? {} : { tool_choice: chatToolChoice }),
       };
 
       const id = `resp_${randomUUID().replaceAll('-', '')}`;
@@ -1182,10 +1323,15 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
             });
             for (const [index, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
               if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
+              const resolved = call.kind === 'function' ? namespaceAliases.aliasToRef.get(call.name) : undefined;
               orderedOutput.push({
                 index: call.outputIndex,
                 item: call.kind === 'function'
-                  ? { id: call.id, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.input }
+                  ? {
+                    id: call.id, type: 'function_call', status: 'completed', call_id: call.id,
+                    name: resolved?.name ?? call.name, arguments: call.input,
+                    ...(resolved ? { namespace: resolved.namespace } : {}),
+                  }
                   : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: call.input },
               });
               sse(response, state, id, call.kind === 'function'
