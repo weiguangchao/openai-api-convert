@@ -38,6 +38,8 @@ type IdempotencyClaim =
   | { kind: 'reused'; responseId: string }
   | { kind: 'conflict' }
   | { kind: 'capacity_exceeded' };
+type AttemptResult = 'completed' | 'failed' | 'cancelled';
+type AttemptCompletion = { id: number; result: AttemptResult; preOutputFailure: boolean; errorCode?: string };
 type ChatToolCall =
   | { id: string; type: 'function'; function: { name: string; arguments: string } }
   | { id: string; type: 'custom'; custom: { name: string; input: string } };
@@ -153,7 +155,12 @@ class StateStore {
         CREATE TABLE IF NOT EXISTS attempts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           response_id TEXT NOT NULL,
-          created_at INTEGER NOT NULL DEFAULT 0
+          attempt_index INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT 0,
+          finished_at INTEGER,
+          result TEXT,
+          pre_output_failure INTEGER,
+          error_code TEXT
         ) STRICT;
       `);
       this.#addColumn('parent_id TEXT');
@@ -165,6 +172,11 @@ class StateStore {
       const responseCreatedAtAdded = this.#addColumn('created_at INTEGER NOT NULL DEFAULT 0');
       const terminalAtAdded = this.#addColumn('terminal_at INTEGER');
       const attemptCreatedAtAdded = this.#addAttemptColumn('created_at INTEGER NOT NULL DEFAULT 0');
+      this.#addAttemptColumn('attempt_index INTEGER NOT NULL DEFAULT 0');
+      this.#addAttemptColumn('finished_at INTEGER');
+      this.#addAttemptColumn('result TEXT');
+      this.#addAttemptColumn('pre_output_failure INTEGER');
+      this.#addAttemptColumn('error_code TEXT');
       const now = Date.now();
       if (responseCreatedAtAdded) this.#db.prepare('UPDATE responses SET created_at = ? WHERE created_at = 0').run(now);
       if (terminalAtAdded) this.#db.prepare("UPDATE responses SET terminal_at = ? WHERE status IN ('completed', 'failed', 'cancelled', 'incomplete')").run(now);
@@ -196,7 +208,7 @@ class StateStore {
   #createResponse(response: Omit<StoredResponse, 'output'>) {
     this.#db.prepare(
       'INSERT INTO responses (id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, context_complete, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)',
-    ).run(response.id, response.parentId ?? null, 'in_progress', response.model, JSON.stringify(response.input), JSON.stringify(response.tools), Number(response.parallelToolCalls), Date.now());
+    ).run(response.id, response.parentId ?? null, 'queued', response.model, JSON.stringify(response.input), JSON.stringify(response.tools), Number(response.parallelToolCalls), Date.now());
   }
 
   #bytes() {
@@ -336,7 +348,23 @@ class StateStore {
   }
 
   startAttempt(responseId: string) {
-    this.#db.prepare('INSERT INTO attempts (response_id, created_at) VALUES (?, ?)').run(responseId, Date.now());
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#db.prepare("UPDATE responses SET status = 'in_progress' WHERE id = ? AND status = 'queued'").run(responseId);
+      const index = Number((this.#db.prepare('SELECT COUNT(*) AS count FROM attempts WHERE response_id = ?').get(responseId) as Record<string, unknown>).count) + 1;
+      const result = this.#db.prepare('INSERT INTO attempts (response_id, attempt_index, created_at) VALUES (?, ?, ?)').run(responseId, index, Date.now());
+      this.#db.exec('COMMIT');
+      return Number(result.lastInsertRowid);
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  finishAttempt(attempt: AttemptCompletion) {
+    this.#db.prepare(
+      'UPDATE attempts SET finished_at = ?, result = ?, pre_output_failure = ?, error_code = ? WHERE id = ?',
+    ).run(Date.now(), attempt.result, Number(attempt.preOutputFailure), attempt.errorCode ?? null, attempt.id);
   }
 
   appendEvent(responseId: string, event: ResponseEvent): StoredEvent {
@@ -346,9 +374,14 @@ class StateStore {
     return { sequence: Number(result.lastInsertRowid), type: event.type };
   }
 
-  terminal(id: string, status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent): StoredEvent {
+  terminal(id: string, status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt?: AttemptCompletion): StoredEvent {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      if (attempt) {
+        this.#db.prepare(
+          'UPDATE attempts SET finished_at = ?, result = ?, pre_output_failure = ?, error_code = ? WHERE id = ?',
+        ).run(Date.now(), attempt.result, Number(attempt.preOutputFailure), attempt.errorCode ?? null, attempt.id);
+      }
       this.#db.prepare('UPDATE responses SET status = ?, output_text = ?, terminal_at = COALESCE(terminal_at, ?) WHERE id = ?')
         .run(status, outputText, Date.now(), id);
       const stored = this.appendEvent(id, event);
@@ -411,6 +444,15 @@ class StateStore {
       .all().map((row) => ({ responseId: String(row.response_id) }));
   }
 
+  attemptDetails() {
+    return this.#db.prepare('SELECT response_id, attempt_index, created_at, finished_at, result, pre_output_failure, error_code FROM attempts ORDER BY id')
+      .all().map((row) => ({
+        responseId: String(row.response_id), attemptIndex: Number(row.attempt_index), createdAt: Number(row.created_at),
+        finishedAt: row.finished_at === null ? undefined : Number(row.finished_at), result: row.result === null ? undefined : String(row.result),
+        preOutputFailure: row.pre_output_failure === null ? undefined : Boolean(row.pre_output_failure), errorCode: row.error_code === null ? undefined : String(row.error_code),
+      }));
+  }
+
   observability(): StateObservability {
     return { ...this.#observability, bytes: this.#bytes(), lastCleanup: this.#observability.lastCleanup && { ...this.#observability.lastCleanup } };
   }
@@ -428,6 +470,7 @@ class StateStore {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       this.#db.prepare('DELETE FROM attempts WHERE response_id = ?').run(id);
+      this.#db.prepare('DELETE FROM idempotency_records WHERE response_id = ?').run(id);
       this.#db.prepare('DELETE FROM responses WHERE id = ?').run(id);
       this.#db.exec('COMMIT');
     } catch (error) {
@@ -449,7 +492,7 @@ class StateStore {
 
 export type RunningBridge = {
   url: string;
-  state: Pick<StateStore, 'events' | 'responses' | 'attempts' | 'observability'>;
+  state: Pick<StateStore, 'events' | 'responses' | 'attempts' | 'attemptDetails' | 'observability'>;
   close: () => Promise<void>;
 };
 
@@ -571,26 +614,14 @@ const sse = (response: ServerResponse, store: StateStore, responseId: string, ev
   response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
 };
 
-const terminalSse = (response: ServerResponse, store: StateStore, responseId: string, status: 'completed' | 'failed', outputText: string, event: ResponseEvent) => {
-  store.terminal(responseId, status, outputText, event);
+const terminalSse = (response: ServerResponse, store: StateStore, responseId: string, status: 'completed' | 'failed', outputText: string, event: ResponseEvent, attempt?: AttemptCompletion) => {
+  store.terminal(responseId, status, outputText, event, attempt);
   response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
 };
 
-const failedSse = (response: ServerResponse, store: StateStore, responseId: string, model: string) => {
-  response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-  sse(response, store, responseId, { type: 'response.created', response: { id: responseId, object: 'response', status: 'in_progress', model, output: [] } });
-  terminalSse(response, store, responseId, 'failed', '', { type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed' } });
-  response.end();
-};
-
-const finishUpstreamFailure = (response: ServerResponse, store: StateStore, id: string, model: string, idempotencyKey: string | undefined, status: number, message: string, code: string) => {
-  if (idempotencyKey === undefined) {
-    store.discardRejectedResponse(id);
-    sendError(response, status, message, code);
-    return;
-  }
-  errorCodes.set(response, code);
-  failedSse(response, store, id, model);
+const finishUpstreamFailure = (response: ServerResponse, store: StateStore, id: string, status: number, message: string, code: string) => {
+  store.discardRejectedResponse(id);
+  sendError(response, status, message, code);
 };
 
 const writeSse = (response: ServerResponse, event: ResponseEvent) => {
@@ -828,8 +859,14 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       response.once('close', onResponseClose);
       try {
         let upstreamAttempts = 0;
+        let terminalAttempt: AttemptCompletion | undefined;
+        let retryAttempt: AttemptCompletion | undefined;
         for (const upstream of upstreams) {
           if (cancelled) break;
+          if (retryAttempt) {
+            state.finishAttempt(retryAttempt);
+            retryAttempt = undefined;
+          }
           const abort = new AbortController();
           activeAbort = abort;
           let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -842,7 +879,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
             activeAbort = undefined;
           };
           armTimeout(options.firstEventTimeoutMs ?? 30_000);
-          state.startAttempt(id);
+          const attemptId = state.startAttempt(id);
           if (upstreamAttempts > 0) metrics.upstreamSwitches += 1;
           upstreamAttempts += 1;
           let upstreamResponse: Response;
@@ -854,19 +891,25 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
             });
           } catch {
             finishAttempt();
-            if (cancelled) break;
+            if (cancelled) {
+              terminalAttempt = { id: attemptId, result: 'cancelled', preOutputFailure: true, errorCode: 'client_disconnected' };
+              break;
+            }
+            retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
             continue;
           }
           if (upstreamResponse.status === 408 || upstreamResponse.status === 429 || upstreamResponse.status >= 500 || !upstreamResponse.body) {
             finishAttempt();
+            retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
             continue;
           }
           if (upstreamResponse.status >= 400) {
             finishAttempt();
             if (!streamStarted) {
-              finishUpstreamFailure(response, state, id, model, idempotencyKey, 400, 'Upstream rejected request', 'upstream_rejected');
+              finishUpstreamFailure(response, state, id, 400, 'Upstream rejected request', 'upstream_rejected');
               return;
             }
+            terminalAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_rejected' };
             break;
           }
           if (!streamStarted) {
@@ -949,32 +992,36 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
               sse(response, state, id, { type: 'response.output_item.done', output_index: index, item });
             }
             finishAttempt();
-            terminalSse(response, state, id, 'completed', outputText, { type: 'response.completed', response: { id, object: 'response', status: 'completed', model, output } });
+            terminalSse(response, state, id, 'completed', outputText, { type: 'response.completed', response: { id, object: 'response', status: 'completed', model, output } }, { id: attemptId, result: 'completed', preOutputFailure: false });
             response.end();
             return;
           } catch {
             finishAttempt();
             if (cancelled) {
               failedOutputText = outputText;
+              terminalAttempt = { id: attemptId, result: 'cancelled', preOutputFailure: !outputStarted, errorCode: 'client_disconnected' };
               break;
             }
             if (outputStarted) {
               failedOutputText = outputText;
+              terminalAttempt = { id: attemptId, result: 'failed', preOutputFailure: false, errorCode: 'upstream_stream_failed' };
               break;
             }
+            retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
           }
         }
         if (cancelled) {
-          state.terminal(id, 'cancelled', failedOutputText, { type: 'response.cancelled', response: { id, object: 'response', status: 'cancelled' } });
+          const cancelledAttempt = terminalAttempt ?? (retryAttempt && { ...retryAttempt, result: 'cancelled' as const, errorCode: 'client_disconnected' });
+          state.terminal(id, 'cancelled', failedOutputText, { type: 'response.cancelled', response: { id, object: 'response', status: 'cancelled' } }, cancelledAttempt);
           if (!response.destroyed) response.end();
           return;
         }
         if (!streamStarted) {
-          finishUpstreamFailure(response, state, id, model, idempotencyKey, 503, 'Upstream unavailable', 'upstream_unavailable');
+          finishUpstreamFailure(response, state, id, 503, 'Upstream unavailable', 'upstream_unavailable');
           return;
         }
         errorCodes.set(response, 'upstream_stream_failed');
-        terminalSse(response, state, id, 'failed', failedOutputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } });
+        terminalSse(response, state, id, 'failed', failedOutputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } }, terminalAttempt ?? retryAttempt);
         response.end();
       } finally {
         request.removeListener('aborted', cancel);
