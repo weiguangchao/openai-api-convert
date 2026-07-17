@@ -615,6 +615,8 @@ const toChatTools = (tools: Tool[]) => tools.filter((tool): tool is FunctionTool
   },
 });
 
+const WEB_SEARCH_UNAVAILABLE_HINT = 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.';
+
 const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   const messages: ChatMessage[] = response.input.map((item) => item.type === 'message'
     ? { role: item.role === 'developer' ? 'system' : 'user', content: item.content }
@@ -976,27 +978,41 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         webSearch: chainTools.some((tool) => tool.type === 'web_search'),
         parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
       };
-      const nativeResponses = needs.webSearch || nativeParent !== undefined;
-      const upstreams = options.upstreams.filter((upstream) => (
+      const matchesCapabilities = (upstream: Upstream, requireWebSearch: boolean) => (
         (!needs.functionTools || upstream.capabilities?.functionTools === true)
         && (!needs.customTools || upstream.capabilities?.customTools === true)
-        && (!needs.webSearch || (upstream.wireApi === 'responses' && upstream.capabilities?.webSearch === true))
+        && (!requireWebSearch || (upstream.wireApi === 'responses' && upstream.capabilities?.webSearch === true))
         && (!needs.parallelToolCalls || upstream.capabilities?.parallelToolCalls === true)
         && (!nativeParent || (upstream.wireApi === 'responses' && upstream.baseUrl === nativeParent.baseUrl && upstreamIdentity(upstream) === nativeParent.identity))
-      ));
+      );
+      const nativeUpstreams = (needs.webSearch || nativeParent !== undefined)
+        ? options.upstreams.filter((upstream) => matchesCapabilities(upstream, needs.webSearch))
+        : [];
+      const degradeWebSearch = needs.webSearch && nativeParent === undefined && nativeUpstreams.length === 0;
+      const upstreams = degradeWebSearch
+        ? options.upstreams.filter((upstream) => (upstream.wireApi ?? 'chat') === 'chat' && matchesCapabilities(upstream, false))
+        : nativeUpstreams.length
+          ? nativeUpstreams
+          : options.upstreams.filter((upstream) => matchesCapabilities(upstream, false));
       if (!upstreams.length) {
         sendError(response, 400, 'No upstream supports the requested capabilities', 'unsupported_capabilities');
         return;
       }
+      const nativeResponses = !degradeWebSearch && (needs.webSearch || nativeParent !== undefined);
+      const chatTools = toChatTools(effectiveTools);
+      const forcedWebSearchChoice = payload.tool_choice !== undefined && typeof payload.tool_choice === 'object' && payload.tool_choice !== null
+        && (payload.tool_choice as { type?: unknown }).type === 'web_search';
       const messages: ChatMessage[] = [
+        ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
         ...ancestors.flatMap(toChatMessages),
         ...toChatMessages({ id: '', model: '', input, tools: [], parallelToolCalls: false, output: [] }),
       ];
       const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
       const upstreamBody: Record<string, unknown> = {
         model, stream: true, stream_options: { include_usage: true }, messages,
-        ...(effectiveTools.length ? { tools: toChatTools(effectiveTools) } : {}),
+        ...(chatTools.length ? { tools: chatTools } : {}),
         ...(needs.parallelToolCalls ? { parallel_tool_calls: true } : {}),
+        ...(degradeWebSearch && forcedWebSearchChoice ? { tool_choice: 'auto' } : {}),
       };
 
       const id = `resp_${randomUUID().replaceAll('-', '')}`;

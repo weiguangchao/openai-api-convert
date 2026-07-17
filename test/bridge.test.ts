@@ -1103,6 +1103,115 @@ test('mixed-tools rejects partial capability coverage before contacting an upstr
   }
 });
 
+test('chat-only Hosted Web Search degrades without forging search results', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    const events = sseTypes(body);
+    assert.equal(events.at(-1)?.type, 'response.completed');
+    assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
+    assert.equal(body.includes('url_citation'), false);
+    assert.equal(upstream.requests.length, 1);
+    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools?: unknown };
+    assert.equal(request.tools, undefined);
+    assert.equal(request.messages.some(({ role, content }) => role === 'system' && content.includes('web search is unavailable')), true);
+    assert.deepEqual(request.messages.at(-1), { role: 'user', content: 'Find an example.' });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('chat-only forced web_search tool_choice degrades to auto', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }], tool_choice: { type: 'web_search' },
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual(upstream.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'system', content: 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.' },
+        { role: 'user', content: 'Find an example.' },
+      ],
+      tool_choice: 'auto',
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('chat-only mixed tools keep Function and Custom after web_search degradation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCustomFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Research and inspect the workspace.',
+        tools: [
+          { type: 'web_search' },
+          { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } },
+          { type: 'custom', name: 'shell', description: 'Runs shell' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const events = sseTypes(await response.text());
+    assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
+    assert.deepEqual((events.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
+      id: 'call_shell', type: 'custom_tool_call', status: 'completed', call_id: 'call_shell', name: 'shell', input: 'ls',
+    });
+    const request = upstream.requests[0] as {
+      messages: Array<{ role: string; content?: string }>;
+      tools: unknown[];
+    };
+    assert.equal(request.messages[0]?.role, 'system');
+    assert.equal(String(request.messages[0]?.content).includes('web search is unavailable'), true);
+    assert.deepEqual(request.tools, [
+      { type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } },
+      { type: 'custom', custom: { name: 'shell', description: 'Runs shell' } },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('web-search-incompatible rejects before contacting an upstream', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_1') }]);
