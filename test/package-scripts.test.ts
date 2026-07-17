@@ -7,4 +7,8 @@ test('release smoke is the default test command and Compatibility Fixtures remai
 
   assert.equal(packageJson.scripts.test, 'node --experimental-strip-types scripts/release-smoke.ts');
   assert.equal(packageJson.scripts['test:unit'], 'node --test --experimental-strip-types test/**/*.test.ts');
+  assert.equal(
+    packageJson.scripts['test:codex-mixed-tools'],
+    "node --test --experimental-strip-types --test-name-pattern='Codex mixed-tools' test/bridge.test.ts",
+  );
 });
