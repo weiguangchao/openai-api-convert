@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
@@ -18,6 +18,7 @@ type OutputItem =
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string }
   | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string };
 type StoredResponse = { id: string; parentId?: string; model: string; input: InputItem[]; tools: Tool[]; parallelToolCalls: boolean; output: OutputItem[] };
+type IdempotencyClaim = { kind: 'created'; responseId: string } | { kind: 'reused'; responseId: string } | { kind: 'conflict' };
 type ChatToolCall =
   | { id: string; type: 'function'; function: { name: string; arguments: string } }
   | { id: string; type: 'custom'; custom: { name: string; input: string } };
@@ -56,6 +57,17 @@ class StateStore {
           type TEXT NOT NULL,
           payload TEXT NOT NULL
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS idempotency_records (
+          auth_subject TEXT NOT NULL,
+          key TEXT NOT NULL,
+          request_hash TEXT NOT NULL,
+          response_id TEXT NOT NULL UNIQUE,
+          PRIMARY KEY (auth_subject, key)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          response_id TEXT NOT NULL
+        ) STRICT;
       `);
       this.#addColumn('parent_id TEXT');
       this.#addColumn("model TEXT NOT NULL DEFAULT 'gpt-4.1'");
@@ -74,10 +86,39 @@ class StateStore {
     if (!columns.includes(name)) this.#db.exec(`ALTER TABLE responses ADD COLUMN ${definition}`);
   }
 
-  createResponse(response: Omit<StoredResponse, 'output'>) {
+  #createResponse(response: Omit<StoredResponse, 'output'>) {
     this.#db.prepare(
       'INSERT INTO responses (id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, context_complete) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
     ).run(response.id, response.parentId ?? null, 'in_progress', response.model, JSON.stringify(response.input), JSON.stringify(response.tools), Number(response.parallelToolCalls));
+  }
+
+  claimResponse(response: Omit<StoredResponse, 'output'>, idempotency?: { subject: string; key: string; hash: string }): IdempotencyClaim {
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      if (idempotency) {
+        const existing = this.#db.prepare(
+          'SELECT request_hash, response_id FROM idempotency_records WHERE auth_subject = ? AND key = ?',
+        ).get(idempotency.subject, idempotency.key) as Record<string, unknown> | undefined;
+        if (existing) {
+          this.#db.exec('COMMIT');
+          return String(existing.request_hash) === idempotency.hash
+            ? { kind: 'reused', responseId: String(existing.response_id) }
+            : { kind: 'conflict' };
+        }
+      }
+      this.#createResponse(response);
+      if (idempotency) {
+        this.#db.prepare(
+          'INSERT INTO idempotency_records (auth_subject, key, request_hash, response_id) VALUES (?, ?, ?, ?)',
+        ).run(idempotency.subject, idempotency.key, idempotency.hash, response.id);
+      }
+      this.#db.prepare('INSERT INTO attempts (response_id) VALUES (?)').run(response.id);
+      this.#db.exec('COMMIT');
+      return { kind: 'created', responseId: response.id };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   appendOutputItem(responseId: string, outputIndex: number, item: OutputItem) {
@@ -141,6 +182,34 @@ class StateStore {
       .all().map((row) => ({ sequence: Number(row.sequence), type: String(row.type) }));
   }
 
+  eventsForResponse(id: string, after: number) {
+    return this.#db.prepare(
+      'SELECT sequence, payload FROM stream_events WHERE response_id = ? AND sequence > ? ORDER BY sequence',
+    ).all(id, after).map((row) => ({ sequence: Number(row.sequence), event: JSON.parse(String(row.payload)) as ResponseEvent }));
+  }
+
+  status(id: string) {
+    const row = this.#db.prepare('SELECT status FROM responses WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? String(row.status) : undefined;
+  }
+
+  attempts() {
+    return this.#db.prepare('SELECT response_id FROM attempts ORDER BY id')
+      .all().map((row) => ({ responseId: String(row.response_id) }));
+  }
+
+  discardRejectedResponse(id: string) {
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#db.prepare('DELETE FROM attempts WHERE response_id = ?').run(id);
+      this.#db.prepare('DELETE FROM responses WHERE id = ?').run(id);
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   responses() {
     return this.#db.prepare('SELECT status, output_text FROM responses ORDER BY rowid')
       .all().map((row) => ({ status: String(row.status), outputText: String(row.output_text) }));
@@ -151,7 +220,7 @@ class StateStore {
 
 export type RunningBridge = {
   url: string;
-  state: Pick<StateStore, 'events' | 'responses'>;
+  state: Pick<StateStore, 'events' | 'responses' | 'attempts'>;
   close: () => Promise<void>;
 };
 
@@ -249,6 +318,49 @@ const terminalSse = (response: ServerResponse, store: StateStore, responseId: st
   response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
 };
 
+const failedSse = (response: ServerResponse, store: StateStore, responseId: string, model: string) => {
+  response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  sse(response, store, responseId, { type: 'response.created', response: { id: responseId, object: 'response', status: 'in_progress', model, output: [] } });
+  terminalSse(response, store, responseId, 'failed', '', { type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed' } });
+  response.end();
+};
+
+const finishUpstreamFailure = (response: ServerResponse, store: StateStore, id: string, model: string, idempotencyKey: string | undefined, status: number, message: string, code: string) => {
+  if (idempotencyKey === undefined) {
+    store.discardRejectedResponse(id);
+    sendError(response, status, message, code);
+    return;
+  }
+  failedSse(response, store, id, model);
+};
+
+const writeSse = (response: ServerResponse, event: ResponseEvent) => {
+  response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+};
+
+const replaySse = async (response: ServerResponse, store: StateStore, responseId: string) => {
+  let sequence = 0;
+  while (!response.destroyed) {
+    const events = store.eventsForResponse(responseId, sequence);
+    for (const event of events) {
+      sequence = event.sequence;
+      writeSse(response, event.event);
+    }
+    if (!events.length && store.status(responseId) !== 'in_progress') break;
+    if (!events.length) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  response.end();
+};
+
+const canonicalJson = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`;
+};
+
+const digest = (value: unknown) => createHash('sha256').update(canonicalJson(value)).digest('hex');
+
 const parseUpstream = async function* (body: ReadableStream<Uint8Array>) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -291,6 +403,11 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       }
       if (request.headers.authorization !== `Bearer ${options.apiKey}`) {
         sendError(response, 401, 'Invalid authentication credentials', 'invalid_api_key');
+        return;
+      }
+      const idempotencyKey = request.headers['idempotency-key'];
+      if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || !idempotencyKey)) {
+        sendError(response, 400, 'Idempotency-Key must be a non-empty string', 'invalid_idempotency_key');
         return;
       }
 
@@ -362,6 +479,24 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         ...(needs.parallelToolCalls ? { parallel_tool_calls: true } : {}),
       };
 
+      const id = `resp_${randomUUID().replaceAll('-', '')}`;
+      const claim = state.claimResponse({
+        id, parentId: payload.previous_response_id, model, input, tools: tools ?? [], parallelToolCalls: payload.parallel_tool_calls === true,
+      }, idempotencyKey === undefined ? undefined : {
+        subject: digest(request.headers.authorization),
+        key: idempotencyKey,
+        hash: digest({ model, input, tools: tools ?? [], previousResponseId: payload.previous_response_id ?? null, parallelToolCalls: payload.parallel_tool_calls === true }),
+      });
+      if (claim.kind === 'conflict') {
+        sendError(response, 409, 'Idempotency-Key is already used for a different request', 'idempotency_key_conflict');
+        return;
+      }
+      if (claim.kind === 'reused') {
+        response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        await replaySse(response, state, claim.responseId);
+        return;
+      }
+
       let upstreamResponse: Response;
       try {
         upstreamResponse = await fetch(new URL('/v1/chat/completions', upstream.baseUrl), {
@@ -370,22 +505,18 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           body: JSON.stringify(upstreamBody),
         });
       } catch {
-        sendError(response, 503, 'Upstream unavailable', 'upstream_unavailable');
+        finishUpstreamFailure(response, state, id, model, idempotencyKey, 503, 'Upstream unavailable', 'upstream_unavailable');
         return;
       }
       if (upstreamResponse.status >= 400 && upstreamResponse.status < 500) {
-        sendError(response, 400, 'Upstream rejected request', 'upstream_rejected');
+        finishUpstreamFailure(response, state, id, model, idempotencyKey, 400, 'Upstream rejected request', 'upstream_rejected');
         return;
       }
       if (!upstreamResponse.ok || !upstreamResponse.body) {
-        sendError(response, 503, 'Upstream unavailable', 'upstream_unavailable');
+        finishUpstreamFailure(response, state, id, model, idempotencyKey, 503, 'Upstream unavailable', 'upstream_unavailable');
         return;
       }
 
-      const id = `resp_${randomUUID().replaceAll('-', '')}`;
-      state.createResponse({
-        id, parentId: payload.previous_response_id, model, input, tools: tools ?? [], parallelToolCalls: payload.parallel_tool_calls === true,
-      });
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       sse(response, state, id, { type: 'response.created', response: { id, object: 'response', status: 'in_progress', model, output: [] } });
 
