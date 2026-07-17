@@ -31,6 +31,31 @@ const startCompatibilityFixture = async () => {
   };
 };
 
+const startIdempotencyFixture = async () => {
+  const requests: unknown[] = [];
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.write('data: {"choices":[{"delta":{"content":"first "}}]}\r\n\r\n');
+    await pending;
+    response.write('data: {"choices":[{"delta":{"content":"second"}}]}\r\n\r\n');
+    response.end('data: [DONE]\r\n\r\n');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    release,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
 const functionSingleStreams = [
   [
     'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\\\"city\\\":\\\""}}]}}]}\r\n\r\n',
@@ -688,6 +713,91 @@ test('declared-capability-client-4xx Compatibility Fixture does not switch upstr
     await bridge?.close();
     await rejected.close();
     await fallback.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('idempotency-failed replays an upstream rejection without another Attempt', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startRejectedFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'failed-once' };
+    const body = JSON.stringify({ stream: true, input: 'Hello' });
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
+    const failed = await first.text();
+    const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
+    assert.equal(await replay.text(), failed);
+    assert.deepEqual(sseTypes(failed).map(({ type }) => type), ['response.created', 'response.failed']);
+    assert.equal(upstream.requests.length, 1);
+    assert.equal(bridge.state.attempts().length, 1);
+    assert.deepEqual(bridge.state.responses(), [{ status: 'failed', outputText: '' }]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('idempotency-in-progress replays persisted events then follows the Response without another Attempt', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startIdempotencyFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'once' };
+    const request = { stream: true, input: 'Hello' };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
+    for (let tries = 0; bridge.state.events().length < 2 && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta']);
+    const second = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
+    upstream.release();
+    const [firstBody, secondBody] = await Promise.all([first.text(), second.text()]);
+    assert.equal(secondBody, firstBody);
+    assert.equal(upstream.requests.length, 1);
+    assert.equal(bridge.state.attempts().length, 1);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('idempotency-terminal replays original SSE and rejects a conflicting request without state changes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startIdempotencyFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'once' };
+    const request = { stream: true, input: 'Hello' };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
+    upstream.release();
+    const firstBody = await first.text();
+    assert.equal(sseTypes(firstBody).at(-1)?.type, 'response.completed');
+    assert.deepEqual(bridge.state.responses(), [{ status: 'completed', outputText: 'first second' }]);
+    const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
+    assert.equal(await replay.text(), firstBody);
+    const before = { events: bridge.state.events(), responses: bridge.state.responses(), attempts: bridge.state.attempts() };
+    const conflict = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Different' }),
+    });
+    assert.equal(conflict.status, 409);
+    assert.deepEqual(await conflict.json(), {
+      error: { message: 'Idempotency-Key is already used for a different request', type: 'invalid_request_error', param: null, code: 'idempotency_key_conflict' },
+    });
+    assert.deepEqual({ events: bridge.state.events(), responses: bridge.state.responses(), attempts: bridge.state.attempts() }, before);
+    assert.equal(upstream.requests.length, 1);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
