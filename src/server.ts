@@ -4,7 +4,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
 type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
-type BridgeOptions = { apiKey: string; upstreams: Upstream[]; statePath: string; port?: number };
+type BridgeOptions = {
+  apiKey: string;
+  upstreams: Upstream[];
+  statePath: string;
+  port?: number;
+  firstEventTimeoutMs?: number;
+  outputIdleTimeoutMs?: number;
+};
 type StoredEvent = { sequence: number; type: string };
 type ResponseEvent = { type: string; [key: string]: unknown };
 type FunctionTool = { type: 'function'; name: string; description?: string; parameters?: unknown };
@@ -112,7 +119,6 @@ class StateStore {
           'INSERT INTO idempotency_records (auth_subject, key, request_hash, response_id) VALUES (?, ?, ?, ?)',
         ).run(idempotency.subject, idempotency.key, idempotency.hash, response.id);
       }
-      this.#db.prepare('INSERT INTO attempts (response_id) VALUES (?)').run(response.id);
       this.#db.exec('COMMIT');
       return { kind: 'created', responseId: response.id };
     } catch (error) {
@@ -126,6 +132,10 @@ class StateStore {
       .run(responseId, outputIndex, JSON.stringify(item));
   }
 
+  startAttempt(responseId: string) {
+    this.#db.prepare('INSERT INTO attempts (response_id) VALUES (?)').run(responseId);
+  }
+
   appendEvent(responseId: string, event: ResponseEvent): StoredEvent {
     const result = this.#db.prepare(
       'INSERT INTO stream_events (response_id, type, payload) VALUES (?, ?, ?)',
@@ -133,7 +143,7 @@ class StateStore {
     return { sequence: Number(result.lastInsertRowid), type: event.type };
   }
 
-  terminal(id: string, status: 'completed' | 'failed', outputText: string, event: ResponseEvent): StoredEvent {
+  terminal(id: string, status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent): StoredEvent {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       this.#db.prepare('UPDATE responses SET status = ?, output_text = ? WHERE id = ?')
@@ -389,6 +399,12 @@ const assertOptions = (options: BridgeOptions) => {
       throw new Error('Upstream Pool contains an invalid capability profile');
     }
   }
+  if (options.firstEventTimeoutMs !== undefined && (!Number.isInteger(options.firstEventTimeoutMs) || options.firstEventTimeoutMs <= 0)) {
+    throw new Error('First event timeout must be a positive integer');
+  }
+  if (options.outputIdleTimeoutMs !== undefined && (!Number.isInteger(options.outputIdleTimeoutMs) || options.outputIdleTimeoutMs <= 0)) {
+    throw new Error('Output idle timeout must be a positive integer');
+  }
 };
 
 export const startBridge = async (options: BridgeOptions): Promise<RunningBridge> => {
@@ -459,12 +475,12 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         customTools: chainTools.some((tool) => tool.type === 'custom'),
         parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
       };
-      const upstream = options.upstreams.find(({ capabilities }) => (
+      const upstreams = options.upstreams.filter(({ capabilities }) => (
         (!needs.functionTools || capabilities?.functionTools === true)
         && (!needs.customTools || capabilities?.customTools === true)
         && (!needs.parallelToolCalls || capabilities?.parallelToolCalls === true)
       ));
-      if (!upstream) {
+      if (!upstreams.length) {
         sendError(response, 400, 'No upstream supports the requested capabilities', 'unsupported_capabilities');
         return;
       }
@@ -497,95 +513,164 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         return;
       }
 
-      let upstreamResponse: Response;
+      let streamStarted = false;
+      let cancelled = false;
+      let activeAbort: AbortController | undefined;
+      let failedOutputText = '';
+      const cancel = () => { cancelled = true; activeAbort?.abort(); };
+      const onResponseClose = () => { if (!response.writableEnded) cancel(); };
+      request.once('aborted', cancel);
+      response.once('close', onResponseClose);
       try {
-        upstreamResponse = await fetch(new URL('/v1/chat/completions', upstream.baseUrl), {
-          method: 'POST',
-          headers: { authorization: `Bearer ${upstream.apiKey}`, 'content-type': 'application/json', accept: 'text/event-stream' },
-          body: JSON.stringify(upstreamBody),
-        });
-      } catch {
-        finishUpstreamFailure(response, state, id, model, idempotencyKey, 503, 'Upstream unavailable', 'upstream_unavailable');
-        return;
-      }
-      if (upstreamResponse.status >= 400 && upstreamResponse.status < 500) {
-        finishUpstreamFailure(response, state, id, model, idempotencyKey, 400, 'Upstream rejected request', 'upstream_rejected');
-        return;
-      }
-      if (!upstreamResponse.ok || !upstreamResponse.body) {
-        finishUpstreamFailure(response, state, id, model, idempotencyKey, 503, 'Upstream unavailable', 'upstream_unavailable');
-        return;
-      }
-
-      response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      sse(response, state, id, { type: 'response.created', response: { id, object: 'response', status: 'in_progress', model, output: [] } });
-
-      let outputText = '';
-      let completed = false;
-      let nextOutputIndex = 0;
-      let textOutputIndex: number | undefined;
-      const calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
-      try {
-        for await (const data of parseUpstream(upstreamResponse.body)) {
-          if (data === '[DONE]') { completed = true; break; }
-          const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown; tool_calls?: Array<{ index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown }; custom?: { name?: unknown; input?: unknown } }> } }> };
-          const delta = chunk.choices?.[0]?.delta;
-          if (typeof delta?.content === 'string' && delta.content.length) {
-            if (textOutputIndex === undefined) textOutputIndex = nextOutputIndex++;
-            outputText += delta.content;
-            sse(response, state, id, { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: textOutputIndex, content_index: 0, delta: delta.content });
+        for (const upstream of upstreams) {
+          if (cancelled) break;
+          const abort = new AbortController();
+          activeAbort = abort;
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          const armTimeout = (milliseconds: number) => {
+            if (timeout) clearTimeout(timeout);
+            timeout = setTimeout(() => abort.abort(), milliseconds);
+          };
+          const finishAttempt = () => {
+            if (timeout) clearTimeout(timeout);
+            activeAbort = undefined;
+          };
+          armTimeout(options.firstEventTimeoutMs ?? 30_000);
+          state.startAttempt(id);
+          let upstreamResponse: Response;
+          try {
+            upstreamResponse = await fetch(new URL('/v1/chat/completions', upstream.baseUrl), {
+              method: 'POST',
+              headers: { authorization: `Bearer ${upstream.apiKey}`, 'content-type': 'application/json', accept: 'text/event-stream' },
+              body: JSON.stringify(upstreamBody), signal: abort.signal,
+            });
+          } catch {
+            finishAttempt();
+            if (cancelled) break;
+            continue;
           }
-          for (const call of delta?.tool_calls ?? []) {
-            if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
-            if (call.type !== undefined && call.type !== 'function' && call.type !== 'custom') throw new Error('Invalid upstream Tool call');
-            const kind = call.type === 'custom' ? 'custom' : 'function';
-            const current = calls.get(Number(call.index)) ?? {
-              kind, input: '', outputIndex: Number(call.index) + (textOutputIndex === undefined ? 0 : 1),
-            };
-            if (current.kind !== kind) throw new Error('Inconsistent upstream Tool call');
-            nextOutputIndex = Math.max(nextOutputIndex, current.outputIndex + 1);
-            if (typeof call.id === 'string') current.id = call.id;
-            const name = current.kind === 'function' ? call.function?.name : call.custom?.name;
-            const inputDelta = current.kind === 'function' ? call.function?.arguments : call.custom?.input;
-            if (typeof name === 'string') current.name = name;
-            if (typeof inputDelta === 'string') {
-              current.input += inputDelta;
-              sse(response, state, id, {
-                type: current.kind === 'function' ? 'response.function_call_arguments.delta' : 'response.custom_tool_call_input.delta',
-                item_id: current.id ?? `tc_${Number(call.index)}`, output_index: current.outputIndex, delta: inputDelta,
-              });
+          if (upstreamResponse.status === 408 || upstreamResponse.status === 429 || upstreamResponse.status >= 500 || !upstreamResponse.body) {
+            finishAttempt();
+            continue;
+          }
+          if (upstreamResponse.status >= 400) {
+            finishAttempt();
+            if (!streamStarted) {
+              finishUpstreamFailure(response, state, id, model, idempotencyKey, 400, 'Upstream rejected request', 'upstream_rejected');
+              return;
             }
-            calls.set(Number(call.index), current);
+            break;
+          }
+          if (!streamStarted) {
+            response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+            sse(response, state, id, { type: 'response.created', response: { id, object: 'response', status: 'in_progress', model, output: [] } });
+            streamStarted = true;
+          }
+
+          let outputStarted = false;
+          let firstEvent = true;
+          let outputText = '';
+          let completed = false;
+          let nextOutputIndex = 0;
+          let textOutputIndex: number | undefined;
+          const calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
+          try {
+            for await (const data of parseUpstream(upstreamResponse.body)) {
+              if (firstEvent) {
+                firstEvent = false;
+                if (timeout) clearTimeout(timeout);
+                timeout = undefined;
+              }
+              if (outputStarted) armTimeout(options.outputIdleTimeoutMs ?? 60_000);
+              if (data === '[DONE]') { completed = true; break; }
+              const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown; tool_calls?: Array<{ index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown }; custom?: { name?: unknown; input?: unknown } }> } }> };
+              const delta = chunk.choices?.[0]?.delta;
+              if (typeof delta?.content === 'string' && delta.content.length) {
+                if (textOutputIndex === undefined) textOutputIndex = nextOutputIndex++;
+                outputStarted = true;
+                armTimeout(options.outputIdleTimeoutMs ?? 60_000);
+                outputText += delta.content;
+                sse(response, state, id, { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: textOutputIndex, content_index: 0, delta: delta.content });
+              }
+              for (const call of delta?.tool_calls ?? []) {
+                if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
+                if (call.type !== undefined && call.type !== 'function' && call.type !== 'custom') throw new Error('Invalid upstream Tool call');
+                const kind = call.type === 'custom' ? 'custom' : 'function';
+                const current = calls.get(Number(call.index)) ?? {
+                  kind, input: '', outputIndex: Number(call.index) + (textOutputIndex === undefined ? 0 : 1),
+                };
+                if (current.kind !== kind) throw new Error('Inconsistent upstream Tool call');
+                nextOutputIndex = Math.max(nextOutputIndex, current.outputIndex + 1);
+                if (typeof call.id === 'string') current.id = call.id;
+                const name = current.kind === 'function' ? call.function?.name : call.custom?.name;
+                const inputDelta = current.kind === 'function' ? call.function?.arguments : call.custom?.input;
+                if (typeof name === 'string') current.name = name;
+                if (typeof inputDelta === 'string') {
+                  outputStarted = true;
+                  armTimeout(options.outputIdleTimeoutMs ?? 60_000);
+                  current.input += inputDelta;
+                  sse(response, state, id, {
+                    type: current.kind === 'function' ? 'response.function_call_arguments.delta' : 'response.custom_tool_call_input.delta',
+                    item_id: current.id ?? `tc_${Number(call.index)}`, output_index: current.outputIndex, delta: inputDelta,
+                  });
+                }
+                calls.set(Number(call.index), current);
+              }
+            }
+            if (!completed) throw new Error('Upstream stream ended without [DONE]');
+            const orderedOutput: Array<{ index: number; item: OutputItem }> = [];
+            if (outputText && textOutputIndex !== undefined) orderedOutput.push({
+              index: textOutputIndex,
+              item: { id: `msg_${id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: outputText }] },
+            });
+            for (const [index, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
+              if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
+              orderedOutput.push({
+                index: call.outputIndex,
+                item: call.kind === 'function'
+                  ? { id: call.id, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.input }
+                  : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: call.input },
+              });
+              sse(response, state, id, call.kind === 'function'
+                ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
+                : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input });
+            }
+            const output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
+            for (const [index, item] of output.entries()) {
+              state.appendOutputItem(id, index, item);
+              sse(response, state, id, { type: 'response.output_item.done', output_index: index, item });
+            }
+            finishAttempt();
+            terminalSse(response, state, id, 'completed', outputText, { type: 'response.completed', response: { id, object: 'response', status: 'completed', model, output } });
+            response.end();
+            return;
+          } catch {
+            finishAttempt();
+            if (cancelled) {
+              failedOutputText = outputText;
+              break;
+            }
+            if (outputStarted) {
+              failedOutputText = outputText;
+              break;
+            }
           }
         }
-        if (!completed) throw new Error('Upstream stream ended without [DONE]');
-        const orderedOutput: Array<{ index: number; item: OutputItem }> = [];
-        if (outputText && textOutputIndex !== undefined) orderedOutput.push({
-          index: textOutputIndex,
-          item: { id: `msg_${id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: outputText }] },
-        });
-        for (const [index, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
-          if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
-          orderedOutput.push({
-            index: call.outputIndex,
-            item: call.kind === 'function'
-              ? { id: call.id, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.input }
-              : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: call.input },
-          });
-          sse(response, state, id, call.kind === 'function'
-            ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
-            : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input });
+        if (cancelled) {
+          state.terminal(id, 'cancelled', failedOutputText, { type: 'response.cancelled', response: { id, object: 'response', status: 'cancelled' } });
+          if (!response.destroyed) response.end();
+          return;
         }
-        const output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
-        for (const [index, item] of output.entries()) {
-          state.appendOutputItem(id, index, item);
-          sse(response, state, id, { type: 'response.output_item.done', output_index: index, item });
+        if (!streamStarted) {
+          finishUpstreamFailure(response, state, id, model, idempotencyKey, 503, 'Upstream unavailable', 'upstream_unavailable');
+          return;
         }
-        terminalSse(response, state, id, 'completed', outputText, { type: 'response.completed', response: { id, object: 'response', status: 'completed', model, output } });
-      } catch {
-        terminalSse(response, state, id, 'failed', outputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } });
+        terminalSse(response, state, id, 'failed', failedOutputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } });
+        response.end();
+      } finally {
+        request.removeListener('aborted', cancel);
+        response.removeListener('close', onResponseClose);
       }
-      response.end();
     });
     await new Promise<void>((resolve, reject) => server!.once('error', reject).listen(options.port ?? 0, '127.0.0.1', resolve));
     const address = server.address();

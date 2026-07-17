@@ -164,6 +164,33 @@ const startRejectedFixture = async () => {
   };
 };
 
+const startScriptedFixture = async (scripts: Array<{ status?: number; frames?: string[]; waitMs?: number; waitAfterFirstFrameMs?: number }>) => {
+  const requests: unknown[] = [];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    const script = scripts[requests.length - 1] ?? { status: 500 };
+    response.writeHead(script.status ?? 200, { 'content-type': script.status && script.status >= 400 ? 'application/json' : 'text/event-stream' });
+    if (script.waitMs) await new Promise((resolve) => setTimeout(resolve, script.waitMs));
+    if (script.waitAfterFirstFrameMs && script.frames?.length) {
+      response.write(script.frames[0]);
+      await new Promise((resolve) => setTimeout(resolve, script.waitAfterFirstFrameMs));
+      response.end(script.frames.slice(1).join(''));
+      return;
+    }
+    response.end(script.frames?.join('') ?? '{"error":"unavailable"}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
 test('rejects invalid startup configuration', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   try {
@@ -796,6 +823,216 @@ test('idempotency-terminal replays original SSE and rejects a conflicting reques
     assert.deepEqual({ events: bridge.state.events(), responses: bridge.state.responses(), attempts: bridge.state.attempts() }, before);
     assert.equal(upstream.requests.length, 1);
   } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('failover-before-output Compatibility Fixture retries the full Response Chain on the next compatible upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const primary = await startScriptedFixture([
+    { frames: functionSingleStreams[0] },
+    { status: 429 },
+  ]);
+  const fallback = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: primary.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+        { baseUrl: fallback.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
+    });
+    const firstEvents = sseTypes(await first.text());
+    const previousResponseId = (firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        stream: true, previous_response_id: previousResponseId,
+        input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
+      }),
+    });
+    const events = sseTypes(await second.text());
+    assert.equal(events.at(-1)?.type, 'response.completed');
+    assert.equal(primary.requests.length, 2);
+    assert.equal(fallback.requests.length, 1);
+    assert.deepEqual(fallback.requests[0], primary.requests[1]);
+    assert.deepEqual((fallback.requests[0] as { messages: unknown[] }).messages, [
+      { role: 'user', content: 'Weather?' },
+      { role: 'assistant', tool_calls: [{ id: 'call_weather', type: 'function', function: { name: 'weather', arguments: '{"city":"Paris"}' } }] },
+      { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
+    ]);
+    assert.equal(bridge.state.attempts().length, 3);
+  } finally {
+    await bridge?.close();
+    await primary.close();
+    await fallback.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('failure-after-output Compatibility Fixture fails without another Attempt or completion', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const primary = await startScriptedFixture([{ frames: ['data: {"choices":[{"delta":{"content":"partial"}}]}\r\n\r\n'] }]);
+  const fallback = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: primary.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+        { baseUrl: fallback.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    const events = sseTypes(await response.text());
+    assert.deepEqual(events.map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.failed']);
+    assert.equal(primary.requests.length, 1);
+    assert.equal(fallback.requests.length, 0);
+    assert.equal(bridge.state.attempts().length, 1);
+    assert.deepEqual(bridge.state.responses(), [{ status: 'failed', outputText: 'partial' }]);
+  } finally {
+    await bridge?.close();
+    await primary.close();
+    await fallback.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('first-event timeout switches to the next compatible upstream before output', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const slow = await startScriptedFixture([{ waitMs: 100 }]);
+  const fallback = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', firstEventTimeoutMs: 10,
+      upstreams: [
+        { baseUrl: slow.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+        { baseUrl: fallback.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.equal(slow.requests.length, 1);
+    assert.equal(fallback.requests.length, 1);
+    assert.equal(bridge.state.attempts().length, 2);
+  } finally {
+    await bridge?.close();
+    await slow.close();
+    await fallback.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a valid first upstream event prevents a first-event timeout', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const primary = await startScriptedFixture([{
+    waitAfterFirstFrameMs: 30,
+    frames: [
+      'data: {"choices":[{"delta":{}}]}\r\n\r\n',
+      'data: {"choices":[{"delta":{"content":"Hello"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  }]);
+  const fallback = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', firstEventTimeoutMs: 10,
+      upstreams: [
+        { baseUrl: primary.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+        { baseUrl: fallback.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.equal(primary.requests.length, 1);
+    assert.equal(fallback.requests.length, 0);
+  } finally {
+    await bridge?.close();
+    await primary.close();
+    await fallback.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('all-upstreams-fail Compatibility Fixture emits response.failed after every compatible upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const first = await startScriptedFixture([{ status: 429 }]);
+  const second = await startScriptedFixture([{ frames: ['data: not-json\r\n\r\n'] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: first.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+        { baseUrl: second.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    assert.deepEqual(sseTypes(await response.text()).map(({ type }) => type), ['response.created', 'response.failed']);
+    assert.equal(first.requests.length, 1);
+    assert.equal(second.requests.length, 1);
+    assert.equal(bridge.state.attempts().length, 2);
+    assert.deepEqual(bridge.state.responses(), [{ status: 'failed', outputText: '' }]);
+  } finally {
+    await bridge?.close();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('client disconnect aborts the active Attempt and cancels the Response', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startIdempotencyFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const abort = new AbortController();
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', signal: abort.signal,
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    for (let tries = 0; bridge.state.events().length < 2 && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    abort.abort();
+    await assert.rejects(() => response.text());
+    for (let tries = 0; bridge.state.responses()[0]?.status !== 'cancelled' && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(bridge.state.responses(), [{ status: 'cancelled', outputText: 'first ' }]);
+    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.cancelled']);
+    assert.equal(bridge.state.attempts().length, 1);
+  } finally {
+    upstream.release();
     await bridge?.close();
     await upstream.close();
     await rm(dir, { recursive: true, force: true });
