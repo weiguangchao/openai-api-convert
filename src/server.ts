@@ -32,7 +32,8 @@ type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput;
 type OutputItem =
   | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string }
-  | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string };
+  | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string }
+  | { id: string; type: 'web_search_call'; status: string; [key: string]: unknown };
 type NativeUpstreamMapping = { baseUrl: string; identity: string; responseId: string };
 type StoredResponse = {
   id: string; parentId?: string; model: string; input: InputItem[]; tools: Tool[]; parallelToolCalls: boolean; output: OutputItem[];
@@ -618,7 +619,7 @@ const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   const messages: ChatMessage[] = response.input.map((item) => item.type === 'message'
     ? { role: item.role === 'developer' ? 'system' : 'user', content: item.content }
     : { role: 'tool', tool_call_id: item.call_id, content: item.output });
-  const toolCalls = response.output.filter((item): item is Exclude<OutputItem, { type: 'message' }> => item.type !== 'message');
+  const toolCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call');
   const text = response.output.find((item): item is Extract<OutputItem, { type: 'message' }> => item.type === 'message');
   if (text || toolCalls.length) {
     messages.push({
@@ -694,11 +695,14 @@ const parseUpstream = async function* (body: ReadableStream<Uint8Array>) {
   }
 };
 
-const replaceResponseId = (value: unknown, upstreamId: string, bridgeId: string): unknown => {
-  if (value === upstreamId) return bridgeId;
-  if (Array.isArray(value)) return value.map((item) => replaceResponseId(item, upstreamId, bridgeId));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceResponseId(item, upstreamId, bridgeId)]));
-  return value;
+const replaceResponseId = (event: ResponseEvent, upstreamId: string, bridgeId: string): ResponseEvent => {
+  const response = event.response;
+  const mapped = {
+    ...event,
+    ...(event.response_id === upstreamId ? { response_id: bridgeId } : {}),
+  };
+  if (!response || typeof response !== 'object' || (response as Record<string, unknown>).id !== upstreamId) return mapped;
+  return { ...mapped, response: { ...(response as Record<string, unknown>), id: bridgeId } };
 };
 
 const responseIdFromEvent = (event: ResponseEvent) => {
@@ -724,7 +728,12 @@ const streamNativeResponses = async ({
       retryAttempt = undefined;
     }
     const abort = new AbortController();
-    let timeout: ReturnType<typeof setTimeout> | undefined = setTimeout(() => abort.abort(), options.firstEventTimeoutMs ?? 30_000);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const armTimeout = (milliseconds: number) => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(() => abort.abort(), milliseconds);
+    };
+    armTimeout(options.firstEventTimeoutMs ?? 30_000);
     const finishAttempt = () => { if (timeout) clearTimeout(timeout); timeout = undefined; };
     const attemptId = state.startAttempt(id);
     if (index > 0) metrics.upstreamSwitches += 1;
@@ -770,22 +779,26 @@ const streamNativeResponses = async ({
         if (typeof raw.type !== 'string') throw new Error('Invalid upstream Responses event');
         upstreamResponseId ??= responseIdFromEvent(raw);
         if (upstreamResponseId) state.setNativeUpstream(id, { baseUrl: upstream.baseUrl, identity: upstreamIdentity(upstream), responseId: upstreamResponseId });
-        const event = (upstreamResponseId ? replaceResponseId(raw, upstreamResponseId, id) : raw) as ResponseEvent;
+        const event = upstreamResponseId ? replaceResponseId(raw, upstreamResponseId, id) : raw;
         const terminal = event.type === 'response.completed' || event.type === 'response.failed' || event.type === 'response.cancelled';
         const preamble = event.type === 'response.created' || event.type === 'response.in_progress';
         if (!preamble && !upstreamResponseId) throw new Error('Upstream Response ID is missing');
         if (terminal && event.type !== 'response.completed' && !outputStarted) throw new Error('Upstream Responses failed before output');
         if (preamble) {
           pending.push(event);
+          armTimeout(options.outputIdleTimeoutMs ?? 60_000);
           continue;
         }
         outputStarted = true;
         if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') failedOutputText += event.delta;
-        if (timeout) {
-          clearTimeout(timeout);
-          timeout = setTimeout(() => abort.abort(), options.outputIdleTimeoutMs ?? 60_000);
-        }
+        armTimeout(options.outputIdleTimeoutMs ?? 60_000);
         start();
+        if (event.type === 'response.output_item.done'
+          && Number.isInteger(event.output_index) && Number(event.output_index) >= 0
+          && event.item && typeof event.item === 'object'
+          && ['message', 'function_call', 'custom_tool_call', 'web_search_call'].includes(String((event.item as Record<string, unknown>).type))) {
+          state.appendOutputItem(id, Number(event.output_index), event.item as OutputItem);
+        }
         if (event.type === 'response.completed') {
           finishAttempt();
           terminalSse(response, state, id, 'completed', failedOutputText, event, { id: attemptId, result: 'completed', preOutputFailure: false });
@@ -945,7 +958,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         catch { sendError(response, 400, 'Previous response was not found', 'previous_response_not_found'); return; }
       }
       const callKinds = new Map((ancestors.at(-1)?.output ?? [])
-        .filter((item): item is Exclude<OutputItem, { type: 'message' }> => item.type !== 'message')
+        .filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call')
         .map((item) => [item.call_id, item.type]));
       const nativeParent = ancestors.at(-1)?.nativeUpstream;
       if (!nativeParent && input.some((item) => {

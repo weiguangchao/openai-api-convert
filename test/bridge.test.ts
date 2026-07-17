@@ -199,12 +199,14 @@ const startScriptedFixture = async (scripts: Array<{ status?: number; frames?: s
 const nativeWebSearchFrames = (upstreamResponseId: string, text = 'Search result.') => [
   `data: {"type":"response.created","response":{"id":"${upstreamResponseId}","object":"response","status":"in_progress","output":[]}}\r\n\r\n`,
   `data: {"type":"response.web_search_call.in_progress","output_index":0,"item_id":"ws_1"}\r\n\r\n`,
+  'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed"}}\r\n\r\n',
   `data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"${text}"}\r\n\r\n`,
   'data: {"type":"response.output_text.annotation.added","item_id":"msg_1","output_index":1,"content_index":0,"annotation_index":0,"annotation":{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":6}}\r\n\r\n',
+  `data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"${text}"}]}}\r\n\r\n`,
   `data: {"type":"response.completed","response":{"id":"${upstreamResponseId}","object":"response","status":"completed","output":[]}}\r\n\r\n`,
 ];
 
-const startNativeResponsesFixture = async (scripts: Array<{ status?: number; frames?: string[] }>) => {
+const startNativeResponsesFixture = async (scripts: Array<{ status?: number; frames?: string[]; waitAfterFirstFrameMs?: number }>) => {
   const requests: Array<{ url?: string; body: unknown }> = [];
   const authorizations: string[] = [];
   const server = createServer(async (request, response) => {
@@ -219,6 +221,12 @@ const startNativeResponsesFixture = async (scripts: Array<{ status?: number; fra
     authorizations.push(String(request.headers.authorization));
     const script = scripts[requests.length - 1] ?? { status: 500 };
     response.writeHead(script.status ?? 200, { 'content-type': script.status && script.status >= 400 ? 'application/json' : 'text/event-stream' });
+    if (script.waitAfterFirstFrameMs && script.frames?.length) {
+      response.write(script.frames[0]);
+      await new Promise((resolve) => setTimeout(resolve, script.waitAfterFirstFrameMs));
+      response.end(script.frames.slice(1).join(''));
+      return;
+    }
     response.end(script.frames?.join('') ?? '{"error":"unavailable"}');
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -969,6 +977,15 @@ test('web-search-supported preserves native Responses SSE, controls, citations, 
     assert.equal(primary.requests.length, 1);
 
     await bridge.close();
+    const state = new DatabaseSync(join(dir, 'state.db'));
+    try {
+      assert.deepEqual(state.prepare('SELECT item_json FROM output_items ORDER BY output_index').all().map((row) => JSON.parse(String(row.item_json))), [
+        { id: 'ws_1', type: 'web_search_call', status: 'completed' },
+        { id: 'msg_1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'Search result.' }] },
+      ]);
+    } finally {
+      state.close();
+    }
     bridge = await startBridge({
       apiKey: 'bridge-key',
       upstreams: [
@@ -1190,6 +1207,94 @@ test('web-search-failover retries a native Responses upstream before output', as
     assert.deepEqual(bridge.state.attemptDetails().map(({ result, preOutputFailure }) => ({ result, preOutputFailure })), [
       { result: 'failed', preOutputFailure: true }, { result: 'completed', preOutputFailure: false },
     ]);
+  } finally {
+    await bridge?.close();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('native Responses rewrites only protocol Response IDs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_1', 'upstream_resp_1') }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
+    });
+    const events = sseTypes(await response.text()) as Array<{ type: string; delta?: string; response?: { id: string } }>;
+    assert.equal(events.find(({ type }) => type === 'response.output_text.delta')?.delta, 'upstream_resp_1');
+    assert.notEqual(events.find(({ type }) => type === 'response.completed')?.response?.id, 'upstream_resp_1');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('web-search-failover retries after a native Responses preamble stalls', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const first = await startNativeResponsesFixture([{
+    frames: [nativeWebSearchFrames('upstream_stalled')[0]], waitAfterFirstFrameMs: 200,
+  }]);
+  const second = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_2') }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: first.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+        { baseUrl: second.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+      ],
+      statePath: join(dir, 'state.db'), outputIdleTimeoutMs: 20,
+    });
+    const startedAt = Date.now();
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
+    });
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert(Date.now() - startedAt < 150);
+    assert.equal(first.requests.length, 1);
+    assert.equal(second.requests.length, 1);
+  } finally {
+    await bridge?.close();
+    await first.close();
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('native Responses pre-stream rejection does not retry or persist a Response', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const first = await startNativeResponsesFixture([{ status: 400 }]);
+  const second = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_2') }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: first.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+        { baseUrl: second.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'upstream_rejected');
+    assert.equal(first.requests.length, 1);
+    assert.equal(second.requests.length, 0);
+    assert.deepEqual(bridge.state.responses(), []);
   } finally {
     await bridge?.close();
     await first.close();
