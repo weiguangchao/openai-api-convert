@@ -4,13 +4,20 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
 type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
-type BridgeOptions = {
+export type StatePolicy = {
+  responseRetentionDays?: number;
+  attemptRetentionDays?: number;
+  cleanupThresholdBytes?: number;
+  hardLimitBytes?: number;
+};
+export type BridgeOptions = {
   apiKey: string;
   upstreams: Upstream[];
   statePath: string;
   port?: number;
   firstEventTimeoutMs?: number;
   outputIdleTimeoutMs?: number;
+  statePolicy?: StatePolicy;
 };
 type StoredEvent = { sequence: number; type: string };
 type ResponseEvent = { type: string; [key: string]: unknown };
@@ -25,7 +32,11 @@ type OutputItem =
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string }
   | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string };
 type StoredResponse = { id: string; parentId?: string; model: string; input: InputItem[]; tools: Tool[]; parallelToolCalls: boolean; output: OutputItem[] };
-type IdempotencyClaim = { kind: 'created'; responseId: string } | { kind: 'reused'; responseId: string } | { kind: 'conflict' };
+type IdempotencyClaim =
+  | { kind: 'created'; responseId: string }
+  | { kind: 'reused'; responseId: string }
+  | { kind: 'conflict' }
+  | { kind: 'capacity_exceeded' };
 type ChatToolCall =
   | { id: string; type: 'function'; function: { name: string; arguments: string } }
   | { id: string; type: 'custom'; custom: { name: string; input: string } };
@@ -34,10 +45,35 @@ type ChatMessage =
   | { role: 'tool'; tool_call_id: string; content: string }
   | { role: 'assistant'; content?: string; tool_calls?: ChatToolCall[] };
 
+type ResolvedStatePolicy = Required<StatePolicy>;
+type StateObservability = {
+  bytes: number;
+  cleanupRuns: number;
+  deletedChains: number;
+  reclaimedBytes: number;
+  capacityRejections: number;
+  lastCleanup?: { startedAt: number; endedAt: number; deletedChains: number; reclaimedBytes: number; failureReason?: 'cleanup_failed' };
+};
+
+const GIB = 1024 ** 3;
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
+const defaultStatePolicy: ResolvedStatePolicy = {
+  responseRetentionDays: 30,
+  attemptRetentionDays: 7,
+  cleanupThresholdBytes: 8 * GIB,
+  hardLimitBytes: 10 * GIB,
+};
+
 class StateStore {
   #db: DatabaseSync;
+  #policy: ResolvedStatePolicy;
+  #cleanupTimer?: ReturnType<typeof setInterval>;
+  #observability: StateObservability = { bytes: 0, cleanupRuns: 0, deletedChains: 0, reclaimedBytes: 0, capacityRejections: 0 };
 
-  constructor(path: string) {
+  constructor(path: string, policy: ResolvedStatePolicy) {
+    this.#policy = policy;
     try {
       this.#db = new DatabaseSync(path);
       this.#db.exec(`
@@ -50,7 +86,9 @@ class StateStore {
           tools_json TEXT NOT NULL DEFAULT '[]',
           parallel_tool_calls INTEGER NOT NULL DEFAULT 0,
           context_complete INTEGER NOT NULL DEFAULT 1,
-          output_text TEXT NOT NULL DEFAULT ''
+          output_text TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL DEFAULT 0,
+          terminal_at INTEGER
         ) STRICT;
         CREATE TABLE IF NOT EXISTS output_items (
           response_id TEXT NOT NULL,
@@ -73,7 +111,8 @@ class StateStore {
         ) STRICT;
         CREATE TABLE IF NOT EXISTS attempts (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          response_id TEXT NOT NULL
+          response_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL DEFAULT 0
         ) STRICT;
       `);
       this.#addColumn('parent_id TEXT');
@@ -82,6 +121,16 @@ class StateStore {
       this.#addColumn("tools_json TEXT NOT NULL DEFAULT '[]'");
       this.#addColumn('parallel_tool_calls INTEGER NOT NULL DEFAULT 0');
       this.#addColumn('context_complete INTEGER NOT NULL DEFAULT 0');
+      const responseCreatedAtAdded = this.#addColumn('created_at INTEGER NOT NULL DEFAULT 0');
+      const terminalAtAdded = this.#addColumn('terminal_at INTEGER');
+      const attemptCreatedAtAdded = this.#addAttemptColumn('created_at INTEGER NOT NULL DEFAULT 0');
+      const now = Date.now();
+      if (responseCreatedAtAdded) this.#db.prepare('UPDATE responses SET created_at = ? WHERE created_at = 0').run(now);
+      if (terminalAtAdded) this.#db.prepare("UPDATE responses SET terminal_at = ? WHERE status IN ('completed', 'failed', 'cancelled', 'incomplete')").run(now);
+      if (attemptCreatedAtAdded) this.#db.prepare('UPDATE attempts SET created_at = ? WHERE created_at = 0').run(now);
+      this.cleanup();
+      this.#cleanupTimer = setInterval(() => this.cleanup(), HOUR);
+      this.#cleanupTimer.unref?.();
     } catch (error) {
       throw new Error(`State Store is not writable: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -90,16 +139,129 @@ class StateStore {
   #addColumn(definition: string) {
     const name = definition.split(' ')[0];
     const columns = this.#db.prepare('PRAGMA table_info(responses)').all().map((row) => String(row.name));
-    if (!columns.includes(name)) this.#db.exec(`ALTER TABLE responses ADD COLUMN ${definition}`);
+    if (columns.includes(name)) return false;
+    this.#db.exec(`ALTER TABLE responses ADD COLUMN ${definition}`);
+    return true;
+  }
+
+  #addAttemptColumn(definition: string) {
+    const name = definition.split(' ')[0];
+    const columns = this.#db.prepare('PRAGMA table_info(attempts)').all().map((row) => String(row.name));
+    if (columns.includes(name)) return false;
+    this.#db.exec(`ALTER TABLE attempts ADD COLUMN ${definition}`);
+    return true;
   }
 
   #createResponse(response: Omit<StoredResponse, 'output'>) {
     this.#db.prepare(
-      'INSERT INTO responses (id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, context_complete) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
-    ).run(response.id, response.parentId ?? null, 'in_progress', response.model, JSON.stringify(response.input), JSON.stringify(response.tools), Number(response.parallelToolCalls));
+      'INSERT INTO responses (id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, context_complete, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)',
+    ).run(response.id, response.parentId ?? null, 'in_progress', response.model, JSON.stringify(response.input), JSON.stringify(response.tools), Number(response.parallelToolCalls), Date.now());
+  }
+
+  #bytes() {
+    const pageCount = Number((this.#db.prepare('PRAGMA page_count').get() as Record<string, unknown>).page_count);
+    const pageSize = Number((this.#db.prepare('PRAGMA page_size').get() as Record<string, unknown>).page_size);
+    return pageCount * pageSize;
+  }
+
+  #chainRows(rootId: string) {
+    return this.#db.prepare(`
+      WITH RECURSIVE response_chain(id) AS (
+        VALUES (?)
+        UNION ALL
+        SELECT responses.id FROM responses JOIN response_chain ON responses.parent_id = response_chain.id
+      )
+      SELECT id, status, terminal_at FROM responses WHERE id IN response_chain
+    `).all(rootId).map((row) => ({
+      id: String(row.id), status: String(row.status), terminalAt: row.terminal_at === null ? undefined : Number(row.terminal_at),
+    }));
+  }
+
+  #deleteChain(ids: string[]) {
+    const placeholders = ids.map(() => '?').join(', ');
+    this.#db.prepare(`DELETE FROM output_items WHERE response_id IN (${placeholders})`).run(...ids);
+    this.#db.prepare(`DELETE FROM stream_events WHERE response_id IN (${placeholders})`).run(...ids);
+    this.#db.prepare(`DELETE FROM idempotency_records WHERE response_id IN (${placeholders})`).run(...ids);
+    this.#db.prepare(`DELETE FROM attempts WHERE response_id IN (${placeholders})`).run(...ids);
+    this.#db.prepare(`DELETE FROM responses WHERE id IN (${placeholders})`).run(...ids);
+  }
+
+  cleanup(limit = this.#policy.cleanupThresholdBytes) {
+    const startedAt = Date.now();
+    const beforeBytes = this.#bytes();
+    let deletedChains = 0;
+    try {
+      const responseCutoff = startedAt - this.#policy.responseRetentionDays * DAY;
+      const attemptCutoff = startedAt - this.#policy.attemptRetentionDays * DAY;
+      let deletedAttempts = 0;
+      this.#db.exec('BEGIN IMMEDIATE');
+      try {
+        deletedAttempts = Number(this.#db.prepare(`
+          DELETE FROM attempts WHERE created_at < ? AND response_id IN (
+            SELECT id FROM responses WHERE status IN ('completed', 'failed', 'cancelled', 'incomplete')
+          )
+        `).run(attemptCutoff).changes);
+        this.#db.exec('COMMIT');
+      } catch (error) {
+        this.#db.exec('ROLLBACK');
+        throw error;
+      }
+      if (deletedAttempts) this.#db.exec('VACUUM');
+      const roots = this.#db.prepare('SELECT id FROM responses WHERE parent_id IS NULL ORDER BY terminal_at, id').all();
+      for (const root of roots) {
+        if (this.#bytes() < limit) break;
+        const chain = this.#chainRows(String(root.id));
+        const lastTerminalAt = Math.max(...chain.map(({ terminalAt }) => terminalAt ?? Number.POSITIVE_INFINITY));
+        if (!chain.length || !chain.every(({ status }) => terminalStatuses.has(status)) || lastTerminalAt >= responseCutoff) continue;
+        this.#db.exec('BEGIN IMMEDIATE');
+        try {
+          this.#deleteChain(chain.map(({ id }) => id));
+          this.#db.exec('COMMIT');
+        } catch (error) {
+          this.#db.exec('ROLLBACK');
+          throw error;
+        }
+        this.#db.exec('VACUUM');
+        deletedChains += 1;
+      }
+      const reclaimedBytes = Math.max(0, beforeBytes - this.#bytes());
+      this.#observability.cleanupRuns += 1;
+      this.#observability.deletedChains += deletedChains;
+      this.#observability.reclaimedBytes += reclaimedBytes;
+      this.#observability.bytes = this.#bytes();
+      this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes };
+      console.info(JSON.stringify({ event: 'state_store_cleanup', deleted_chains: deletedChains, reclaimed_bytes: reclaimedBytes }));
+    } catch {
+      this.#observability.cleanupRuns += 1;
+      this.#observability.bytes = this.#bytes();
+      this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes: 0, failureReason: 'cleanup_failed' };
+      console.error(JSON.stringify({ event: 'state_store_cleanup', failure_reason: 'cleanup_failed' }));
+    }
+  }
+
+  #hasCapacityFor(response: Omit<StoredResponse, 'output'>) {
+    const reservedBytes = Buffer.byteLength(JSON.stringify(response.input)) + Buffer.byteLength(JSON.stringify(response.tools)) + 1024;
+    if (this.#bytes() + reservedBytes >= this.#policy.cleanupThresholdBytes) {
+      this.cleanup(Math.max(0, this.#policy.cleanupThresholdBytes - reservedBytes));
+    }
+    if (this.#bytes() + reservedBytes < this.#policy.hardLimitBytes) return true;
+    this.#observability.capacityRejections += 1;
+    this.#observability.bytes = this.#bytes();
+    return false;
   }
 
   claimResponse(response: Omit<StoredResponse, 'output'>, idempotency?: { subject: string; key: string; hash: string }): IdempotencyClaim {
+    if (idempotency) {
+      const existing = this.#db.prepare(
+        'SELECT request_hash, response_id FROM idempotency_records WHERE auth_subject = ? AND key = ?',
+      ).get(idempotency.subject, idempotency.key) as Record<string, unknown> | undefined;
+      if (existing) {
+        return String(existing.request_hash) === idempotency.hash
+          ? { kind: 'reused', responseId: String(existing.response_id) }
+          : { kind: 'conflict' };
+      }
+    }
+    if (!this.#hasCapacityFor(response)) return { kind: 'capacity_exceeded' };
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       if (idempotency) {
@@ -133,7 +295,7 @@ class StateStore {
   }
 
   startAttempt(responseId: string) {
-    this.#db.prepare('INSERT INTO attempts (response_id) VALUES (?)').run(responseId);
+    this.#db.prepare('INSERT INTO attempts (response_id, created_at) VALUES (?, ?)').run(responseId, Date.now());
   }
 
   appendEvent(responseId: string, event: ResponseEvent): StoredEvent {
@@ -146,8 +308,8 @@ class StateStore {
   terminal(id: string, status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent): StoredEvent {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
-      this.#db.prepare('UPDATE responses SET status = ?, output_text = ? WHERE id = ?')
-        .run(status, outputText, id);
+      this.#db.prepare('UPDATE responses SET status = ?, output_text = ?, terminal_at = COALESCE(terminal_at, ?) WHERE id = ?')
+        .run(status, outputText, Date.now(), id);
       const stored = this.appendEvent(id, event);
       this.#db.exec('COMMIT');
       return stored;
@@ -208,6 +370,10 @@ class StateStore {
       .all().map((row) => ({ responseId: String(row.response_id) }));
   }
 
+  observability(): StateObservability {
+    return { ...this.#observability, bytes: this.#bytes(), lastCleanup: this.#observability.lastCleanup && { ...this.#observability.lastCleanup } };
+  }
+
   discardRejectedResponse(id: string) {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
@@ -225,12 +391,15 @@ class StateStore {
       .all().map((row) => ({ status: String(row.status), outputText: String(row.output_text) }));
   }
 
-  close() { this.#db.close(); }
+  close() {
+    if (this.#cleanupTimer) clearInterval(this.#cleanupTimer);
+    this.#db.close();
+  }
 }
 
 export type RunningBridge = {
   url: string;
-  state: Pick<StateStore, 'events' | 'responses' | 'attempts'>;
+  state: Pick<StateStore, 'events' | 'responses' | 'attempts' | 'observability'>;
   close: () => Promise<void>;
 };
 
@@ -405,11 +574,16 @@ const assertOptions = (options: BridgeOptions) => {
   if (options.outputIdleTimeoutMs !== undefined && (!Number.isInteger(options.outputIdleTimeoutMs) || options.outputIdleTimeoutMs <= 0)) {
     throw new Error('Output idle timeout must be a positive integer');
   }
+  for (const value of Object.values(options.statePolicy ?? {})) {
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error('State Store policy values must be positive integers');
+  }
+  const policy = { ...defaultStatePolicy, ...options.statePolicy };
+  if (policy.cleanupThresholdBytes >= policy.hardLimitBytes) throw new Error('State Store cleanup threshold must be below the hard limit');
 };
 
 export const startBridge = async (options: BridgeOptions): Promise<RunningBridge> => {
   assertOptions(options);
-  const state = new StateStore(options.statePath);
+  const state = new StateStore(options.statePath, { ...defaultStatePolicy, ...options.statePolicy });
   let server: Server | undefined;
   try {
     server = createServer(async (request, response) => {
@@ -505,6 +679,10 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       });
       if (claim.kind === 'conflict') {
         sendError(response, 409, 'Idempotency-Key is already used for a different request', 'idempotency_key_conflict');
+        return;
+      }
+      if (claim.kind === 'capacity_exceeded') {
+        sendError(response, 503, 'State Store capacity is exhausted', 'state_store_capacity_exceeded');
         return;
       }
       if (claim.kind === 'reused') {

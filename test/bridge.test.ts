@@ -206,6 +206,111 @@ test('rejects invalid startup configuration', async () => {
   }
 });
 
+test('State Store startup cleanup removes only expired terminal Response Chains and safe observability', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const statePath = join(dir, 'state.db');
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = sseTypes(await (await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'first retained input' }),
+    })).text());
+    const responseId = (first[0] as unknown as { response: { id: string } }).response.id;
+    await (await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'second retained input', previous_response_id: responseId }),
+    })).text();
+    await bridge.close();
+    bridge = undefined;
+
+    const database = new DatabaseSync(statePath);
+    database.exec(`
+      UPDATE responses SET terminal_at = 0;
+      UPDATE attempts SET created_at = 0;
+      INSERT INTO responses (id, status, model, input_json, tools_json, parallel_tool_calls, context_complete, output_text, created_at)
+      VALUES ('resp_active', 'in_progress', 'gpt-test', '[]', '[]', 0, 1, '', 0);
+      INSERT INTO attempts (response_id, created_at) VALUES ('resp_active', 0);
+    `);
+    database.close();
+
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1_000_000, hardLimitBytes: 2_000_000, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+    assert.deepEqual(bridge.state.responses(), [
+      { status: 'completed', outputText: 'Hello world' },
+      { status: 'completed', outputText: 'Hello world' },
+      { status: 'in_progress', outputText: '' },
+    ]);
+    assert.deepEqual(bridge.state.attempts(), [{ responseId: 'resp_active' }]);
+    await bridge.close();
+
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1, hardLimitBytes: 1_000_000, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+    assert.deepEqual(bridge.state.responses(), [{ status: 'in_progress', outputText: '' }]);
+    assert.deepEqual(bridge.state.events(), []);
+    assert.deepEqual(bridge.state.attempts(), [{ responseId: 'resp_active' }]);
+    const observability = bridge.state.observability();
+    assert.equal(observability.deletedChains, 1);
+    assert.equal(JSON.stringify(observability).includes('retained input'), false);
+    assert.equal(JSON.stringify(observability).includes('bridge-key'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('State Store rejects a new Response before writes at the hard capacity limit', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const statePath = join(dir, 'state.db');
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+    });
+    const bytes = bridge.state.observability().bytes;
+    await bridge.close();
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: Math.max(1, bytes - 1), hardLimitBytes: bytes, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'must not be stored' }),
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: { message: 'State Store capacity is exhausted', type: 'invalid_request_error', param: null, code: 'state_store_capacity_exceeded' },
+    });
+    assert.deepEqual(bridge.state.responses(), []);
+    assert.deepEqual(bridge.state.attempts(), []);
+    assert.equal(bridge.state.observability().capacityRejections, 1);
+    assert.equal(upstream.requests.length, 0);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('bridges a text stream into ordered Responses SSE', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
