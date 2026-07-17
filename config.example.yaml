@@ -2,12 +2,13 @@ apiKey: replace-with-bridge-api-key
 upstreams:
   - baseUrl: https://upstream.example.com
     apiKey: replace-with-upstream-api-key
+    wireApi: responses
     capabilities:
       functionTools: true
       customTools: true
       parallelToolCalls: true
-statePath: ./response-bridge.db
-port: 3000
+      webSearch: true
+port: 8417
 firstEventTimeoutMs: 30000
 outputIdleTimeoutMs: 60000
 statePolicy:
