@@ -13,7 +13,8 @@
 - **Stream Event**: 向客户端发出的、带单调序号的 Responses 语义 SSE 事件。
 - **Compatibility Fixture**: 可重复的脚本化上游交互，连同对 Bridge 可观察结果的预期，用于验证协议与故障契约。
 - **Service Runtime**: Node.js + TypeScript。
-- **Upstream Pool**: 由环境变量配置的有序 Chat Completions 上游；请求失败时按顺序切换。
+- **Bridge Configuration**: 部署方持有的单个 YAML 配置，声明 Bridge 认证、Upstream Pool 与运行策略；不从服务进程环境读取配置。
+- **Upstream Pool**: 由 Bridge 配置文件声明的有序 Chat Completions 上游；请求失败时按顺序切换。
 - **Upstream Capability Profile**: 启动配置显式声明的 Function Tool、双向 Custom Tool 与并行调用能力；Bridge 按请求筛选兼容上游。
 - **State Store**: SQLite；保存响应、会话、工具调用与重试所需状态。
 - **Idempotent Request**: 同一 Bridge Authentication 主体的 `POST /v1/responses`，以 `Idempotency-Key` 和规范化已接受请求的摘要识别；命中时复用同一 Response。
