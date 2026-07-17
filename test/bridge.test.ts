@@ -574,6 +574,61 @@ test('function-single Compatibility Fixture continues a Response Chain', async (
   }
 });
 
+test('store:false Response Chain accepts echoed assistant input from prior turn', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, store: false, input: 'hi' }),
+    });
+    const firstBody = await first.text();
+    assert.equal(first.status, 200);
+    const firstEvents = sseTypes(firstBody);
+    const firstCompleted = firstEvents.find(({ type }) => type === 'response.completed') as unknown as {
+      response: { id: string; output: Array<{ type: string; role?: string; content?: unknown }> };
+    };
+    const assistant = firstCompleted.response.output.find((item) => item.type === 'message');
+    assert(assistant);
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        stream: true,
+        store: false,
+        previous_response_id: firstCompleted.response.id,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+          assistant,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi again' }] },
+        ],
+      }),
+    });
+    const secondBody = await second.text();
+    assert.equal(second.status, 200, secondBody);
+    assert.equal(sseTypes(secondBody).at(-1)?.type, 'response.completed');
+    assert.deepEqual(upstream.requests[1], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'Hello world' },
+        { role: 'user', content: 'hi again' },
+      ],
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('function-parallel Compatibility Fixture preserves call order in a Response Chain', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startFunctionFixture(functionParallelStreams);
