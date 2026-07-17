@@ -1,4 +1,4 @@
-import { startBridge } from './server.ts';
+import { log, startBridge } from './server.ts';
 
 const upstreams = JSON.parse(process.env.UPSTREAM_POOL ?? '[]');
 const optionalNumber = (name: string) => process.env[name] === undefined ? undefined : Number(process.env[name]);
@@ -15,4 +15,4 @@ const bridge = await startBridge({
   port: process.env.PORT ? Number(process.env.PORT) : undefined,
   statePolicy: Object.fromEntries(Object.entries(statePolicy).filter(([, value]) => value !== undefined)),
 });
-console.log(`Response Bridge listening at ${bridge.url}`);
+log('info', 'bridge_started');

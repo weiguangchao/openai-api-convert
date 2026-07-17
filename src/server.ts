@@ -54,6 +54,12 @@ type StateObservability = {
   capacityRejections: number;
   lastCleanup?: { startedAt: number; endedAt: number; deletedChains: number; reclaimedBytes: number; failureReason?: 'cleanup_failed' };
 };
+type Metrics = {
+  requests: number;
+  failures: number;
+  durationMs: number;
+  upstreamSwitches: number;
+};
 
 const GIB = 1024 ** 3;
 const HOUR = 60 * 60 * 1000;
@@ -65,6 +71,40 @@ const defaultStatePolicy: ResolvedStatePolicy = {
   cleanupThresholdBytes: 8 * GIB,
   hardLimitBytes: 10 * GIB,
 };
+
+const requestIds = new WeakMap<ServerResponse, string>();
+const errorCodes = new WeakMap<ServerResponse, string>();
+
+export const log = (level: 'info' | 'error', event: string, fields: {
+  requestId?: string | null;
+  responseId?: string | null;
+  durationMs?: number;
+  errorCode?: string | null;
+  [key: string]: string | number | null | undefined;
+} = {}) => {
+  const entry = {
+    timestamp: new Date().toISOString(), level, event,
+    request_id: fields.requestId ?? null,
+    response_id: fields.responseId ?? null,
+    duration_ms: fields.durationMs ?? 0,
+    error_code: fields.errorCode ?? null,
+    ...Object.fromEntries(Object.entries(fields).filter(([key]) => !['requestId', 'responseId', 'durationMs', 'errorCode'].includes(key))),
+  };
+  console[level](JSON.stringify(entry));
+};
+
+const prometheus = (metrics: Metrics, observability: StateObservability) => [
+  '# TYPE bridge_requests_total counter', `bridge_requests_total ${metrics.requests}`,
+  '# TYPE bridge_request_failures_total counter', `bridge_request_failures_total ${metrics.failures}`,
+  '# TYPE bridge_request_duration_seconds_sum counter', `bridge_request_duration_seconds_sum ${metrics.durationMs / 1_000}`,
+  '# TYPE bridge_request_duration_seconds_count counter', `bridge_request_duration_seconds_count ${metrics.requests}`,
+  '# TYPE bridge_upstream_switches_total counter', `bridge_upstream_switches_total ${metrics.upstreamSwitches}`,
+  '# TYPE bridge_state_store_bytes gauge', `bridge_state_store_bytes ${observability.bytes}`,
+  '# TYPE bridge_state_store_cleanup_runs_total counter', `bridge_state_store_cleanup_runs_total ${observability.cleanupRuns}`,
+  '# TYPE bridge_state_store_deleted_chains_total counter', `bridge_state_store_deleted_chains_total ${observability.deletedChains}`,
+  '# TYPE bridge_state_store_reclaimed_bytes_total counter', `bridge_state_store_reclaimed_bytes_total ${observability.reclaimedBytes}`,
+  '# TYPE bridge_state_store_capacity_rejections_total counter', `bridge_state_store_capacity_rejections_total ${observability.capacityRejections}`,
+].join('\n') + '\n';
 
 class StateStore {
   #db: DatabaseSync;
@@ -230,12 +270,12 @@ class StateStore {
       this.#observability.reclaimedBytes += reclaimedBytes;
       this.#observability.bytes = this.#bytes();
       this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes };
-      console.info(JSON.stringify({ event: 'state_store_cleanup', deleted_chains: deletedChains, reclaimed_bytes: reclaimedBytes }));
+      log('info', 'state_store_cleanup', { durationMs: Date.now() - startedAt, deleted_chains: deletedChains, reclaimed_bytes: reclaimedBytes });
     } catch {
       this.#observability.cleanupRuns += 1;
       this.#observability.bytes = this.#bytes();
       this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes: 0, failureReason: 'cleanup_failed' };
-      console.error(JSON.stringify({ event: 'state_store_cleanup', failure_reason: 'cleanup_failed' }));
+      log('error', 'state_store_cleanup', { durationMs: Date.now() - startedAt, errorCode: 'cleanup_failed' });
     }
   }
 
@@ -374,6 +414,15 @@ class StateStore {
     return { ...this.#observability, bytes: this.#bytes(), lastCleanup: this.#observability.lastCleanup && { ...this.#observability.lastCleanup } };
   }
 
+  isReady() {
+    try {
+      this.#db.prepare('SELECT 1').get();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   discardRejectedResponse(id: string) {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
@@ -403,9 +452,28 @@ export type RunningBridge = {
   close: () => Promise<void>;
 };
 
+const upstreamReady = async (upstream: Upstream) => {
+  try {
+    const response = await fetch(new URL('/v1/models', upstream.baseUrl), {
+      headers: { authorization: `Bearer ${upstream.apiKey}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+};
+
 const sendError = (response: ServerResponse, status: number, message: string, code: string) => {
-  response.writeHead(status, { 'content-type': 'application/json', 'x-request-id': randomUUID() });
+  errorCodes.set(response, code);
+  response.writeHead(status, { 'content-type': 'application/json', 'x-request-id': requestIds.get(response) ?? randomUUID() });
   response.end(JSON.stringify({ error: { message, type: 'invalid_request_error', param: null, code } }));
+};
+
+const requireBridgeAuthentication = (request: IncomingMessage, response: ServerResponse, apiKey: string) => {
+  if (request.headers.authorization === `Bearer ${apiKey}`) return true;
+  sendError(response, 401, 'Invalid authentication credentials', 'invalid_api_key');
+  return false;
 };
 
 const readJson = async (request: IncomingMessage): Promise<unknown> => {
@@ -510,6 +578,7 @@ const finishUpstreamFailure = (response: ServerResponse, store: StateStore, id: 
     sendError(response, status, message, code);
     return;
   }
+  errorCodes.set(response, code);
   failedSse(response, store, id, model);
 };
 
@@ -584,17 +653,62 @@ const assertOptions = (options: BridgeOptions) => {
 export const startBridge = async (options: BridgeOptions): Promise<RunningBridge> => {
   assertOptions(options);
   const state = new StateStore(options.statePath, { ...defaultStatePolicy, ...options.statePolicy });
+  const metrics: Metrics = { requests: 0, failures: 0, durationMs: 0, upstreamSwitches: 0 };
   let server: Server | undefined;
   try {
     server = createServer(async (request, response) => {
+      const requestId = randomUUID();
+      const startedAt = Date.now();
+      let responseId: string | undefined;
+      requestIds.set(response, requestId);
+      response.setHeader('x-request-id', requestId);
+      const measuresRequest = request.method === 'POST' && request.url === '/v1/responses';
+      let observed = false;
+      const observeRequest = (disconnected = false) => {
+        if (observed) return;
+        observed = true;
+        if (disconnected && !errorCodes.has(response)) errorCodes.set(response, 'client_disconnected');
+        const durationMs = Date.now() - startedAt;
+        if (measuresRequest) {
+          metrics.requests += 1;
+          metrics.durationMs += durationMs;
+        }
+        const errorCode = errorCodes.get(response) ?? null;
+        if (measuresRequest && (response.statusCode >= 400 || errorCode)) metrics.failures += 1;
+        log(response.statusCode >= 400 || errorCode ? 'error' : 'info', 'http_request_completed', {
+          requestId, responseId: responseId ?? null, durationMs, errorCode, method: request.method ?? null, status: response.statusCode,
+        });
+      };
+      response.once('finish', observeRequest);
+      response.once('close', () => queueMicrotask(() => observeRequest(!response.writableEnded)));
+      request.once('aborted', () => queueMicrotask(() => observeRequest(true)));
+      if (request.method === 'GET' && request.url === '/healthz') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ status: 'ok' }));
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/readyz') {
+        if (!requireBridgeAuthentication(request, response, options.apiKey)) return;
+        const upstreamAvailable = await Promise.any(options.upstreams.map(async (upstream) => {
+          if (await upstreamReady(upstream)) return true;
+          throw new Error('upstream unavailable');
+        })).catch(() => false);
+        const ready = state.isReady() && upstreamAvailable;
+        response.writeHead(ready ? 200 : 503, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ status: ready ? 'ready' : 'not_ready' }));
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/metrics') {
+        if (!requireBridgeAuthentication(request, response, options.apiKey)) return;
+        response.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+        response.end(prometheus(metrics, state.observability()));
+        return;
+      }
       if (request.method !== 'POST' || request.url !== '/v1/responses') {
         sendError(response, 404, 'Not found', 'not_found');
         return;
       }
-      if (request.headers.authorization !== `Bearer ${options.apiKey}`) {
-        sendError(response, 401, 'Invalid authentication credentials', 'invalid_api_key');
-        return;
-      }
+      if (!requireBridgeAuthentication(request, response, options.apiKey)) return;
       const idempotencyKey = request.headers['idempotency-key'];
       if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || !idempotencyKey)) {
         sendError(response, 400, 'Idempotency-Key must be a non-empty string', 'invalid_idempotency_key');
@@ -686,20 +800,23 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         return;
       }
       if (claim.kind === 'reused') {
+        responseId = claim.responseId;
         response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
         await replaySse(response, state, claim.responseId);
         return;
       }
+      responseId = id;
 
       let streamStarted = false;
       let cancelled = false;
       let activeAbort: AbortController | undefined;
       let failedOutputText = '';
-      const cancel = () => { cancelled = true; activeAbort?.abort(); };
+      const cancel = () => { errorCodes.set(response, 'client_disconnected'); cancelled = true; activeAbort?.abort(); };
       const onResponseClose = () => { if (!response.writableEnded) cancel(); };
       request.once('aborted', cancel);
       response.once('close', onResponseClose);
       try {
+        let upstreamAttempts = 0;
         for (const upstream of upstreams) {
           if (cancelled) break;
           const abort = new AbortController();
@@ -715,6 +832,8 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           };
           armTimeout(options.firstEventTimeoutMs ?? 30_000);
           state.startAttempt(id);
+          if (upstreamAttempts > 0) metrics.upstreamSwitches += 1;
+          upstreamAttempts += 1;
           let upstreamResponse: Response;
           try {
             upstreamResponse = await fetch(new URL('/v1/chat/completions', upstream.baseUrl), {
@@ -843,6 +962,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           finishUpstreamFailure(response, state, id, model, idempotencyKey, 503, 'Upstream unavailable', 'upstream_unavailable');
           return;
         }
+        errorCodes.set(response, 'upstream_stream_failed');
         terminalSse(response, state, id, 'failed', failedOutputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } });
         response.end();
       } finally {

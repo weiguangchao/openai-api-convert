@@ -13,6 +13,11 @@ const sseTypes = (body: string) => [...body.matchAll(/^data: (.+)$/gm)]
 const startCompatibilityFixture = async () => {
   const requests: unknown[] = [];
   const server = createServer(async (request, response) => {
+    if (request.method === 'GET' && request.url === '/v1/models') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{"object":"list","data":[]}');
+      return;
+    }
     let body = '';
     for await (const chunk of request) body += chunk;
     requests.push(JSON.parse(body));
@@ -190,6 +195,104 @@ const startScriptedFixture = async (scripts: Array<{ status?: number; frames?: s
     close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
   };
 };
+
+test('exposes public liveness and protected readiness', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const live = await fetch(`${bridge.url}/healthz`);
+    assert.equal(live.status, 200);
+    assert.deepEqual(await live.json(), { status: 'ok' });
+    assert.equal((await fetch(`${bridge.url}/readyz`)).status, 401);
+    const ready = await fetch(`${bridge.url}/readyz`, { headers: { authorization: 'Bearer bridge-key' } });
+    assert.equal(ready.status, 200);
+    assert.deepEqual(await ready.json(), { status: 'ready' });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reports not ready when every upstream probe fails', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: 'http://127.0.0.1:1', apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/readyz`, { headers: { authorization: 'Bearer bridge-key' } });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { status: 'not_ready' });
+  } finally {
+    await bridge?.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('exports protected metrics and redacted JSON Lines logs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  const lines: string[] = [];
+  const info = console.info;
+  const error = console.error;
+  console.info = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    assert.equal((await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: 'secret invalid payload',
+    })).status, 400);
+    assert.equal((await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'secret response input' }),
+    })).status, 200);
+    assert.equal((await fetch(`${bridge.url}/metrics`)).status, 401);
+    const metrics = await (await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).text();
+    for (const metric of [
+      'bridge_requests_total 2', 'bridge_request_failures_total 1', 'bridge_request_duration_seconds_sum',
+      'bridge_upstream_switches_total', 'bridge_state_store_bytes', 'bridge_state_store_cleanup_runs_total',
+      'bridge_state_store_capacity_rejections_total',
+    ]) assert.equal(metrics.includes(metric), true);
+    const requestLog = lines.map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find(({ event }) => event === 'http_request_completed');
+    assert(requestLog);
+    assert.equal(typeof requestLog.timestamp, 'string');
+    assert.equal(typeof requestLog.level, 'string');
+    assert.equal(typeof requestLog.request_id, 'string');
+    assert.equal(typeof requestLog.duration_ms, 'number');
+    assert.equal(Object.hasOwn(requestLog, 'response_id'), true);
+    assert.equal(Object.hasOwn(requestLog, 'error_code'), true);
+    const serialized = lines.join('\n');
+    assert.equal(serialized.includes('secret invalid payload'), false);
+    assert.equal(serialized.includes('secret response input'), false);
+    assert.equal(serialized.includes('bridge-key'), false);
+    assert.equal(serialized.includes('upstream-key'), false);
+    assert.equal(serialized.includes(upstream.url), false);
+  } finally {
+    console.info = info;
+    console.error = error;
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('rejects invalid startup configuration', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
@@ -1116,6 +1219,11 @@ test('all-upstreams-fail Compatibility Fixture emits response.failed after every
 test('client disconnect aborts the active Attempt and cancels the Response', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startIdempotencyFixture();
+  const lines: string[] = [];
+  const info = console.info;
+  const error = console.error;
+  console.info = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
@@ -1136,7 +1244,13 @@ test('client disconnect aborts the active Attempt and cancels the Response', asy
     assert.deepEqual(bridge.state.responses(), [{ status: 'cancelled', outputText: 'first ' }]);
     assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.cancelled']);
     assert.equal(bridge.state.attempts().length, 1);
+    const metrics = await (await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).text();
+    assert.equal(metrics.includes('bridge_requests_total 1'), true);
+    assert.equal(metrics.includes('bridge_request_failures_total 1'), true);
+    assert.equal(lines.some((line) => line.includes('"event":"http_request_completed"') && line.includes('"error_code":"client_disconnected"')), true);
   } finally {
+    console.info = info;
+    console.error = error;
     upstream.release();
     await bridge?.close();
     await upstream.close();
