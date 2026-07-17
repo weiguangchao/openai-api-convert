@@ -6,8 +6,8 @@ import type { BridgeOptions, CapabilityProfile, StatePolicy, Upstream } from './
 
 type RecordValue = Record<string, unknown>;
 const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy']);
-const upstreamKeys = new Set(['baseUrl', 'apiKey', 'wireApi', 'capabilities']);
-const capabilityKeys = new Set(['functionTools', 'customTools', 'parallelToolCalls', 'webSearch']);
+const upstreamKeys = new Set(['baseUrl', 'apiKey', 'capabilities']);
+const capabilityKeys = new Set(['functionTools', 'customTools', 'parallelToolCalls']);
 const statePolicyKeys = new Set(['responseRetentionDays', 'attemptRetentionDays', 'cleanupThresholdBytes', 'hardLimitBytes']);
 
 const object = (value: unknown, path: string): RecordValue => {
@@ -38,11 +38,6 @@ const capabilities = (value: unknown, path: string): CapabilityProfile | undefin
   return profile as CapabilityProfile;
 };
 
-const wireApi = (value: unknown, path: string): 'chat' | 'responses' => {
-  if (value !== 'chat' && value !== 'responses') throw new Error(`${path} must be chat or responses`);
-  return value;
-};
-
 const upstreams = (value: unknown): Upstream[] => {
   if (!Array.isArray(value) || value.length === 0) throw new Error('Configuration.upstreams must be a non-empty array');
   return value.map((entry, index) => {
@@ -52,7 +47,6 @@ const upstreams = (value: unknown): Upstream[] => {
     return {
       baseUrl: requiredText(upstream.baseUrl, `${path}.baseUrl`),
       apiKey: requiredText(upstream.apiKey, `${path}.apiKey`),
-      ...(upstream.wireApi === undefined ? {} : { wireApi: wireApi(upstream.wireApi, `${path}.wireApi`) }),
       capabilities: capabilities(upstream.capabilities, `${path}.capabilities`),
     };
   });

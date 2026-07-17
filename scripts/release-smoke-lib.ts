@@ -33,12 +33,6 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model = 'gpt-4.1', co
   if (!upstreams.some(({ capabilities }) => capabilities?.functionTools === true && capabilities.parallelToolCalls === true)) {
     throw new Error('Codex CLI smoke requires Function Tool and parallel Tool Calling support');
   }
-  if (!upstreams.some(({ wireApi, capabilities }) => wireApi === 'responses'
-    && capabilities?.functionTools === true
-    && capabilities.parallelToolCalls === true
-    && capabilities.webSearch === true)) {
-    throw new Error('Codex CLI web search smoke requires a native Responses upstream with Hosted Web Search support');
-  }
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-smoke-'));
   let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
   try {
@@ -58,7 +52,7 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model = 'gpt-4.1', co
       throw new Error('Bridge direct smoke did not complete semantically');
     }
     if (types.some((type) => typeof type !== 'string' || type.startsWith('chat.'))) throw new Error('Bridge leaked a non-Responses event');
-    if (!types.includes('response.web_search_call.in_progress')) throw new Error('Bridge direct smoke did not execute Hosted Web Search');
+    if (types.includes('response.web_search_call.in_progress')) throw new Error('Bridge direct smoke forged a Hosted Web Search call');
 
     const responseCount = bridge.state.responses().length;
     const eventCount = bridge.state.events().length;
@@ -82,7 +76,7 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model = 'gpt-4.1', co
       || codexEvents.filter((type) => type === 'response.completed').length !== 1) {
       throw new Error('Codex CLI did not complete a Bridge Response');
     }
-    if (!codexEvents.includes('response.web_search_call.in_progress')) throw new Error('Codex CLI did not execute Hosted Web Search');
+    if (codexEvents.includes('response.web_search_call.in_progress')) throw new Error('Codex CLI smoke forged a Hosted Web Search call');
   } finally {
     await bridge?.close();
     await rm(dir, { recursive: true, force: true });
