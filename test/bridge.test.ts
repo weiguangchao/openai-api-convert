@@ -952,7 +952,7 @@ test('declared-capability-client-4xx Compatibility Fixture does not switch upstr
   }
 });
 
-test('idempotency-failed replays an upstream rejection without another Attempt', async () => {
+test('Idempotency-Key does not turn a pre-stream upstream rejection into SSE', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startRejectedFixture();
   let bridge: RunningBridge | undefined;
@@ -963,13 +963,18 @@ test('idempotency-failed replays an upstream rejection without another Attempt',
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'failed-once' };
     const body = JSON.stringify({ stream: true, input: 'Hello' });
     const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
-    const failed = await first.text();
+    assert.equal(first.status, 400);
+    assert.deepEqual(await first.json(), {
+      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+    });
     const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
-    assert.equal(await replay.text(), failed);
-    assert.deepEqual(sseTypes(failed).map(({ type }) => type), ['response.created', 'response.failed']);
-    assert.equal(upstream.requests.length, 1);
-    assert.equal(bridge.state.attempts().length, 1);
-    assert.deepEqual(bridge.state.responses(), [{ status: 'failed', outputText: '' }]);
+    assert.equal(replay.status, 400);
+    assert.deepEqual(await replay.json(), {
+      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+    });
+    assert.equal(upstream.requests.length, 2);
+    assert.deepEqual(bridge.state.attempts(), []);
+    assert.deepEqual(bridge.state.responses(), []);
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -1079,6 +1084,13 @@ test('failover-before-output Compatibility Fixture retries the full Response Cha
       { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
     ]);
     assert.equal(bridge.state.attempts().length, 3);
+    const attempts = bridge.state.attemptDetails();
+    assert.deepEqual(attempts.map(({ attemptIndex, result, preOutputFailure, errorCode }) => ({ attemptIndex, result, preOutputFailure, errorCode })), [
+      { attemptIndex: 1, result: 'completed', preOutputFailure: false, errorCode: undefined },
+      { attemptIndex: 1, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' },
+      { attemptIndex: 2, result: 'completed', preOutputFailure: false, errorCode: undefined },
+    ]);
+    assert.equal(attempts.every(({ createdAt, finishedAt }) => finishedAt !== undefined && Number.isSafeInteger(createdAt) && Number.isSafeInteger(finishedAt) && finishedAt >= createdAt), true);
   } finally {
     await bridge?.close();
     await primary.close();
