@@ -1789,3 +1789,317 @@ test('client disconnect aborts the active Attempt and cancels the Response', asy
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('rejects Tool Namespace children that are not Function Tools', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Run shell.',
+        tools: [{
+          type: 'namespace', name: 'ops', description: 'Ops tools',
+          tools: [{ type: 'custom', name: 'shell' }],
+        }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Function-only Tool Namespace continues a Response Chain via Completion aliases', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const alias = 'crm_get_customer_profile_e3d1fa98';
+  const streams = [
+    [
+      `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_crm","type":"function","function":{"name":"${alias}","arguments":"{\\\"customer_id\\\":\\\"1\\\"}"}}]}}]}\r\n\r\n`,
+      'data: [DONE]\r\n\r\n',
+    ],
+    [
+      'data: {"choices":[{"delta":{"content":"Profile loaded."}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  ];
+  const upstream = await startFunctionFixture(streams);
+  let bridge: RunningBridge | undefined;
+  const parameters = {
+    type: 'object',
+    properties: { customer_id: { type: 'string' } },
+    required: ['customer_id'],
+    additionalProperties: false,
+  };
+  const namespaceTool = {
+    type: 'namespace',
+    name: 'crm',
+    description: 'CRM tools',
+    tools: [{
+      type: 'function',
+      name: 'get_customer_profile',
+      description: 'Fetch a customer profile by customer ID.',
+      parameters,
+      strict: true,
+    }],
+  };
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, input: 'Lookup customer 1.',
+        tools: [namespaceTool],
+        tool_choice: { type: 'function', name: 'get_customer_profile', namespace: 'crm' },
+      }),
+    });
+    assert.equal(first.status, 200);
+    const firstEvents = sseTypes(await first.text());
+    const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
+    const call = firstEvents.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown };
+    assert.deepEqual(call.item, {
+      id: 'call_crm', type: 'function_call', status: 'completed', call_id: 'call_crm',
+      name: 'get_customer_profile', namespace: 'crm', arguments: '{"customer_id":"1"}',
+    });
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, previous_response_id: firstResponse.response.id,
+        input: [{ type: 'function_call_output', call_id: 'call_crm', output: '{"name":"Ada"}' }],
+      }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual(upstream.requests, [
+      {
+        model: 'gpt-test', stream: true, stream_options: { include_usage: true },
+        messages: [{ role: 'user', content: 'Lookup customer 1.' }],
+        tools: [{
+          type: 'function',
+          function: {
+            name: alias,
+            description: 'Fetch a customer profile by customer ID.',
+            parameters,
+            strict: true,
+          },
+        }],
+        tool_choice: { type: 'function', function: { name: alias } },
+      },
+      {
+        model: 'gpt-test', stream: true, stream_options: { include_usage: true },
+        messages: [
+          { role: 'user', content: 'Lookup customer 1.' },
+          {
+            role: 'assistant',
+            tool_calls: [{ id: 'call_crm', type: 'function', function: { name: alias, arguments: '{"customer_id":"1"}' } }],
+          },
+          { role: 'tool', tool_call_id: 'call_crm', content: '{"name":"Ada"}' },
+        ],
+        tools: [{
+          type: 'function',
+          function: {
+            name: alias,
+            description: 'Fetch a customer profile by customer ID.',
+            parameters,
+            strict: true,
+          },
+        }],
+      },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Tool Namespace aliases stay legal and at most 64 characters for overlong names', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const namespace = `ns_${'x'.repeat(80)}`;
+  const name = `fn_${'y'.repeat(80)}`;
+  const alias = 'ns_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_2db6913b';
+  const streams = [[
+    `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_long","type":"function","function":{"name":"${alias}","arguments":"{}"}}]}}]}\r\n\r\n`,
+    'data: [DONE]\r\n\r\n',
+  ]];
+  const upstream = await startFunctionFixture(streams);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Call long tool.',
+        tools: [{ type: 'namespace', name: namespace, description: 'Long names', tools: [{ type: 'function', name }] }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const events = sseTypes(await response.text());
+    assert.deepEqual((events.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
+      id: 'call_long', type: 'function_call', status: 'completed', call_id: 'call_long',
+      name, namespace, arguments: '{}',
+    });
+    const forwarded = (upstream.requests[0] as { tools: Array<{ function: { name: string } }> }).tools[0].function.name;
+    assert.equal(forwarded, alias);
+    assert.equal(forwarded.length, 64);
+    assert.match(forwarded, /^[a-zA-Z0-9_-]+$/);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Tool Namespace aliases disambiguate conflicts with peer Function names', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const alias = 'crm_get_customer_profile_e3d1fa981';
+  const streams = [[
+    `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_crm","type":"function","function":{"name":"${alias}","arguments":"{}"}}]}}]}\r\n\r\n`,
+    'data: [DONE]\r\n\r\n',
+  ]];
+  const upstream = await startFunctionFixture(streams);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Lookup.',
+        tools: [
+          { type: 'function', name: 'crm_get_customer_profile_e3d1fa98' },
+          {
+            type: 'namespace', name: 'crm', description: 'CRM tools',
+            tools: [{ type: 'function', name: 'get_customer_profile' }],
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const events = sseTypes(await response.text());
+    assert.deepEqual((events.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
+      id: 'call_crm', type: 'function_call', status: 'completed', call_id: 'call_crm',
+      name: 'get_customer_profile', namespace: 'crm', arguments: '{}',
+    });
+    assert.deepEqual(
+      (upstream.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map((tool) => tool.function.name),
+      ['crm_get_customer_profile_e3d1fa98', alias],
+    );
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects Tool Namespace input missing required fields', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Lookup.',
+        tools: [{ type: 'namespace', name: 'crm', tools: [{ type: 'function', name: 'get_customer_profile' }] }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects duplicate Function names inside a Tool Namespace', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Lookup.',
+        tools: [{
+          type: 'namespace', name: 'crm', description: 'CRM tools',
+          tools: [
+            { type: 'function', name: 'get_customer_profile' },
+            { type: 'function', name: 'get_customer_profile' },
+          ],
+        }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Tool Namespace requests require functionTools capability', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { customTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Lookup.',
+        tools: [{
+          type: 'namespace', name: 'crm', description: 'CRM tools',
+          tools: [{ type: 'function', name: 'get_customer_profile' }],
+        }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

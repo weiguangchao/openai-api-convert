@@ -8,6 +8,7 @@
 - **Response Chain**: 由 `previous_response_id` 连接的 Response 链；MVP 的唯一会话模型。
 - **Output Item**: Response 输出中的有序规范项，包含 assistant 内容或工具调用。
 - **Custom Tool**: `type=custom` 的 Responses 工具；其自由格式输入与工具输出回传语义必须由上游原生保留。
+- **Tool Namespace**: `type=namespace` 的 Responses 工具分组；MVP 仅接受 Function 子工具。Completion 上游以可逆、合法、最长 64 字符的可读哈希别名扁平转发；客户端始终看到原始 namespace 与子工具 name。
 - **Hosted Web Search**: `type=web_search` 的 Responses 托管工具；由原生 Responses 上游执行并产出搜索调用、引用及注释。
 - **Native Web Search Chain**: 含 Hosted Web Search 的 Response Chain；首轮成功后固定至创建该链的原生 Responses 上游。
 - **Upstream Response Mapping**: Bridge Response ID 与原生上游 Response ID 的私有映射；客户端始终只使用前者。
