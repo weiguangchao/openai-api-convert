@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { startBridge, type RunningBridge } from '../src/server.ts';
+
+const codexMixedTools = JSON.parse(
+  await readFile(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/codex-0.144.5-mixed-tools.json'), 'utf8'),
+) as unknown[];
 
 const sseTypes = (body: string) => [...body.matchAll(/^data: (.+)$/gm)]
   .map((match) => JSON.parse(match[1]) as { type: string });
@@ -2096,6 +2101,134 @@ test('Tool Namespace requests require functionTools capability', async () => {
     });
     assert.equal(response.status, 400);
     assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Codex mixed-tools Compatibility Fixture continues Namespaced Function calls on Completion', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const spawnAlias = 'multi_agent_v1_spawn_agent_ba58fe27';
+  const spawnArgs = '{"agent_type":"explorer","message":"Find the bridge entrypoint."}';
+  const streams = [
+    [
+      `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_spawn","type":"function","function":{"name":"${spawnAlias}","arguments":${JSON.stringify(spawnArgs)}}}]}}]}\r\n\r\n`,
+      'data: [DONE]\r\n\r\n',
+    ],
+    [
+      'data: {"choices":[{"delta":{"content":"Agent spawned."}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  ];
+  const upstream = await startFunctionFixture(streams);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, parallelToolCalls: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        stream: true,
+        input: 'hi',
+        tools: codexMixedTools,
+        tool_choice: 'auto',
+        parallel_tool_calls: true,
+      }),
+    });
+    assert.equal(first.status, 200);
+    const firstBody = await first.text();
+    const firstEvents = sseTypes(firstBody);
+    assert.equal(firstEvents.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
+    assert.equal(firstEvents.some(({ type }) => type === 'response.failed'), false);
+    const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
+    assert.ok(firstResponse?.response.id);
+    assert.deepEqual((firstEvents.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
+      id: 'call_spawn', type: 'function_call', status: 'completed', call_id: 'call_spawn',
+      name: 'spawn_agent', namespace: 'multi_agent_v1', arguments: spawnArgs,
+    });
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash', stream: true, previous_response_id: firstResponse.response.id,
+        input: [{ type: 'function_call_output', call_id: 'call_spawn', output: '{"agent_id":"agent_1","status":"running"}' }],
+      }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+
+    assert.equal(upstream.requests.length, 2);
+    const request = upstream.requests[0] as {
+      messages: Array<{ role: string; content?: string }>;
+      tools: Array<{ type: string; function: { name: string; strict?: boolean } }>;
+      tool_choice?: unknown;
+    };
+    assert.equal(request.messages[0]?.role, 'system');
+    assert.equal(String(request.messages[0]?.content).includes('web search is unavailable'), true);
+    assert.equal(request.tools.some((tool) => tool.type === 'web_search' || tool.function?.name === 'web_search'), false);
+    assert.deepEqual(request.tools.map((tool) => tool.function.name), [
+      'exec_command',
+      'multi_agent_v1_close_agent_4e4a21c0',
+      'multi_agent_v1_resume_agent_01cc6017',
+      'multi_agent_v1_send_input_ba78fa14',
+      spawnAlias,
+      'multi_agent_v1_wait_agent_619dd87b',
+    ]);
+    assert.equal(request.tools.every((tool) => tool.function.strict === false), true);
+    assert.equal(request.tool_choice, undefined);
+    assert.deepEqual(upstream.requests[1], {
+      model: 'deepseek-v4-flash', stream: true, stream_options: { include_usage: true }, parallel_tool_calls: true,
+      messages: [
+        { role: 'system', content: 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.' },
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_spawn', type: 'function', function: { name: spawnAlias, arguments: spawnArgs } }],
+        },
+        { role: 'tool', tool_call_id: 'call_spawn', content: '{"agent_id":"agent_1","status":"running"}' },
+      ],
+      tools: request.tools,
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Codex mixed-tools Compatibility Fixture rejects illegal Tool Namespace before upstream contact', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, parallelToolCalls: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'hi',
+        tools: [
+          { type: 'function', name: 'exec_command' },
+          {
+            type: 'namespace', name: 'multi_agent_v1', description: 'Tools for spawning and managing sub-agents.',
+            tools: [{ type: 'custom', name: 'spawn_agent' }],
+          },
+          { type: 'web_search' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
     assert.deepEqual(upstream.requests, []);
   } finally {
     await bridge?.close();

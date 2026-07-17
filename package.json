@@ -6,7 +6,8 @@
     "build": "tsc --noEmit",
     "start": "node --experimental-strip-types src/index.ts",
     "test": "node --experimental-strip-types scripts/release-smoke.ts",
-    "test:unit": "node --test --experimental-strip-types test/**/*.test.ts"
+    "test:unit": "node --test --experimental-strip-types test/**/*.test.ts",
+    "test:codex-mixed-tools": "node --test --experimental-strip-types --test-name-pattern='Codex mixed-tools' test/bridge.test.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
