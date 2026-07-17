@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
-import { runReleaseSmoke } from '../src/release-smoke.ts';
+import { runReleaseSmoke } from '../scripts/release-smoke-lib.ts';
 
 test('release smoke validates semantic SSE and invokes Codex with an isolated Bridge provider', async () => {
   const upstream = createServer((request, response) => {
