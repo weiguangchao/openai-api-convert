@@ -2,13 +2,15 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
-import type { BridgeOptions, CapabilityProfile, StatePolicy, Upstream } from './server.ts';
+import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, StatePolicy, Upstream } from './server.ts';
 
 type RecordValue = Record<string, unknown>;
-const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy']);
+const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy', 'logging']);
 const upstreamKeys = new Set(['baseUrl', 'apiKey', 'capabilities']);
 const capabilityKeys = new Set(['functionTools', 'customTools', 'parallelToolCalls']);
 const statePolicyKeys = new Set(['responseRetentionDays', 'attemptRetentionDays', 'cleanupThresholdBytes', 'hardLimitBytes']);
+const loggingKeys = new Set(['level', 'path', 'retentionDays']);
+const logLevels = new Set<LogLevel>(['debug', 'info', 'error']);
 
 const object = (value: unknown, path: string): RecordValue => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path} must be an object`);
@@ -59,6 +61,17 @@ const statePolicy = (value: unknown): StatePolicy | undefined => {
   return Object.fromEntries(Object.entries(policy).map(([key, number]) => [key, optionalPositiveInteger(number, `Configuration.statePolicy.${key}`)])) as StatePolicy;
 };
 
+const logging = (value: unknown, configDir: string, statePath: string): LoggingPolicy => {
+  const policy = value === undefined ? {} : object(value, 'Configuration.logging');
+  rejectUnknown(policy, loggingKeys, 'Configuration.logging');
+  const level = policy.level === undefined ? 'info' : policy.level;
+  if (typeof level !== 'string' || !logLevels.has(level as LogLevel)) throw new Error('Configuration.logging.level must be one of debug, info, error');
+  const retentionDays = optionalPositiveInteger(policy.retentionDays, 'Configuration.logging.retentionDays') ?? 7;
+  const configuredPath = policy.path === undefined ? join(dirname(statePath), 'logs') : requiredText(policy.path, 'Configuration.logging.path');
+  const logPath = policy.path === undefined || isAbsolute(configuredPath) ? configuredPath : resolve(configDir, configuredPath);
+  return { level: level as LogLevel, path: logPath, retentionDays };
+};
+
 export const loadBridgeConfiguration = async (path = resolve('config.yaml')): Promise<BridgeOptions> => {
   let source: string;
   try { source = await readFile(path, 'utf8'); }
@@ -81,5 +94,6 @@ export const loadBridgeConfiguration = async (path = resolve('config.yaml')): Pr
     firstEventTimeoutMs: optionalPositiveInteger(configuration.firstEventTimeoutMs, 'Configuration.firstEventTimeoutMs'),
     outputIdleTimeoutMs: optionalPositiveInteger(configuration.outputIdleTimeoutMs, 'Configuration.outputIdleTimeoutMs'),
     statePolicy: statePolicy(configuration.statePolicy),
+    logging: logging(configuration.logging, dirname(path), statePath),
   };
 };
