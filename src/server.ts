@@ -35,7 +35,7 @@ type LogFields = {
   responseId?: string | null;
   durationMs?: number;
   errorCode?: string | null;
-  [key: string]: string | number | null | undefined;
+  [key: string]: string | number | null | undefined | Record<string, unknown>;
 };
 type BridgeLog = (level: LogLevel, event: string, fields?: LogFields) => void;
 type StoredEvent = { sequence: number; type: string };
@@ -164,7 +164,7 @@ const createBridgeLogger = async (statePath: string, logging?: LoggingPolicy) =>
     logger.on('finish', () => resolve());
     logger.end();
   });
-  return { log, close };
+  return { log, close, level };
 };
 
 const prometheus = (metrics: Metrics, observability: StateObservability) => [
@@ -594,10 +594,14 @@ const requireBridgeAuthentication = (request: IncomingMessage, response: ServerR
   return false;
 };
 
-const readJson = async (request: IncomingMessage): Promise<unknown> => {
-  let body = '';
-  for await (const chunk of request) body += chunk;
-  return JSON.parse(body);
+const REDACTED = '[REDACTED]';
+const sensitiveHeaderNames = new Set(['authorization', 'cookie', 'set-cookie']);
+const redactHeaders = (headers: Record<string, string | string[] | undefined>): Record<string, string> => {
+  const redacted: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    redacted[key] = sensitiveHeaderNames.has(key.toLowerCase()) ? REDACTED : String(value ?? '');
+  }
+  return redacted;
 };
 
 const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
@@ -992,8 +996,19 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         stream?: unknown; input?: unknown; model?: unknown; tools?: unknown; previous_response_id?: unknown; parallel_tool_calls?: unknown;
         tool_choice?: unknown; include?: unknown; reasoning?: unknown;
       };
-      try { payload = await readJson(request) as typeof payload; }
+      let rawBody = '';
+      try {
+        for await (const chunk of request) rawBody += chunk;
+        payload = JSON.parse(rawBody) as typeof payload;
+      }
       catch { sendError(response, 400, 'Invalid JSON body', 'invalid_json'); return; }
+      logging.log('info', 'traffic_downstream_inbound', { requestId, method: request.method ?? null, path: request.url ?? null });
+      if (logging.level === 'debug') {
+        logging.log('debug', 'traffic_downstream_inbound', {
+          requestId, method: request.method ?? null, path: request.url ?? null,
+          headers: redactHeaders(request.headers), body: rawBody,
+        });
+      }
       if (payload.stream !== true) {
         sendError(response, 400, 'Only stream: true is supported', 'stream_required');
         return;
@@ -1148,11 +1163,22 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           const attemptId = state.startAttempt(id);
           if (upstreamAttempts > 0) metrics.upstreamSwitches += 1;
           upstreamAttempts += 1;
+          const upstreamUrl = new URL('/v1/chat/completions', upstream.baseUrl);
+          const upstreamHeaders: Record<string, string> = { authorization: `Bearer ${upstream.apiKey}`, 'content-type': 'application/json', accept: 'text/event-stream' };
+          logging.log('info', 'traffic_upstream_outbound', { requestId, responseId: id, attempt_index: upstreamAttempts });
+          if (logging.level === 'debug') {
+            logging.log('debug', 'traffic_upstream_outbound', {
+              requestId, responseId: id, attempt_index: upstreamAttempts,
+              upstream_url: upstreamUrl.href,
+              headers: redactHeaders(upstreamHeaders),
+              body: JSON.stringify(upstreamBody),
+            });
+          }
           let upstreamResponse: Response;
           try {
-            upstreamResponse = await fetch(new URL('/v1/chat/completions', upstream.baseUrl), {
+            upstreamResponse = await fetch(upstreamUrl, {
               method: 'POST',
-              headers: { authorization: `Bearer ${upstream.apiKey}`, 'content-type': 'application/json', accept: 'text/event-stream' },
+              headers: upstreamHeaders,
               body: JSON.stringify(upstreamBody), signal: abort.signal,
             });
           } catch {
