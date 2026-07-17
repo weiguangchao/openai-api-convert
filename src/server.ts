@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { mkdir } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import winston from 'winston';
+import DailyRotateFile from 'winston-daily-rotate-file';
 
 export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
 export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
@@ -10,6 +14,12 @@ export type StatePolicy = {
   cleanupThresholdBytes?: number;
   hardLimitBytes?: number;
 };
+export type LogLevel = 'debug' | 'info' | 'error';
+export type LoggingPolicy = {
+  level?: LogLevel;
+  path?: string;
+  retentionDays?: number;
+};
 export type BridgeOptions = {
   apiKey: string;
   upstreams: Upstream[];
@@ -18,7 +28,16 @@ export type BridgeOptions = {
   firstEventTimeoutMs?: number;
   outputIdleTimeoutMs?: number;
   statePolicy?: StatePolicy;
+  logging?: LoggingPolicy;
 };
+type LogFields = {
+  requestId?: string | null;
+  responseId?: string | null;
+  durationMs?: number;
+  errorCode?: string | null;
+  [key: string]: string | number | null | undefined;
+};
+type BridgeLog = (level: LogLevel, event: string, fields?: LogFields) => void;
 type StoredEvent = { sequence: number; type: string };
 type ResponseEvent = { type: string; [key: string]: unknown };
 type FunctionTool = { type: 'function'; name: string; description?: string; parameters?: unknown; strict?: boolean };
@@ -83,22 +102,69 @@ const defaultStatePolicy: ResolvedStatePolicy = {
 const requestIds = new WeakMap<ServerResponse, string>();
 const errorCodes = new WeakMap<ServerResponse, string>();
 
-export const log = (level: 'info' | 'error', event: string, fields: {
-  requestId?: string | null;
-  responseId?: string | null;
-  durationMs?: number;
-  errorCode?: string | null;
-  [key: string]: string | number | null | undefined;
-} = {}) => {
-  const entry = {
-    timestamp: new Date().toISOString(), level, event,
-    request_id: fields.requestId ?? null,
-    response_id: fields.responseId ?? null,
-    duration_ms: fields.durationMs ?? 0,
-    error_code: fields.errorCode ?? null,
-    ...Object.fromEntries(Object.entries(fields).filter(([key]) => !['requestId', 'responseId', 'durationMs', 'errorCode'].includes(key))),
+const toLogEntry = (level: LogLevel, event: string, fields: LogFields = {}) => ({
+  timestamp: new Date().toISOString(),
+  level,
+  event,
+  request_id: fields.requestId ?? null,
+  response_id: fields.responseId ?? null,
+  duration_ms: fields.durationMs ?? 0,
+  error_code: fields.errorCode ?? null,
+  ...Object.fromEntries(Object.entries(fields).filter(([key]) => !['requestId', 'responseId', 'durationMs', 'errorCode'].includes(key))),
+});
+
+const createBridgeLogger = async (statePath: string, logging?: LoggingPolicy) => {
+  const level = logging?.level ?? 'info';
+  const retentionDays = logging?.retentionDays ?? 7;
+  const logDir = logging?.path ?? join(dirname(statePath), 'logs');
+  await mkdir(logDir, { recursive: true });
+  const entryFormat = winston.format((info) => {
+    const entry = (info as { bridgeEntry?: ReturnType<typeof toLogEntry> }).bridgeEntry;
+    if (!entry) return info;
+    Object.assign(info, entry);
+    info.message = entry.event;
+    return info;
+  })();
+  const logger = winston.createLogger({
+    level,
+    transports: [
+      new winston.transports.Console({
+        level,
+        format: winston.format.combine(
+          entryFormat,
+          winston.format.printf((info) => {
+            const entry = (info as { bridgeEntry?: ReturnType<typeof toLogEntry> }).bridgeEntry;
+            return JSON.stringify(entry ?? { level: info.level, event: info.message });
+          }),
+        ),
+      }),
+      new DailyRotateFile({
+        level,
+        dirname: logDir,
+        filename: 'bridge-%DATE%.log',
+        datePattern: 'YYYY-MM-DD',
+        maxFiles: `${retentionDays}d`,
+        format: winston.format.combine(
+          entryFormat,
+          winston.format.printf((info) => {
+            const entry = (info as { bridgeEntry?: ReturnType<typeof toLogEntry> }).bridgeEntry;
+            if (!entry) return `${info.level} ${info.message}`;
+            return `${entry.timestamp} ${entry.level.toUpperCase()} ${entry.event}\n${JSON.stringify(entry, null, 2)}`;
+          }),
+        ),
+      }),
+    ],
+  });
+  const log: BridgeLog = (logLevel, event, fields = {}) => {
+    const bridgeEntry = toLogEntry(logLevel, event, fields);
+    logger.log({ level: logLevel, message: event, bridgeEntry });
   };
-  console[level](JSON.stringify(entry));
+  const close = () => new Promise<void>((resolve, reject) => {
+    logger.on('error', reject);
+    logger.on('finish', () => resolve());
+    logger.end();
+  });
+  return { log, close };
 };
 
 const prometheus = (metrics: Metrics, observability: StateObservability) => [
@@ -117,11 +183,13 @@ const prometheus = (metrics: Metrics, observability: StateObservability) => [
 class StateStore {
   #db: DatabaseSync;
   #policy: ResolvedStatePolicy;
+  #log: BridgeLog;
   #cleanupTimer?: ReturnType<typeof setInterval>;
   #observability: StateObservability = { bytes: 0, cleanupRuns: 0, deletedChains: 0, reclaimedBytes: 0, capacityRejections: 0 };
 
-  constructor(path: string, policy: ResolvedStatePolicy) {
+  constructor(path: string, policy: ResolvedStatePolicy, log: BridgeLog) {
     this.#policy = policy;
+    this.#log = log;
     try {
       this.#db = new DatabaseSync(path);
       this.#db.exec(`
@@ -288,12 +356,12 @@ class StateStore {
       this.#observability.reclaimedBytes += reclaimedBytes;
       this.#observability.bytes = this.#bytes();
       this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes };
-      log('info', 'state_store_cleanup', { durationMs: Date.now() - startedAt, deleted_chains: deletedChains, reclaimed_bytes: reclaimedBytes });
+      this.#log('info', 'state_store_cleanup', { durationMs: Date.now() - startedAt, deleted_chains: deletedChains, reclaimed_bytes: reclaimedBytes });
     } catch {
       this.#observability.cleanupRuns += 1;
       this.#observability.bytes = this.#bytes();
       this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes: 0, failureReason: 'cleanup_failed' };
-      log('error', 'state_store_cleanup', { durationMs: Date.now() - startedAt, errorCode: 'cleanup_failed' });
+      this.#log('error', 'state_store_cleanup', { durationMs: Date.now() - startedAt, errorCode: 'cleanup_failed' });
     }
   }
 
@@ -498,6 +566,7 @@ class StateStore {
 export type RunningBridge = {
   url: string;
   state: Pick<StateStore, 'events' | 'responses' | 'attempts' | 'attemptDetails' | 'observability'>;
+  log: BridgeLog;
   close: () => Promise<void>;
 };
 
@@ -855,7 +924,8 @@ const assertOptions = (options: BridgeOptions) => {
 
 export const startBridge = async (options: BridgeOptions): Promise<RunningBridge> => {
   assertOptions(options);
-  const state = new StateStore(options.statePath, { ...defaultStatePolicy, ...options.statePolicy });
+  const logging = await createBridgeLogger(options.statePath, options.logging);
+  const state = new StateStore(options.statePath, { ...defaultStatePolicy, ...options.statePolicy }, logging.log);
   const metrics: Metrics = { requests: 0, failures: 0, durationMs: 0, upstreamSwitches: 0 };
   let server: Server | undefined;
   try {
@@ -878,7 +948,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         }
         const errorCode = errorCodes.get(response) ?? null;
         if (measuresRequest && (response.statusCode >= 400 || errorCode)) metrics.failures += 1;
-        log(response.statusCode >= 400 || errorCode ? 'error' : 'info', 'http_request_completed', {
+        logging.log(response.statusCode >= 400 || errorCode ? 'error' : 'info', 'http_request_completed', {
           requestId, responseId: responseId ?? null, durationMs, errorCode, method: request.method ?? null, status: response.statusCode,
         });
       };
@@ -1235,14 +1305,17 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
     return {
       url: `http://127.0.0.1:${address.port}`,
       state,
+      log: logging.log,
       close: async () => {
         await new Promise<void>((resolve, reject) => server!.close((error) => error ? reject(error) : resolve()));
         state.close();
+        await logging.close();
       },
     };
   } catch (error) {
     server?.close();
     state.close();
+    await logging.close().catch(() => undefined);
     throw error;
   }
 };
