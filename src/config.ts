@@ -1,5 +1,6 @@
-import { readFile } from 'node:fs/promises';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { mkdir, readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
 import type { BridgeOptions, CapabilityProfile, StatePolicy, Upstream } from './server.ts';
 
@@ -68,11 +69,14 @@ export const loadBridgeConfiguration = async (path = resolve('config.yaml')): Pr
   rejectUnknown(configuration, rootKeys, 'Configuration');
   const port = configuration.port;
   if (port !== undefined && (typeof port !== 'number' || !Number.isSafeInteger(port) || port < 0 || port > 65_535)) throw new Error('Configuration.port must be an integer from 0 to 65535');
-  const configuredStatePath = configuration.statePath === undefined ? './response-bridge.db' : requiredText(configuration.statePath, 'Configuration.statePath');
+  const usesDefaultStatePath = configuration.statePath === undefined;
+  const configuredStatePath = usesDefaultStatePath ? join(homedir(), '.openai-api-convert', 'response-bridge.db') : requiredText(configuration.statePath, 'Configuration.statePath');
+  const statePath = isAbsolute(configuredStatePath) ? configuredStatePath : resolve(dirname(path), configuredStatePath);
+  if (usesDefaultStatePath) await mkdir(dirname(statePath), { recursive: true });
   return {
     apiKey: requiredText(configuration.apiKey, 'Configuration.apiKey'),
     upstreams: upstreams(configuration.upstreams),
-    statePath: isAbsolute(configuredStatePath) ? configuredStatePath : resolve(dirname(path), configuredStatePath),
+    statePath,
     port,
     firstEventTimeoutMs: optionalPositiveInteger(configuration.firstEventTimeoutMs, 'Configuration.firstEventTimeoutMs'),
     outputIdleTimeoutMs: optionalPositiveInteger(configuration.outputIdleTimeoutMs, 'Configuration.outputIdleTimeoutMs'),
