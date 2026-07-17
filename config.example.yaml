@@ -7,7 +7,7 @@ upstreams:
       customTools: true
       parallelToolCalls: true
 statePath: ./response-bridge.db
-port: 3000
+port: 8417
 firstEventTimeoutMs: 30000
 outputIdleTimeoutMs: 60000
 statePolicy:
