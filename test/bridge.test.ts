@@ -201,50 +201,6 @@ const startScriptedFixture = async (scripts: Array<{ status?: number; frames?: s
   };
 };
 
-const nativeWebSearchFrames = (upstreamResponseId: string, text = 'Search result.') => [
-  `data: {"type":"response.created","response":{"id":"${upstreamResponseId}","object":"response","status":"in_progress","output":[]}}\r\n\r\n`,
-  `data: {"type":"response.web_search_call.in_progress","output_index":0,"item_id":"ws_1"}\r\n\r\n`,
-  'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ws_1","type":"web_search_call","status":"completed"}}\r\n\r\n',
-  `data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"${text}"}\r\n\r\n`,
-  'data: {"type":"response.output_text.annotation.added","item_id":"msg_1","output_index":1,"content_index":0,"annotation_index":0,"annotation":{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":6}}\r\n\r\n',
-  `data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"${text}"}]}}\r\n\r\n`,
-  `data: {"type":"response.completed","response":{"id":"${upstreamResponseId}","object":"response","status":"completed","output":[]}}\r\n\r\n`,
-];
-
-const startNativeResponsesFixture = async (scripts: Array<{ status?: number; frames?: string[]; waitAfterFirstFrameMs?: number }>) => {
-  const requests: Array<{ url?: string; body: unknown }> = [];
-  const authorizations: string[] = [];
-  const server = createServer(async (request, response) => {
-    if (request.method === 'GET' && request.url === '/v1/models') {
-      response.writeHead(200, { 'content-type': 'application/json' });
-      response.end('{"object":"list","data":[]}');
-      return;
-    }
-    let body = '';
-    for await (const chunk of request) body += chunk;
-    requests.push({ url: request.url, body: JSON.parse(body) });
-    authorizations.push(String(request.headers.authorization));
-    const script = scripts[requests.length - 1] ?? { status: 500 };
-    response.writeHead(script.status ?? 200, { 'content-type': script.status && script.status >= 400 ? 'application/json' : 'text/event-stream' });
-    if (script.waitAfterFirstFrameMs && script.frames?.length) {
-      response.write(script.frames[0]);
-      await new Promise((resolve) => setTimeout(resolve, script.waitAfterFirstFrameMs));
-      response.end(script.frames.slice(1).join(''));
-      return;
-    }
-    response.end(script.frames?.join('') ?? '{"error":"unavailable"}');
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  assert(address && typeof address !== 'string');
-  return {
-    requests,
-    authorizations,
-    url: `http://127.0.0.1:${address.port}`,
-    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
-  };
-};
-
 test('exposes public liveness and protected readiness', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
@@ -567,6 +523,61 @@ test('function-single Compatibility Fixture continues a Response Chain', async (
         tools: [{ type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: tool.parameters } }],
       },
     ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('store:false Response Chain accepts echoed assistant input from prior turn', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, store: false, input: 'hi' }),
+    });
+    const firstBody = await first.text();
+    assert.equal(first.status, 200);
+    const firstEvents = sseTypes(firstBody);
+    const firstCompleted = firstEvents.find(({ type }) => type === 'response.completed') as unknown as {
+      response: { id: string; output: Array<{ type: string; role?: string; content?: unknown }> };
+    };
+    const assistant = firstCompleted.response.output.find((item) => item.type === 'message');
+    assert(assistant);
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        stream: true,
+        store: false,
+        previous_response_id: firstCompleted.response.id,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+          assistant,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi again' }] },
+        ],
+      }),
+    });
+    const secondBody = await second.text();
+    assert.equal(second.status, 200, secondBody);
+    assert.equal(sseTypes(secondBody).at(-1)?.type, 'response.completed');
+    assert.deepEqual(upstream.requests[1], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'Hello world' },
+        { role: 'user', content: 'hi again' },
+      ],
+    });
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -941,174 +952,7 @@ test('custom-incompatible Compatibility Fixture rejects before contacting an ups
   }
 });
 
-test('web-search-supported preserves native Responses SSE, controls, citations, and Response Chain routing', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const primary = await startNativeResponsesFixture([
-    { frames: nativeWebSearchFrames('upstream_resp_1') },
-    { frames: nativeWebSearchFrames('upstream_resp_2', 'Follow-up.') },
-    { frames: nativeWebSearchFrames('upstream_resp_3', 'Final follow-up.') },
-  ]);
-  const alternate = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_alt') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: primary.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: alternate.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-      ],
-      statePath: join(dir, 'state.db'),
-    });
-    const request = {
-      model: 'gpt-test', stream: true, input: 'Find an example.',
-      tools: [{ type: 'web_search', search_context_size: 'medium', user_location: { type: 'approximate', country: 'US' } }],
-      tool_choice: { type: 'web_search' }, include: ['web_search_call.action.sources'],
-    };
-    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'web-search-once' };
-    const first = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify(request),
-    });
-    assert.equal(first.status, 200);
-    const firstBody = await first.text();
-    const events = sseTypes(firstBody) as unknown as Array<{ type: string; response?: { id: string }; annotation?: { url: string } }>;
-    const bridgeResponseId = events.find(({ type }) => type === 'response.completed')?.response?.id;
-    assert(bridgeResponseId);
-    assert.equal(firstBody.includes('upstream_resp_1'), false);
-    assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), true);
-    assert.equal(events.find(({ type }) => type === 'response.output_text.annotation.added')?.annotation?.url, 'https://example.com');
-    assert.deepEqual(primary.requests[0], { url: '/v1/responses', body: request });
-    const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
-    assert.equal(await replay.text(), firstBody);
-    assert.equal(primary.requests.length, 1);
-
-    await bridge.close();
-    const state = new DatabaseSync(join(dir, 'state.db'));
-    try {
-      assert.deepEqual(state.prepare('SELECT item_json FROM output_items ORDER BY output_index').all().map((row) => JSON.parse(String(row.item_json))), [
-        { id: 'ws_1', type: 'web_search_call', status: 'completed' },
-        { id: 'msg_1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'Search result.' }] },
-      ]);
-    } finally {
-      state.close();
-    }
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: primary.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: alternate.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-      ],
-      statePath: join(dir, 'state.db'),
-    });
-    const second = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'web-search-continuation' },
-      body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: bridgeResponseId, input: 'Continue.' }),
-    });
-    const secondBody = await second.text();
-    const secondResponseId = (sseTypes(secondBody).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
-    assert.equal(secondBody.includes('upstream_resp_2'), false);
-    assert.equal(sseTypes(secondBody).at(-1)?.type, 'response.completed');
-    assert.deepEqual(primary.requests[1], {
-      url: '/v1/responses', body: { model: 'gpt-test', stream: true, previous_response_id: 'upstream_resp_1', input: 'Continue.' },
-    });
-    const continuationReplay = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'web-search-continuation' },
-      body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: bridgeResponseId, input: 'Continue.' }),
-    });
-    assert.equal(await continuationReplay.text(), secondBody);
-    assert.equal(primary.requests.length, 2);
-    await (await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: secondResponseId, input: 'Continue again.' }),
-    })).text();
-    assert.deepEqual(primary.requests[2], {
-      url: '/v1/responses', body: { model: 'gpt-test', stream: true, previous_response_id: 'upstream_resp_2', input: 'Continue again.' },
-    });
-    assert.equal(alternate.requests.length, 0);
-  } finally {
-    await bridge?.close();
-    await primary.close();
-    await alternate.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('mixed-tools selects one fully capable native Responses upstream without conversion', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const webOnly = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_web_only') }]);
-  const functionAndCustom = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_function_and_custom') }]);
-  const fullyCapable = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_complete') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: webOnly.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: functionAndCustom.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { functionTools: true, customTools: true } },
-        { baseUrl: fullyCapable.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { functionTools: true, customTools: true, webSearch: true } },
-      ],
-      statePath: join(dir, 'state.db'),
-    });
-    const request = {
-      model: 'gpt-test', stream: true, input: 'Research and inspect the workspace.',
-      tools: [
-        { type: 'web_search', search_context_size: 'high' },
-        { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } },
-        { type: 'custom', name: 'shell', description: 'Runs shell', format: { type: 'grammar', syntax: 'bash' } },
-      ],
-      tool_choice: 'auto', include: ['web_search_call.action.sources'],
-    };
-    const response = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify(request),
-    });
-    assert.equal(response.status, 200);
-    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
-    assert.deepEqual(webOnly.requests, []);
-    assert.deepEqual(functionAndCustom.requests, []);
-    assert.deepEqual(fullyCapable.requests, [{ url: '/v1/responses', body: request }]);
-  } finally {
-    await bridge?.close();
-    await webOnly.close();
-    await functionAndCustom.close();
-    await fullyCapable.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('mixed-tools rejects partial capability coverage before contacting an upstream', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const webOnly = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_web_only') }]);
-  const functionAndCustom = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_function_and_custom') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: webOnly.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: functionAndCustom.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { functionTools: true, customTools: true } },
-      ],
-      statePath: join(dir, 'state.db'),
-    });
-    const response = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({
-        stream: true, input: 'Research and inspect the workspace.',
-        tools: [{ type: 'web_search' }, { type: 'function', name: 'weather' }, { type: 'custom', name: 'shell' }],
-      }),
-    });
-    assert.equal(response.status, 400);
-    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
-    assert.deepEqual(webOnly.requests, []);
-    assert.deepEqual(functionAndCustom.requests, []);
-    assert.deepEqual(bridge.state.responses(), []);
-  } finally {
-    await bridge?.close();
-    await webOnly.close();
-    await functionAndCustom.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('chat-only Hosted Web Search degrades without forging search results', async () => {
+test('Hosted Web Search always degrades to Chat Completions without forging search results', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
@@ -1120,7 +964,11 @@ test('chat-only Hosted Web Search degrades without forging search results', asyn
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, input: 'Find an example.',
+        tools: [{ type: 'web_search', search_context_size: 'medium', user_location: { type: 'approximate', country: 'US' } }],
+        tool_choice: { type: 'web_search' }, include: ['web_search_call.action.sources'],
+      }),
     });
     assert.equal(response.status, 200);
     const body = await response.text();
@@ -1129,8 +977,9 @@ test('chat-only Hosted Web Search degrades without forging search results', asyn
     assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
     assert.equal(body.includes('url_citation'), false);
     assert.equal(upstream.requests.length, 1);
-    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools?: unknown };
+    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: unknown };
     assert.equal(request.tools, undefined);
+    assert.equal(request.tool_choice, 'auto');
     assert.equal(request.messages.some(({ role, content }) => role === 'system' && content.includes('web search is unavailable')), true);
     assert.deepEqual(request.messages.at(-1), { role: 'user', content: 'Find an example.' });
   } finally {
@@ -1140,7 +989,280 @@ test('chat-only Hosted Web Search degrades without forging search results', asyn
   }
 });
 
-test('chat-only forced web_search tool_choice degrades to auto', async () => {
+test('Hosted Web Search Response Chain continues via Chat messages without upstream Response IDs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
+    });
+    const firstBody = await first.text();
+    const responseId = (sseTypes(firstBody).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+    await bridge.close();
+    const state = new DatabaseSync(join(dir, 'state.db'));
+    try {
+      const columns = state.prepare('PRAGMA table_info(responses)').all() as Array<{ name: string }>;
+      assert.equal(columns.some(({ name }) => name.startsWith('native_upstream_')), false);
+    } finally {
+      state.close();
+    }
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, previous_response_id: responseId, input: 'Continue.' }),
+    });
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    assert.equal(upstream.requests.length, 2);
+    const continuation = upstream.requests[1] as { messages: Array<{ role: string; content?: string }>; previous_response_id?: unknown };
+    assert.equal(continuation.previous_response_id, undefined);
+    assert.equal(continuation.messages.some(({ role, content }) => role === 'user' && content === 'Find an example.'), true);
+    assert.equal(continuation.messages.some(({ role, content }) => role === 'assistant' && content === 'Hello world'), true);
+    assert.deepEqual(continuation.messages.at(-1), { role: 'user', content: 'Continue.' });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('mixed tools with web_search select a Chat Completions upstream that covers remaining capabilities', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const functionOnly = await startCompatibilityFixture();
+  const fullyCapable = await startCustomFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: functionOnly.url, apiKey: 'upstream-key', capabilities: { functionTools: true } },
+        { baseUrl: fullyCapable.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Research and inspect the workspace.',
+        tools: [
+          { type: 'web_search' },
+          { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } },
+          { type: 'custom', name: 'shell', description: 'Runs shell' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual(functionOnly.requests, []);
+    assert.equal(fullyCapable.requests.length, 1);
+    const request = fullyCapable.requests[0] as { tools: unknown[] };
+    assert.deepEqual(request.tools, [
+      { type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } },
+      { type: 'custom', custom: { name: 'shell', description: 'Runs shell' } },
+    ]);
+  } finally {
+    await bridge?.close();
+    await functionOnly.close();
+    await fullyCapable.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('mixed-tools rejects partial capability coverage before contacting an upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const functionOnly = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: functionOnly.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Research and inspect the workspace.',
+        tools: [{ type: 'web_search' }, { type: 'function', name: 'weather' }, { type: 'custom', name: 'shell' }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
+    assert.deepEqual(functionOnly.requests, []);
+    assert.deepEqual(bridge.state.responses(), []);
+  } finally {
+    await bridge?.close();
+    await functionOnly.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('maps Reasoning Effort to upstream reasoning_effort', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'high' } }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.equal((upstream.requests[0] as { reasoning_effort?: string }).reasoning_effort, 'high');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('omits upstream reasoning_effort when Reasoning Effort is absent', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const withoutReasoning = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    assert.equal(withoutReasoning.status, 200);
+    await withoutReasoning.text();
+    const ignoredFields = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { summary: 'auto', mode: 'pro' } }),
+    });
+    assert.equal(ignoredFields.status, 200);
+    await ignoredFields.text();
+    assert.equal('reasoning_effort' in (upstream.requests[0] as object), false);
+    assert.equal('reasoning_effort' in (upstream.requests[1] as object), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects invalid Reasoning Effort before creating Response state', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'bad-effort' };
+    const nonObject = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: 'high' }),
+    });
+    assert.equal(nonObject.status, 400);
+    assert.equal((await nonObject.json() as { error: { code: string } }).error.code, 'invalid_reasoning');
+    const badEffort = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'ultra' } }),
+    });
+    assert.equal(badEffort.status, 400);
+    assert.equal((await badEffort.json() as { error: { code: string } }).error.code, 'invalid_reasoning');
+    assert.deepEqual(upstream.requests, []);
+    assert.deepEqual(bridge.state.responses(), []);
+    assert.deepEqual(bridge.state.attempts(), []);
+    await bridge.close();
+    bridge = undefined;
+    const state = new DatabaseSync(join(dir, 'state.db'));
+    try {
+      assert.deepEqual(state.prepare('SELECT key FROM idempotency_records').all(), []);
+    } finally {
+      state.close();
+    }
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Idempotent Request conflicts when only Reasoning Effort differs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'effort-once' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'low' } }),
+    });
+    assert.equal(first.status, 200);
+    await first.text();
+    const before = { events: bridge.state.events(), responses: bridge.state.responses(), attempts: bridge.state.attempts() };
+    const conflict = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'high' } }),
+    });
+    assert.equal(conflict.status, 409);
+    assert.deepEqual(await conflict.json(), {
+      error: { message: 'Idempotency-Key is already used for a different request', type: 'invalid_request_error', param: null, code: 'idempotency_key_conflict' },
+    });
+    assert.deepEqual({ events: bridge.state.events(), responses: bridge.state.responses(), attempts: bridge.state.attempts() }, before);
+    assert.equal(upstream.requests.length, 1);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Idempotent Request ignores non-effort reasoning fields in the digest', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'ignore-fields' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'medium', summary: 'auto' } }),
+    });
+    assert.equal(first.status, 200);
+    const firstBody = await first.text();
+    const replay = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'medium', mode: 'pro' } }),
+    });
+    assert.equal(await replay.text(), firstBody);
+    assert.equal(upstream.requests.length, 1);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('forced web_search tool_choice degrades to auto', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
@@ -1173,7 +1295,7 @@ test('chat-only forced web_search tool_choice degrades to auto', async () => {
   }
 });
 
-test('chat-only mixed tools keep Function and Custom after web_search degradation', async () => {
+test('mixed tools keep Function and Custom after web_search degradation', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCustomFixture();
   let bridge: RunningBridge | undefined;
@@ -1217,70 +1339,14 @@ test('chat-only mixed tools keep Function and Custom after web_search degradatio
   }
 });
 
-test('web-search-incompatible rejects before contacting an upstream', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const upstream = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_1') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { functionTools: true } }],
-      statePath: join(dir, 'state.db'),
-    });
-    const response = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
-    });
-    assert.equal(response.status, 400);
-    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
-    assert.deepEqual(upstream.requests, []);
-  } finally {
-    await bridge?.close();
-    await upstream.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('Native Web Search Chain pins the configured upstream identity', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const upstream = await startNativeResponsesFixture([
-    { frames: nativeWebSearchFrames('upstream_resp_1') },
-    { frames: nativeWebSearchFrames('upstream_resp_2') },
-  ]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: upstream.url, apiKey: 'first-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: upstream.url, apiKey: 'second-key', wireApi: 'responses', capabilities: { webSearch: true } },
-      ],
-      statePath: join(dir, 'state.db'),
-    });
-    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
-    const first = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
-    });
-    const responseId = (sseTypes(await first.text()).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
-    await (await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, previous_response_id: responseId, input: 'Continue.' }),
-    })).text();
-    assert.deepEqual(upstream.authorizations, ['Bearer first-key', 'Bearer first-key']);
-  } finally {
-    await bridge?.close();
-    await upstream.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 test('web_search_preview is rejected before contacting an upstream', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const upstream = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_1') }]);
+  const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
       statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
@@ -1293,126 +1359,6 @@ test('web_search_preview is rejected before contacting an upstream', async () =>
   } finally {
     await bridge?.close();
     await upstream.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('web-search-failover retries a native Responses upstream before output', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const first = await startNativeResponsesFixture([{ status: 500 }]);
-  const second = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_2') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: first.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: second.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-      ],
-      statePath: join(dir, 'state.db'),
-    });
-    const response = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
-    });
-    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
-    assert.equal(first.requests.length, 1);
-    assert.equal(second.requests.length, 1);
-    assert.deepEqual(bridge.state.attemptDetails().map(({ result, preOutputFailure }) => ({ result, preOutputFailure })), [
-      { result: 'failed', preOutputFailure: true }, { result: 'completed', preOutputFailure: false },
-    ]);
-  } finally {
-    await bridge?.close();
-    await first.close();
-    await second.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('native Responses rewrites only protocol Response IDs', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const upstream = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_1', 'upstream_resp_1') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } }],
-      statePath: join(dir, 'state.db'),
-    });
-    const response = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
-    });
-    const events = sseTypes(await response.text()) as Array<{ type: string; delta?: string; response?: { id: string } }>;
-    assert.equal(events.find(({ type }) => type === 'response.output_text.delta')?.delta, 'upstream_resp_1');
-    assert.notEqual(events.find(({ type }) => type === 'response.completed')?.response?.id, 'upstream_resp_1');
-  } finally {
-    await bridge?.close();
-    await upstream.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('web-search-failover retries after a native Responses preamble stalls', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const first = await startNativeResponsesFixture([{
-    frames: [nativeWebSearchFrames('upstream_stalled')[0]], waitAfterFirstFrameMs: 200,
-  }]);
-  const second = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_2') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: first.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: second.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-      ],
-      statePath: join(dir, 'state.db'), outputIdleTimeoutMs: 20,
-    });
-    const startedAt = Date.now();
-    const response = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
-    });
-    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
-    assert(Date.now() - startedAt < 150);
-    assert.equal(first.requests.length, 1);
-    assert.equal(second.requests.length, 1);
-  } finally {
-    await bridge?.close();
-    await first.close();
-    await second.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test('native Responses pre-stream rejection does not retry or persist a Response', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const first = await startNativeResponsesFixture([{ status: 400 }]);
-  const second = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_2') }]);
-  let bridge: RunningBridge | undefined;
-  try {
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: first.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-        { baseUrl: second.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
-      ],
-      statePath: join(dir, 'state.db'),
-    });
-    const response = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
-    });
-    assert.equal(response.status, 400);
-    assert.equal((await response.json() as { error: { code: string } }).error.code, 'upstream_rejected');
-    assert.equal(first.requests.length, 1);
-    assert.equal(second.requests.length, 0);
-    assert.deepEqual(bridge.state.responses(), []);
-  } finally {
-    await bridge?.close();
-    await first.close();
-    await second.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -123,7 +123,9 @@ test('CLI rejects missing, mistyped, and unknown YAML configuration before start
     ['upstreams: []\n', 'Configuration.apiKey'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\nport: wrong\n', 'Configuration.port'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\nextra: true\n', 'Configuration.extra'],
-    ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    wireApi: native\n', 'Configuration.upstreams[0].wireApi'],
+    ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    wireApi: responses\n', 'Configuration.upstreams[0].wireApi'],
+    ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    wireApi: chat\n', 'Configuration.upstreams[0].wireApi'],
+    ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    capabilities:\n      webSearch: true\n', 'Configuration.upstreams[0].capabilities.webSearch'],
   ]) {
     const rejected = await runRejectedConfiguration(source);
     assert.equal(rejected.code, 1);
