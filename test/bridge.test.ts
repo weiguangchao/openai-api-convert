@@ -933,6 +933,7 @@ test('web-search-supported preserves native Responses SSE, controls, citations, 
   const primary = await startNativeResponsesFixture([
     { frames: nativeWebSearchFrames('upstream_resp_1') },
     { frames: nativeWebSearchFrames('upstream_resp_2', 'Follow-up.') },
+    { frames: nativeWebSearchFrames('upstream_resp_3', 'Final follow-up.') },
   ]);
   const alternate = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_alt') }]);
   let bridge: RunningBridge | undefined;
@@ -967,13 +968,38 @@ test('web-search-supported preserves native Responses SSE, controls, citations, 
     assert.equal(await replay.text(), firstBody);
     assert.equal(primary.requests.length, 1);
 
+    await bridge.close();
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: primary.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+        { baseUrl: alternate.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
     const second = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'web-search-continuation' },
       body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: bridgeResponseId, input: 'Continue.' }),
     });
-    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    const secondBody = await second.text();
+    const secondResponseId = (sseTypes(secondBody).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+    assert.equal(secondBody.includes('upstream_resp_2'), false);
+    assert.equal(sseTypes(secondBody).at(-1)?.type, 'response.completed');
     assert.deepEqual(primary.requests[1], {
       url: '/v1/responses', body: { model: 'gpt-test', stream: true, previous_response_id: 'upstream_resp_1', input: 'Continue.' },
+    });
+    const continuationReplay = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'web-search-continuation' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: bridgeResponseId, input: 'Continue.' }),
+    });
+    assert.equal(await continuationReplay.text(), secondBody);
+    assert.equal(primary.requests.length, 2);
+    await (await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: secondResponseId, input: 'Continue again.' }),
+    })).text();
+    assert.deepEqual(primary.requests[2], {
+      url: '/v1/responses', body: { model: 'gpt-test', stream: true, previous_response_id: 'upstream_resp_2', input: 'Continue again.' },
     });
     assert.equal(alternate.requests.length, 0);
   } finally {
