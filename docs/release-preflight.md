@@ -1,6 +1,6 @@
 # Release preflight
 
-`npm test` is the Compatibility Fixture gate. It fixes the Responses request, optional Response Chain and Idempotency-Key, scripted Chat upstream, expected Responses SSE and State Store observations. It never asserts conversion internals or generated model text.
+`npm run test:unit` is the Compatibility Fixture gate. It fixes the Responses request, optional Response Chain and Idempotency-Key, scripted Chat upstream, expected Responses SSE and State Store observations. It never asserts conversion internals or generated model text.
 
 | Fixture group | Covered contract |
 | --- | --- |
@@ -17,7 +17,7 @@ Run the real-upstream and Codex CLI preflight only with deployment credentials i
 ```sh
 cp config.example.yaml config.yaml
 # Fill both API keys and the upstream base URL in config.yaml.
-npm run smoke
+npm test
 ```
 
 The command starts an isolated Bridge and State Store, first verifies semantic Responses SSE directly, then runs ephemeral Codex with an isolated provider configuration. Codex's built-in web search, apps and multi-agent namespaces are disabled for this MVP preflight. It accepts any generated content; success requires a semantic `response.completed` from both direct and Codex requests. The configured pool must explicitly support Function Tool and parallel Tool Calling.
