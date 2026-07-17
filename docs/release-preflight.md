@@ -7,6 +7,7 @@
 | `text-complete` | Text SSE, Chat request, event persistence and terminal state |
 | `function-single`, `function-parallel` | Response Chain, call IDs, arguments and order |
 | `custom-supported`, `custom-incompatible`, `parallel-incompatible` | Native routing or pre-stream rejection |
+| `web-search-supported`, `web-search-incompatible`, `web-search-failover` | Native Responses passthrough and continuation, pre-stream rejection, pre-output failover |
 | `declared-capability-client-4xx` | Direct 4xx without failover |
 | `idempotency-in-progress`, `idempotency-terminal`, `idempotency-failed` | Replay, atomic terminal state and conflict safety |
 | `failover-before-output`, `failure-after-output`, `all-upstreams-fail` | Retry boundary and terminal failure |
@@ -20,4 +21,4 @@ cp config.example.yaml config.yaml
 npm test
 ```
 
-The command starts an isolated Bridge and State Store, first verifies semantic Responses SSE directly, then runs ephemeral Codex with an isolated provider configuration. Codex's built-in web search, apps and multi-agent namespaces are disabled for this MVP preflight. It accepts any generated content; success requires a semantic `response.completed` from both direct and Codex requests. The configured pool must explicitly support Function Tool and parallel Tool Calling.
+The command starts an isolated Bridge and State Store, first verifies semantic Responses SSE directly, then runs ephemeral Codex with an isolated provider configuration. Codex's built-in web search is enabled; apps and multi-agent namespaces are disabled. It accepts any generated content; success requires a semantic `response.completed` from both direct and Codex requests. The configured pool must explicitly support Function Tool, parallel Tool Calling, native Responses and Hosted Web Search.
