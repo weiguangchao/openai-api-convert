@@ -1010,6 +1010,82 @@ test('web-search-supported preserves native Responses SSE, controls, citations, 
   }
 });
 
+test('mixed-tools selects one fully capable native Responses upstream without conversion', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const webOnly = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_web_only') }]);
+  const functionAndCustom = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_function_and_custom') }]);
+  const fullyCapable = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_complete') }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: webOnly.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+        { baseUrl: functionAndCustom.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { functionTools: true, customTools: true } },
+        { baseUrl: fullyCapable.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { functionTools: true, customTools: true, webSearch: true } },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const request = {
+      model: 'gpt-test', stream: true, input: 'Research and inspect the workspace.',
+      tools: [
+        { type: 'web_search', search_context_size: 'high' },
+        { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } },
+        { type: 'custom', name: 'shell', description: 'Runs shell', format: { type: 'grammar', syntax: 'bash' } },
+      ],
+      tool_choice: 'auto', include: ['web_search_call.action.sources'],
+    };
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify(request),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual(webOnly.requests, []);
+    assert.deepEqual(functionAndCustom.requests, []);
+    assert.deepEqual(fullyCapable.requests, [{ url: '/v1/responses', body: request }]);
+  } finally {
+    await bridge?.close();
+    await webOnly.close();
+    await functionAndCustom.close();
+    await fullyCapable.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('mixed-tools rejects partial capability coverage before contacting an upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const webOnly = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_web_only') }]);
+  const functionAndCustom = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_function_and_custom') }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [
+        { baseUrl: webOnly.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { webSearch: true } },
+        { baseUrl: functionAndCustom.url, apiKey: 'upstream-key', wireApi: 'responses', capabilities: { functionTools: true, customTools: true } },
+      ],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Research and inspect the workspace.',
+        tools: [{ type: 'web_search' }, { type: 'function', name: 'weather' }, { type: 'custom', name: 'shell' }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
+    assert.deepEqual(webOnly.requests, []);
+    assert.deepEqual(functionAndCustom.requests, []);
+    assert.deepEqual(bridge.state.responses(), []);
+  } finally {
+    await bridge?.close();
+    await webOnly.close();
+    await functionAndCustom.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('web-search-incompatible rejects before contacting an upstream', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startNativeResponsesFixture([{ frames: nativeWebSearchFrames('upstream_resp_1') }]);
