@@ -18,6 +18,8 @@ test('release smoke validates semantic SSE and invokes Codex with an isolated Br
     baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'smoke-upstream-key',
     capabilities: { functionTools: true, parallelToolCalls: true },
   }];
+  const inheritedSecret = process.env.RELEASE_SMOKE_TEST_SECRET;
+  process.env.RELEASE_SMOKE_TEST_SECRET = 'must-not-reach-codex';
   try {
     await assert.rejects(() => runReleaseSmoke({
       apiKey: 'smoke-bridge-key', model: 'smoke-model',
@@ -54,12 +56,15 @@ test('release smoke validates semantic SSE and invokes Codex with an isolated Br
     });
     assert.equal(invocations.length, 1);
     assert.equal(invocations[0].env.BRIDGE_API_KEY, 'smoke-bridge-key');
+    assert.equal(invocations[0].env.RELEASE_SMOKE_TEST_SECRET, undefined);
     assert.equal(invocations[0].args.includes('--ephemeral'), true);
     assert.equal(invocations[0].args.includes('--ignore-user-config'), true);
     assert.equal(invocations[0].args.includes('model_provider="response-bridge-smoke"'), true);
     assert.equal(invocations[0].args.some((argument) => argument.includes('smoke-upstream-key')), false);
     assert.equal(invocations[0].args.some((argument) => argument.includes('smoke-bridge-key')), false);
   } finally {
+    if (inheritedSecret === undefined) delete process.env.RELEASE_SMOKE_TEST_SECRET;
+    else process.env.RELEASE_SMOKE_TEST_SECRET = inheritedSecret;
     await new Promise<void>((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()));
   }
 });

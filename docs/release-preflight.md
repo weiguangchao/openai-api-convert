@@ -12,13 +12,12 @@
 | `failover-before-output`, `failure-after-output`, `all-upstreams-fail` | Retry boundary and terminal failure |
 | Retention, capacity and operations | Cleanup safety, capacity-before-write, auth, readiness, metrics, logs and disconnect |
 
-Run the real-upstream and Codex CLI preflight only with deployment credentials:
+Run the real-upstream and Codex CLI preflight only with deployment credentials in the ignored `config.yaml`:
 
 ```sh
-export BRIDGE_SMOKE_API_KEY='local-bridge-key'
-export BRIDGE_SMOKE_UPSTREAM_POOL='[{"baseUrl":"https://upstream.example/v1","apiKey":"...","capabilities":{"functionTools":true,"parallelToolCalls":true}}]'
-export BRIDGE_SMOKE_MODEL='deployment-model'
+cp config.example.yaml config.yaml
+# Fill both API keys and the upstream base URL in config.yaml.
 npm run smoke
 ```
 
-The command starts an isolated Bridge and State Store, first verifies semantic Responses SSE directly, then runs ephemeral Codex with an isolated provider configuration. Codex's built-in web search, apps and multi-agent namespaces are disabled for this MVP preflight. It accepts any generated content; success requires a semantic `response.completed` from both direct and Codex requests. The configured pool must explicitly support Function Tool and parallel Tool Calling. `BRIDGE_SMOKE_CODEX_BIN` optionally overrides `codex`.
+The command starts an isolated Bridge and State Store, first verifies semantic Responses SSE directly, then runs ephemeral Codex with an isolated provider configuration. Codex's built-in web search, apps and multi-agent namespaces are disabled for this MVP preflight. It accepts any generated content; success requires a semantic `response.completed` from both direct and Codex requests. The configured pool must explicitly support Function Tool and parallel Tool Calling.
