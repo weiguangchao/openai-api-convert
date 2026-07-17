@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -7,6 +7,31 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startBridge, type RunningBridge } from '../src/server.ts';
+
+const captureStdoutLines = () => {
+  const lines: string[] = [];
+  const stdoutWrite = process.stdout.write.bind(process.stdout);
+  const stderrWrite = process.stderr.write.bind(process.stderr);
+  const capture = (chunk: string | Uint8Array, encoding?: BufferEncoding) => {
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString(encoding ?? 'utf8');
+    for (const line of text.split('\n')) if (line.trim()) lines.push(line);
+  };
+  process.stdout.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+    capture(chunk, typeof encoding === 'string' ? encoding : undefined);
+    return stdoutWrite(chunk, encoding as never, callback as never);
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+    capture(chunk, typeof encoding === 'string' ? encoding : undefined);
+    return stderrWrite(chunk, encoding as never, callback as never);
+  }) as typeof process.stderr.write;
+  return {
+    lines,
+    restore: () => {
+      process.stdout.write = stdoutWrite;
+      process.stderr.write = stderrWrite;
+    },
+  };
+};
 
 const codexMixedTools = JSON.parse(
   await readFile(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/codex-0.144.5-mixed-tools.json'), 'utf8'),
@@ -246,11 +271,7 @@ test('reports not ready when every upstream probe fails', async () => {
 test('exports protected metrics and redacted JSON Lines logs', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
-  const lines: string[] = [];
-  const info = console.info;
-  const error = console.error;
-  console.info = (...args: unknown[]) => { lines.push(args.join(' ')); };
-  console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  const captured = captureStdoutLines();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
@@ -275,7 +296,7 @@ test('exports protected metrics and redacted JSON Lines logs', async () => {
       'bridge_upstream_switches_total', 'bridge_state_store_bytes', 'bridge_state_store_cleanup_runs_total',
       'bridge_state_store_capacity_rejections_total',
     ]) assert.equal(metrics.includes(metric), true);
-    const requestLog = lines.map((line) => JSON.parse(line) as Record<string, unknown>)
+    const requestLog = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>)
       .find(({ event }) => event === 'http_request_completed');
     assert(requestLog);
     assert.equal(typeof requestLog.timestamp, 'string');
@@ -284,15 +305,49 @@ test('exports protected metrics and redacted JSON Lines logs', async () => {
     assert.equal(typeof requestLog.duration_ms, 'number');
     assert.equal(Object.hasOwn(requestLog, 'response_id'), true);
     assert.equal(Object.hasOwn(requestLog, 'error_code'), true);
-    const serialized = lines.join('\n');
+    const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('secret invalid payload'), false);
     assert.equal(serialized.includes('secret response input'), false);
     assert.equal(serialized.includes('bridge-key'), false);
     assert.equal(serialized.includes('upstream-key'), false);
     assert.equal(serialized.includes(upstream.url), false);
   } finally {
-    console.info = info;
-    console.error = error;
+    captured.restore();
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('writes human-readable Traffic Log files beside State Store without secrets', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const statePath = join(dir, 'state.db');
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+    });
+    assert.equal((await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'secret response input' }),
+    })).status, 200);
+    await bridge.close();
+    bridge = undefined;
+    const logFiles = await readdir(join(dir, 'logs'));
+    assert.ok(logFiles.length > 0, 'expected log files under dirname(statePath)/logs/');
+    const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
+    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ (INFO|ERROR) http_request_completed$/m);
+    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ INFO state_store_cleanup$/m);
+    assert.match(content, /\n  "[a-z_]+": /);
+    assert.equal(content.includes('secret response input'), false);
+    assert.equal(content.includes('bridge-key'), false);
+    assert.equal(content.includes('upstream-key'), false);
+    assert.equal(content.includes(upstream.url), false);
+  } finally {
     await bridge?.close();
     await upstream.close();
     await rm(dir, { recursive: true, force: true });
@@ -1702,11 +1757,7 @@ test('all-upstreams-fail Compatibility Fixture emits response.failed after every
 test('client disconnect aborts the active Attempt and cancels the Response', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startIdempotencyFixture();
-  const lines: string[] = [];
-  const info = console.info;
-  const error = console.error;
-  console.info = (...args: unknown[]) => { lines.push(args.join(' ')); };
-  console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  const captured = captureStdoutLines();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
@@ -1730,10 +1781,9 @@ test('client disconnect aborts the active Attempt and cancels the Response', asy
     const metrics = await (await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).text();
     assert.equal(metrics.includes('bridge_requests_total 1'), true);
     assert.equal(metrics.includes('bridge_request_failures_total 1'), true);
-    assert.equal(lines.some((line) => line.includes('"event":"http_request_completed"') && line.includes('"error_code":"client_disconnected"')), true);
+    assert.equal(captured.lines.some((line) => line.includes('"event":"http_request_completed"') && line.includes('"error_code":"client_disconnected"')), true);
   } finally {
-    console.info = info;
-    console.error = error;
+    captured.restore();
     upstream.release();
     await bridge?.close();
     await upstream.close();
