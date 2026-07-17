@@ -1,5 +1,5 @@
 import { loadBridgeConfiguration } from '../src/config.ts';
-import { runReleaseSmoke } from '../src/release-smoke.ts';
+import { runReleaseSmoke } from './release-smoke-lib.ts';
 
 const configuration = await loadBridgeConfiguration();
 
