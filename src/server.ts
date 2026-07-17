@@ -547,13 +547,24 @@ const readJson = async (request: IncomingMessage): Promise<unknown> => {
   return JSON.parse(body);
 };
 
+const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
+
 const normalizeInput = (input: unknown): InputItem[] | undefined => {
   if (typeof input === 'string' && input.length > 0) return [{ type: 'message', role: 'user', content: input }];
   if (!Array.isArray(input) || input.length === 0) return undefined;
-  const items: InputItem[] = [];
+  type Classified = { kind: 'echo' } | { kind: 'item'; item: InputItem };
+  const classified: Classified[] = [];
   for (const item of input) {
     if (!item || typeof item !== 'object') return undefined;
     const value = item as Record<string, unknown>;
+    if (value.type === 'message' && value.role === 'assistant') {
+      classified.push({ kind: 'echo' });
+      continue;
+    }
+    if (typeof value.type === 'string' && INPUT_ECHO_TYPES.has(value.type)) {
+      classified.push({ kind: 'echo' });
+      continue;
+    }
     if (value.type === 'message' && (value.role === 'user' || value.role === 'developer') && Array.isArray(value.content)) {
       const text = value.content.map((part) => {
         if (!part || typeof part !== 'object') return undefined;
@@ -561,13 +572,19 @@ const normalizeInput = (input: unknown): InputItem[] | undefined => {
         return content.type === 'input_text' && typeof content.text === 'string' ? content.text : undefined;
       });
       if (!text.length || text.some((part) => part === undefined)) return undefined;
-      items.push({ type: 'message', role: value.role, content: text.join('') });
+      classified.push({ kind: 'item', item: { type: 'message', role: value.role, content: text.join('') } });
       continue;
     }
     if ((value.type !== 'function_call_output' && value.type !== 'custom_tool_call_output') || typeof value.call_id !== 'string' || typeof value.output !== 'string') return undefined;
-    items.push({ type: value.type, call_id: value.call_id, output: value.output });
+    classified.push({ kind: 'item', item: { type: value.type, call_id: value.call_id, output: value.output } });
   }
-  return items;
+  // store:false clients may echo prior output items; keep only the suffix after the last echo.
+  let start = 0;
+  for (let index = 0; index < classified.length; index += 1) {
+    if (classified[index]!.kind === 'echo') start = index + 1;
+  }
+  const items = classified.slice(start).flatMap((entry) => entry.kind === 'item' ? [entry.item] : []);
+  return items.length ? items : undefined;
 };
 
 const TOOL_NAME_MAX = 64;
