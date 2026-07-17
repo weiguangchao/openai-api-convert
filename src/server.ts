@@ -803,6 +803,14 @@ const canonicalJson = (value: unknown): string => {
 };
 
 const digest = (value: unknown) => createHash('sha256').update(canonicalJson(value)).digest('hex');
+const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const parseReasoningEffort = (reasoning: unknown): string | undefined | null => {
+  if (reasoning === undefined) return undefined;
+  if (typeof reasoning !== 'object' || reasoning === null || Array.isArray(reasoning)) return null;
+  const effort = (reasoning as { effort?: unknown }).effort;
+  if (effort === undefined) return undefined;
+  return typeof effort === 'string' && REASONING_EFFORTS.has(effort) ? effort : null;
+};
 
 const parseUpstream = async function* (body: ReadableStream<Uint8Array>) {
   const reader = body.getReader();
@@ -912,12 +920,17 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
 
       let payload: {
         stream?: unknown; input?: unknown; model?: unknown; tools?: unknown; previous_response_id?: unknown; parallel_tool_calls?: unknown;
-        tool_choice?: unknown; include?: unknown;
+        tool_choice?: unknown; include?: unknown; reasoning?: unknown;
       };
       try { payload = await readJson(request) as typeof payload; }
       catch { sendError(response, 400, 'Invalid JSON body', 'invalid_json'); return; }
       if (payload.stream !== true) {
         sendError(response, 400, 'Only stream: true is supported', 'stream_required');
+        return;
+      }
+      const reasoningEffort = parseReasoningEffort(payload.reasoning);
+      if (reasoningEffort === null) {
+        sendError(response, 400, 'Invalid reasoning', 'invalid_reasoning');
         return;
       }
       const input = normalizeInput(payload.input);
@@ -1001,6 +1014,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         ...(chatTools.length ? { tools: chatTools } : {}),
         ...(needs.parallelToolCalls ? { parallel_tool_calls: true } : {}),
         ...(chatToolChoice === undefined ? {} : { tool_choice: chatToolChoice }),
+        ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
       };
 
       const id = `resp_${randomUUID().replaceAll('-', '')}`;
@@ -1012,6 +1026,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         hash: digest({
           model, input, tools: payload.tools ?? [], previousResponseId: payload.previous_response_id ?? null,
           parallelToolCalls: payload.parallel_tool_calls === true, toolChoice: payload.tool_choice, include: payload.include,
+          reasoningEffort: reasoningEffort ?? null,
         }),
       });
       if (claim.kind === 'conflict') {
