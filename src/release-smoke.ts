@@ -65,7 +65,7 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model = 'gpt-4.1', co
       '-c', `model_providers.${provider}.wire_api=${JSON.stringify('responses')}`,
       '-m', model, 'Reply with a short acknowledgement. Do not use tools.',
     ];
-    await runCodex(args, { ...process.env, CODEX_HOME: codexHome, BRIDGE_API_KEY: apiKey });
+    await runCodex(args, { PATH: process.env.PATH ?? '', CODEX_HOME: codexHome, BRIDGE_API_KEY: apiKey });
     const codexResponses = bridge.state.responses().slice(responseCount);
     const codexEvents = bridge.state.events().slice(eventCount).map((event) => event.type);
     if (!codexResponses.some((response) => response.status === 'completed')

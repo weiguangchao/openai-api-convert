@@ -65,6 +65,7 @@ out/
 .env
 .env.local
 .env.*.local
+config.yaml
 
 # npm cache directory
 .npm

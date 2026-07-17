@@ -1,0 +1,17 @@
+apiKey: replace-with-bridge-api-key
+upstreams:
+  - baseUrl: https://upstream.example.com
+    apiKey: replace-with-upstream-api-key
+    capabilities:
+      functionTools: true
+      customTools: true
+      parallelToolCalls: true
+statePath: ./response-bridge.db
+port: 3000
+firstEventTimeoutMs: 30000
+outputIdleTimeoutMs: 60000
+statePolicy:
+  responseRetentionDays: 30
+  attemptRetentionDays: 7
+  cleanupThresholdBytes: 8589934592
+  hardLimitBytes: 10737418240
