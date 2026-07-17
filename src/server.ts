@@ -835,14 +835,16 @@ const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   return messages;
 };
 
-const sse = (response: ServerResponse, store: StateStore, responseId: string, event: ResponseEvent) => {
+const sse = (response: ServerResponse, store: StateStore, responseId: string, event: ResponseEvent, logDownstream?: (event: ResponseEvent) => void) => {
   store.appendEvent(responseId, event);
   response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  logDownstream?.(event);
 };
 
-const terminalSse = (response: ServerResponse, store: StateStore, responseId: string, status: 'completed' | 'failed', outputText: string, event: ResponseEvent, attempt?: AttemptCompletion) => {
+const terminalSse = (response: ServerResponse, store: StateStore, responseId: string, status: 'completed' | 'failed', outputText: string, event: ResponseEvent, attempt?: AttemptCompletion, logDownstream?: (event: ResponseEvent) => void) => {
   store.terminal(responseId, status, outputText, event, attempt);
   response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  logDownstream?.(event);
 };
 
 const finishUpstreamFailure = (response: ServerResponse, store: StateStore, id: string, status: number, message: string, code: string) => {
@@ -1142,6 +1144,12 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         let upstreamAttempts = 0;
         let terminalAttempt: AttemptCompletion | undefined;
         let retryAttempt: AttemptCompletion | undefined;
+        const logDownstreamOutbound = (event: ResponseEvent) => {
+          logging.log('info', 'traffic_downstream_outbound', { requestId, responseId: id, attempt_index: upstreamAttempts, event_type: event.type });
+          if (logging.level === 'debug') {
+            logging.log('debug', 'traffic_downstream_outbound', { requestId, responseId: id, attempt_index: upstreamAttempts, event_type: event.type, sse_event: event });
+          }
+        };
         for (const upstream of upstreams) {
           if (cancelled) break;
           if (retryAttempt) {
@@ -1182,6 +1190,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
               body: JSON.stringify(upstreamBody), signal: abort.signal,
             });
           } catch {
+            logging.log('info', 'traffic_upstream_inbound', { requestId, responseId: id, attempt_index: upstreamAttempts, status: 0 });
             finishAttempt();
             if (cancelled) {
               terminalAttempt = { id: attemptId, result: 'cancelled', preOutputFailure: true, errorCode: 'client_disconnected' };
@@ -1190,12 +1199,25 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
             retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
             continue;
           }
+          logging.log('info', 'traffic_upstream_inbound', { requestId, responseId: id, attempt_index: upstreamAttempts, status: upstreamResponse.status });
+          if (logging.level === 'debug') {
+            logging.log('debug', 'traffic_upstream_inbound', {
+              requestId, responseId: id, attempt_index: upstreamAttempts, status: upstreamResponse.status,
+              headers: redactHeaders(Object.fromEntries(upstreamResponse.headers.entries())),
+            });
+          }
           if (upstreamResponse.status === 408 || upstreamResponse.status === 429 || upstreamResponse.status >= 500 || !upstreamResponse.body) {
+            if (logging.level === 'debug' && upstreamResponse.body) {
+              logging.log('debug', 'traffic_upstream_inbound', { requestId, responseId: id, attempt_index: upstreamAttempts, body: await upstreamResponse.text() });
+            }
             finishAttempt();
             retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
             continue;
           }
           if (upstreamResponse.status >= 400) {
+            if (logging.level === 'debug') {
+              logging.log('debug', 'traffic_upstream_inbound', { requestId, responseId: id, attempt_index: upstreamAttempts, body: await upstreamResponse.text() });
+            }
             finishAttempt();
             if (!streamStarted) {
               finishUpstreamFailure(response, state, id, 400, 'Upstream rejected request', 'upstream_rejected');
@@ -1206,7 +1228,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           }
           if (!streamStarted) {
             response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-            sse(response, state, id, { type: 'response.created', response: { id, object: 'response', status: 'in_progress', model, output: [] } });
+            sse(response, state, id, { type: 'response.created', response: { id, object: 'response', status: 'in_progress', model, output: [] } }, logDownstreamOutbound);
             streamStarted = true;
           }
 
@@ -1219,6 +1241,9 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           const calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
           try {
             for await (const data of parseUpstream(upstreamResponse.body)) {
+              if (logging.level === 'debug') {
+                logging.log('debug', 'traffic_upstream_inbound', { requestId, responseId: id, attempt_index: upstreamAttempts, body: data });
+              }
               if (firstEvent) {
                 firstEvent = false;
                 if (timeout) clearTimeout(timeout);
@@ -1233,7 +1258,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
                 outputStarted = true;
                 armTimeout(options.outputIdleTimeoutMs ?? 60_000);
                 outputText += delta.content;
-                sse(response, state, id, { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: textOutputIndex, content_index: 0, delta: delta.content });
+                sse(response, state, id, { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: textOutputIndex, content_index: 0, delta: delta.content }, logDownstreamOutbound);
               }
               for (const call of delta?.tool_calls ?? []) {
                 if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
@@ -1255,7 +1280,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
                   sse(response, state, id, {
                     type: current.kind === 'function' ? 'response.function_call_arguments.delta' : 'response.custom_tool_call_input.delta',
                     item_id: current.id ?? `tc_${Number(call.index)}`, output_index: current.outputIndex, delta: inputDelta,
-                  });
+                  }, logDownstreamOutbound);
                 }
                 calls.set(Number(call.index), current);
               }
@@ -1281,15 +1306,15 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
               });
               sse(response, state, id, call.kind === 'function'
                 ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
-                : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input });
+                : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input }, logDownstreamOutbound);
             }
             const output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
             for (const [index, item] of output.entries()) {
               state.appendOutputItem(id, index, item);
-              sse(response, state, id, { type: 'response.output_item.done', output_index: index, item });
+              sse(response, state, id, { type: 'response.output_item.done', output_index: index, item }, logDownstreamOutbound);
             }
             finishAttempt();
-            terminalSse(response, state, id, 'completed', outputText, { type: 'response.completed', response: { id, object: 'response', status: 'completed', model, output } }, { id: attemptId, result: 'completed', preOutputFailure: false });
+            terminalSse(response, state, id, 'completed', outputText, { type: 'response.completed', response: { id, object: 'response', status: 'completed', model, output } }, { id: attemptId, result: 'completed', preOutputFailure: false }, logDownstreamOutbound);
             response.end();
             return;
           } catch {
@@ -1318,7 +1343,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
           return;
         }
         errorCodes.set(response, 'upstream_stream_failed');
-        terminalSse(response, state, id, 'failed', failedOutputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } }, terminalAttempt ?? retryAttempt);
+        terminalSse(response, state, id, 'failed', failedOutputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } }, terminalAttempt ?? retryAttempt, logDownstreamOutbound);
         response.end();
       } finally {
         request.removeListener('aborted', cancel);
