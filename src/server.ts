@@ -2,8 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
-type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
-type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
+export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
+export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
 export type StatePolicy = {
   responseRetentionDays?: number;
   attemptRetentionDays?: number;
@@ -26,7 +26,8 @@ type CustomTool = { type: 'custom'; name: string; description?: string; format?:
 type Tool = FunctionTool | CustomTool;
 type FunctionToolOutput = { type: 'function_call_output'; call_id: string; output: string };
 type CustomToolOutput = { type: 'custom_tool_call_output'; call_id: string; output: string };
-type InputItem = { type: 'message'; role: 'user'; content: string } | FunctionToolOutput | CustomToolOutput;
+type InputMessage = { type: 'message'; role: 'user' | 'developer'; content: string };
+type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput;
 type OutputItem =
   | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string }
@@ -41,7 +42,7 @@ type ChatToolCall =
   | { id: string; type: 'function'; function: { name: string; arguments: string } }
   | { id: string; type: 'custom'; custom: { name: string; input: string } };
 type ChatMessage =
-  | { role: 'user'; content: string }
+  | { role: 'user' | 'system'; content: string }
   | { role: 'tool'; tool_call_id: string; content: string }
   | { role: 'assistant'; content?: string; tool_calls?: ChatToolCall[] };
 
@@ -489,6 +490,16 @@ const normalizeInput = (input: unknown): InputItem[] | undefined => {
   for (const item of input) {
     if (!item || typeof item !== 'object') return undefined;
     const value = item as Record<string, unknown>;
+    if (value.type === 'message' && (value.role === 'user' || value.role === 'developer') && Array.isArray(value.content)) {
+      const text = value.content.map((part) => {
+        if (!part || typeof part !== 'object') return undefined;
+        const content = part as Record<string, unknown>;
+        return content.type === 'input_text' && typeof content.text === 'string' ? content.text : undefined;
+      });
+      if (!text.length || text.some((part) => part === undefined)) return undefined;
+      items.push({ type: 'message', role: value.role, content: text.join('') });
+      continue;
+    }
     if ((value.type !== 'function_call_output' && value.type !== 'custom_tool_call_output') || typeof value.call_id !== 'string' || typeof value.output !== 'string') return undefined;
     items.push({ type: value.type, call_id: value.call_id, output: value.output });
   }
@@ -539,7 +550,7 @@ const toChatTools = (tools: Tool[]) => tools.map((tool) => tool.type === 'functi
 
 const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   const messages: ChatMessage[] = response.input.map((item) => item.type === 'message'
-    ? { role: 'user', content: item.content }
+    ? { role: item.role === 'developer' ? 'system' : 'user', content: item.content }
     : { role: 'tool', tool_call_id: item.call_id, content: item.output });
   const toolCalls = response.output.filter((item): item is Exclude<OutputItem, { type: 'message' }> => item.type !== 'message');
   const text = response.output.find((item): item is Extract<OutputItem, { type: 'message' }> => item.type === 'message');
