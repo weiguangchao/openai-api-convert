@@ -1,3 +1,7 @@
+# openai-api-convert
+
+Node.js + TypeScript Responses Bridge。
+
 ## Agent skills
 
 ### Issue tracker
