@@ -9,11 +9,10 @@
 - **Output Item**: Response 输出中的有序规范项，包含 assistant 内容或工具调用。
 - **Custom Tool**: `type=custom` 的 Responses 工具；其自由格式输入与工具输出回传语义必须由上游原生保留。
 - **Tool Namespace**: `type=namespace` 的 Responses 工具分组；MVP 仅接受 Function 子工具。Completion 上游以可逆、合法、最长 64 字符的可读哈希别名扁平转发；客户端始终看到原始 namespace 与子工具 name。
-- **Hosted Web Search**: `type=web_search` 的 Responses 托管工具；有兼容原生 Responses 上游时由其执行并产出搜索调用、引用及注释。无此类上游时在 Completion 降级：移除 `web_search`、注入不可用提示、强制选择降为 `auto`，且不伪造搜索调用、引用或结果。
-- **Native Web Search Chain**: 含 Hosted Web Search 的 Response Chain；首轮成功后固定至创建该链的原生 Responses 上游；已固定链不降级。
-- **Upstream Response Mapping**: Bridge Response ID 与原生上游 Response ID 的私有映射；客户端始终只使用前者。
-- **Search Citation**: Hosted Web Search 消息文本上的 URL 注释；必须与其搜索调用一同向客户端保留；Completion 降级路径不产生引用。
-- **Web Search Request Controls**: `web_search` 工具配置及关联的 `tool_choice`、`include`；原生路径透明传递，Completion 降级路径移除 `web_search` 并将强制 `web_search` 选择降为 `auto`。
+- **Hosted Web Search**: `type=web_search` 的 Responses 托管工具；上游仅为 Completion，一律降级：移除 `web_search`、注入不可用提示、强制选择降为 `auto`，且不伪造搜索调用、引用或结果。
+- **Search Citation**: Hosted Web Search 消息文本上的 URL 注释；Completion 降级路径不产生引用。
+- **Web Search Request Controls**: `web_search` 工具配置及关联的 `tool_choice`、`include`；降级路径移除 `web_search` 并将强制 `web_search` 选择降为 `auto`。
+- **Reasoning Effort**: 下游 Responses 的 `reasoning.effort`；Completion 上游映射为顶层 `reasoning_effort`。其它 `reasoning.*` 字段忽略；非法 `reasoning` / `effort` 拒绝。
 - **Parallel Tool Calling**: 同一 Response 中并行产生多个工具调用的语义；不得串行化替代。
 - **Attempt**: 针对单个 Response 的一次上游调用记录；不参与会话重建。
 - **Stream Event**: 向客户端发出的、带单调序号的 Responses 语义 SSE 事件。
@@ -22,9 +21,8 @@
 - **Bridge Configuration**: 部署方持有的单个 YAML 配置，声明 Bridge 认证、Upstream Pool 与运行策略；不从服务进程环境读取配置。
 - **Upstream Pool**: 由 Bridge 配置文件声明的有序 Chat Completions 上游；请求失败时按顺序切换。
 - **Upstream Capability Profile**: 启动配置显式声明的 Function Tool、双向 Custom Tool 与并行调用能力；Bridge 按请求筛选兼容上游。
-- **Upstream Wire API**: 上游使用的 `chat` 或 `responses` 协议；原生 Hosted Web Search 需声明 `responses` 且 `webSearch=true`；无此类上游时 Completion（`chat`）可按 ADR 0003 降级服务。
 - **State Store**: SQLite；保存响应、会话、工具调用与重试所需状态。
-- **Idempotent Request**: 同一 Bridge Authentication 主体的 `POST /v1/responses`，以 `Idempotency-Key` 和规范化已接受请求的摘要识别；命中时复用同一 Response。
+- **Idempotent Request**: 同一 Bridge Authentication 主体的 `POST /v1/responses`，以 `Idempotency-Key` 和规范化已接受请求的摘要识别；命中时复用同一 Response；摘要含合法 `reasoning.effort`。
 - **Bridge Authentication**: 客户端以 `Authorization: Bearer <API_KEY>` 访问受保护的桥接端点；上游密钥仅由服务持有。
 - **Retention Policy**: 仅由部署方配置的全局状态保留、容量限制与清理策略；客户端不得通过请求或 API Key 覆盖。
 - **Replay Window**: Response Chain、Output Item、Stream Event 与幂等记录从整条链最后一个终态 Response 起保留 30 天，以支持原始 SSE 重放；Attempt 保留 7 天。

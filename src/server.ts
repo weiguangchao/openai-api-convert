@@ -2,8 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
-export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean; webSearch?: boolean };
-export type Upstream = { baseUrl: string; apiKey: string; wireApi?: 'chat' | 'responses'; capabilities?: CapabilityProfile };
+export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
+export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
 export type StatePolicy = {
   responseRetentionDays?: number;
   attemptRetentionDays?: number;
@@ -35,10 +35,8 @@ type OutputItem =
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string; namespace?: string }
   | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string }
   | { id: string; type: 'web_search_call'; status: string; [key: string]: unknown };
-type NativeUpstreamMapping = { baseUrl: string; identity: string; responseId: string };
 type StoredResponse = {
   id: string; parentId?: string; model: string; input: InputItem[]; tools: Tool[]; parallelToolCalls: boolean; output: OutputItem[];
-  nativeUpstream?: NativeUpstreamMapping;
 };
 type IdempotencyClaim =
   | { kind: 'created'; responseId: string }
@@ -135,9 +133,6 @@ class StateStore {
           input_json TEXT NOT NULL DEFAULT '[]',
           tools_json TEXT NOT NULL DEFAULT '[]',
           parallel_tool_calls INTEGER NOT NULL DEFAULT 0,
-          native_upstream_base_url TEXT,
-          native_upstream_identity TEXT,
-          native_upstream_response_id TEXT,
           context_complete INTEGER NOT NULL DEFAULT 1,
           output_text TEXT NOT NULL DEFAULT '',
           created_at INTEGER NOT NULL DEFAULT 0,
@@ -178,9 +173,6 @@ class StateStore {
       this.#addColumn("input_json TEXT NOT NULL DEFAULT '[]'");
       this.#addColumn("tools_json TEXT NOT NULL DEFAULT '[]'");
       this.#addColumn('parallel_tool_calls INTEGER NOT NULL DEFAULT 0');
-      this.#addColumn('native_upstream_base_url TEXT');
-      this.#addColumn('native_upstream_identity TEXT');
-      this.#addColumn('native_upstream_response_id TEXT');
       this.#addColumn('context_complete INTEGER NOT NULL DEFAULT 0');
       const responseCreatedAtAdded = this.#addColumn('created_at INTEGER NOT NULL DEFAULT 0');
       const terminalAtAdded = this.#addColumn('terminal_at INTEGER');
@@ -360,11 +352,6 @@ class StateStore {
       .run(responseId, outputIndex, JSON.stringify(item));
   }
 
-  setNativeUpstream(responseId: string, mapping: NativeUpstreamMapping) {
-    this.#db.prepare('UPDATE responses SET native_upstream_base_url = ?, native_upstream_identity = ?, native_upstream_response_id = ? WHERE id = ?')
-      .run(mapping.baseUrl, mapping.identity, mapping.responseId, responseId);
-  }
-
   startAttempt(responseId: string) {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
@@ -419,7 +406,7 @@ class StateStore {
       if (seen.has(next)) throw new Error('Response Chain is cyclic');
       seen.add(next);
       const row: Record<string, unknown> | undefined = this.#db.prepare(
-        'SELECT id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, native_upstream_base_url, native_upstream_identity, native_upstream_response_id, context_complete FROM responses WHERE id = ?',
+        'SELECT id, parent_id, status, model, input_json, tools_json, parallel_tool_calls, context_complete FROM responses WHERE id = ?',
       ).get(next) as Record<string, unknown> | undefined;
       if (!row) throw new Error('Previous response was not found');
       if (Number(row.context_complete) !== 1) throw new Error('Previous response was not found');
@@ -434,9 +421,6 @@ class StateStore {
         input: JSON.parse(String(row.input_json)) as InputItem[],
         tools: JSON.parse(String(row.tools_json)) as Tool[],
         parallelToolCalls: Boolean(row.parallel_tool_calls),
-        nativeUpstream: row.native_upstream_base_url === null || row.native_upstream_identity === null || row.native_upstream_response_id === null ? undefined : {
-          baseUrl: String(row.native_upstream_base_url), identity: String(row.native_upstream_identity), responseId: String(row.native_upstream_response_id),
-        },
         output,
       });
       next = row.parent_id === null ? undefined : String(row.parent_id);
@@ -820,8 +804,6 @@ const canonicalJson = (value: unknown): string => {
 
 const digest = (value: unknown) => createHash('sha256').update(canonicalJson(value)).digest('hex');
 
-const upstreamIdentity = (upstream: Upstream) => digest({ baseUrl: upstream.baseUrl, apiKey: upstream.apiKey, wireApi: upstream.wireApi ?? 'chat' });
-
 const parseUpstream = async function* (body: ReadableStream<Uint8Array>) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -840,152 +822,12 @@ const parseUpstream = async function* (body: ReadableStream<Uint8Array>) {
   }
 };
 
-const replaceResponseId = (event: ResponseEvent, upstreamId: string, bridgeId: string): ResponseEvent => {
-  const response = event.response;
-  const mapped = {
-    ...event,
-    ...(event.response_id === upstreamId ? { response_id: bridgeId } : {}),
-  };
-  if (!response || typeof response !== 'object' || (response as Record<string, unknown>).id !== upstreamId) return mapped;
-  return { ...mapped, response: { ...(response as Record<string, unknown>), id: bridgeId } };
-};
-
-const responseIdFromEvent = (event: ResponseEvent) => {
-  const response = event.response;
-  return response && typeof response === 'object' && typeof (response as Record<string, unknown>).id === 'string'
-    ? String((response as Record<string, unknown>).id) : undefined;
-};
-
-const streamNativeResponses = async ({
-  response, state, id, model, upstreams, upstreamBody, options, metrics,
-}: {
-  response: ServerResponse; state: StateStore; id: string; model: string; upstreams: Upstream[];
-  upstreamBody: Record<string, unknown>; options: BridgeOptions; metrics: Metrics;
-}) => {
-  let streamStarted = false;
-  let failedOutputText = '';
-  let terminalAttempt: AttemptCompletion | undefined;
-  let retryAttempt: AttemptCompletion | undefined;
-  for (let index = 0; index < upstreams.length; index += 1) {
-    const upstream = upstreams[index];
-    if (retryAttempt) {
-      state.finishAttempt(retryAttempt);
-      retryAttempt = undefined;
-    }
-    const abort = new AbortController();
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const armTimeout = (milliseconds: number) => {
-      if (timeout) clearTimeout(timeout);
-      timeout = setTimeout(() => abort.abort(), milliseconds);
-    };
-    armTimeout(options.firstEventTimeoutMs ?? 30_000);
-    const finishAttempt = () => { if (timeout) clearTimeout(timeout); timeout = undefined; };
-    const attemptId = state.startAttempt(id);
-    if (index > 0) metrics.upstreamSwitches += 1;
-    let upstreamResponse: Response;
-    try {
-      upstreamResponse = await fetch(new URL('/v1/responses', upstream.baseUrl), {
-        method: 'POST', headers: { authorization: `Bearer ${upstream.apiKey}`, 'content-type': 'application/json', accept: 'text/event-stream' },
-        body: JSON.stringify(upstreamBody), signal: abort.signal,
-      });
-    } catch {
-      finishAttempt();
-      retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
-      continue;
-    }
-    if (upstreamResponse.status === 408 || upstreamResponse.status === 429 || upstreamResponse.status >= 500 || !upstreamResponse.body) {
-      finishAttempt();
-      retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
-      continue;
-    }
-    if (upstreamResponse.status >= 400) {
-      finishAttempt();
-      finishUpstreamFailure(response, state, id, 400, 'Upstream rejected request', 'upstream_rejected');
-      return;
-    }
-    let outputStarted = false;
-    let firstEvent = true;
-    let upstreamResponseId: string | undefined;
-    const pending: ResponseEvent[] = [];
-    const start = () => {
-      if (streamStarted) return;
-      response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      streamStarted = true;
-      for (const event of pending) sse(response, state, id, event);
-      pending.length = 0;
-    };
-    try {
-      for await (const data of parseUpstream(upstreamResponse.body)) {
-        if (firstEvent) {
-          firstEvent = false;
-          finishAttempt();
-        }
-        const raw = JSON.parse(data) as ResponseEvent;
-        if (typeof raw.type !== 'string') throw new Error('Invalid upstream Responses event');
-        upstreamResponseId ??= responseIdFromEvent(raw);
-        if (upstreamResponseId) state.setNativeUpstream(id, { baseUrl: upstream.baseUrl, identity: upstreamIdentity(upstream), responseId: upstreamResponseId });
-        const event = upstreamResponseId ? replaceResponseId(raw, upstreamResponseId, id) : raw;
-        const terminal = event.type === 'response.completed' || event.type === 'response.failed' || event.type === 'response.cancelled';
-        const preamble = event.type === 'response.created' || event.type === 'response.in_progress';
-        if (!preamble && !upstreamResponseId) throw new Error('Upstream Response ID is missing');
-        if (terminal && event.type !== 'response.completed' && !outputStarted) throw new Error('Upstream Responses failed before output');
-        if (preamble) {
-          pending.push(event);
-          armTimeout(options.outputIdleTimeoutMs ?? 60_000);
-          continue;
-        }
-        outputStarted = true;
-        if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') failedOutputText += event.delta;
-        armTimeout(options.outputIdleTimeoutMs ?? 60_000);
-        start();
-        if (event.type === 'response.output_item.done'
-          && Number.isInteger(event.output_index) && Number(event.output_index) >= 0
-          && event.item && typeof event.item === 'object'
-          && ['message', 'function_call', 'custom_tool_call', 'web_search_call'].includes(String((event.item as Record<string, unknown>).type))) {
-          state.appendOutputItem(id, Number(event.output_index), event.item as OutputItem);
-        }
-        if (event.type === 'response.completed') {
-          finishAttempt();
-          terminalSse(response, state, id, 'completed', failedOutputText, event, { id: attemptId, result: 'completed', preOutputFailure: false });
-          response.end();
-          return;
-        }
-        if (event.type === 'response.failed' || event.type === 'response.cancelled') {
-          finishAttempt();
-          terminalSse(response, state, id, 'failed', failedOutputText, event, { id: attemptId, result: 'failed', preOutputFailure: false, errorCode: 'upstream_stream_failed' });
-          response.end();
-          return;
-        }
-        sse(response, state, id, event);
-      }
-      throw new Error('Upstream Responses stream ended without completion');
-    } catch {
-      finishAttempt();
-      if (outputStarted) {
-        terminalAttempt = { id: attemptId, result: 'failed', preOutputFailure: false, errorCode: 'upstream_stream_failed' };
-        break;
-      }
-      retryAttempt = { id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' };
-    }
-  }
-  if (!streamStarted) {
-    finishUpstreamFailure(response, state, id, 503, 'Upstream unavailable', 'upstream_unavailable');
-    return;
-  }
-  errorCodes.set(response, 'upstream_stream_failed');
-  terminalSse(response, state, id, 'failed', failedOutputText, { type: 'response.failed', response: { id, object: 'response', status: 'failed' } }, terminalAttempt ?? retryAttempt);
-  response.end();
-};
-
 const assertOptions = (options: BridgeOptions) => {
   if (!options.apiKey.trim()) throw new Error('Bridge API key is required');
   if (!options.upstreams.length) throw new Error('Upstream Pool is required');
   for (const upstream of options.upstreams) {
     try { new URL(upstream.baseUrl); } catch { throw new Error('Upstream Pool contains an invalid URL'); }
     if (!upstream.apiKey.trim()) throw new Error('Upstream Pool contains an empty API key');
-    if (upstream.wireApi !== undefined && upstream.wireApi !== 'chat' && upstream.wireApi !== 'responses') {
-      throw new Error('Upstream Pool contains an invalid wire API');
-    }
     if (upstream.capabilities && Object.values(upstream.capabilities).some((value) => typeof value !== 'boolean')) {
       throw new Error('Upstream Pool contains an invalid capability profile');
     }
@@ -1105,8 +947,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       const callKinds = new Map((ancestors.at(-1)?.output ?? [])
         .filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call')
         .map((item) => [item.call_id, item.type]));
-      const nativeParent = ancestors.at(-1)?.nativeUpstream;
-      if (!nativeParent && input.some((item) => {
+      if (input.some((item) => {
         const kind = callKinds.get(item.type === 'message' ? '' : item.call_id);
         return item.type !== 'message' && kind !== (item.type === 'function_call_output' ? 'function_call' : 'custom_tool_call');
       })) {
@@ -1118,30 +959,19 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
       const needs = {
         functionTools: chainTools.some((tool) => tool.type === 'function' || tool.type === 'namespace'),
         customTools: chainTools.some((tool) => tool.type === 'custom'),
-        webSearch: chainTools.some((tool) => tool.type === 'web_search'),
         parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
       };
-      const matchesCapabilities = (upstream: Upstream, requireWebSearch: boolean) => (
+      const degradeWebSearch = chainTools.some((tool) => tool.type === 'web_search');
+      const matchesCapabilities = (upstream: Upstream) => (
         (!needs.functionTools || upstream.capabilities?.functionTools === true)
         && (!needs.customTools || upstream.capabilities?.customTools === true)
-        && (!requireWebSearch || (upstream.wireApi === 'responses' && upstream.capabilities?.webSearch === true))
         && (!needs.parallelToolCalls || upstream.capabilities?.parallelToolCalls === true)
-        && (!nativeParent || (upstream.wireApi === 'responses' && upstream.baseUrl === nativeParent.baseUrl && upstreamIdentity(upstream) === nativeParent.identity))
       );
-      const nativeUpstreams = (needs.webSearch || nativeParent !== undefined)
-        ? options.upstreams.filter((upstream) => matchesCapabilities(upstream, needs.webSearch))
-        : [];
-      const degradeWebSearch = needs.webSearch && nativeParent === undefined && nativeUpstreams.length === 0;
-      const upstreams = degradeWebSearch
-        ? options.upstreams.filter((upstream) => (upstream.wireApi ?? 'chat') === 'chat' && matchesCapabilities(upstream, false))
-        : nativeUpstreams.length
-          ? nativeUpstreams
-          : options.upstreams.filter((upstream) => matchesCapabilities(upstream, false));
+      const upstreams = options.upstreams.filter(matchesCapabilities);
       if (!upstreams.length) {
         sendError(response, 400, 'No upstream supports the requested capabilities', 'unsupported_capabilities');
         return;
       }
-      const nativeResponses = !degradeWebSearch && (needs.webSearch || nativeParent !== undefined);
       let chatTools: ReturnType<typeof toChatTools>;
       let namespaceAliases: ReturnType<typeof buildNamespaceAliasMaps>;
       let chatToolChoice: ReturnType<typeof toChatToolChoice> | 'auto' | undefined;
@@ -1199,19 +1029,6 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
         return;
       }
       responseId = id;
-
-      if (nativeResponses) {
-        const nativeUpstreamBody: Record<string, unknown> = {
-          model, stream: true, input: payload.input,
-          ...(payload.tools === undefined ? {} : { tools: payload.tools }),
-          ...(payload.tool_choice === undefined ? {} : { tool_choice: payload.tool_choice }),
-          ...(payload.include === undefined ? {} : { include: payload.include }),
-          ...(nativeParent ? { previous_response_id: nativeParent.responseId } : {}),
-          ...(payload.parallel_tool_calls === undefined ? {} : { parallel_tool_calls: payload.parallel_tool_calls }),
-        };
-        await streamNativeResponses({ response, state, id, model, upstreams, upstreamBody: nativeUpstreamBody, options, metrics });
-        return;
-      }
 
       let streamStarted = false;
       let cancelled = false;
