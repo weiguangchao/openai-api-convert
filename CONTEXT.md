@@ -19,6 +19,13 @@
 - **Stream Event Sink**: Failover Policy Execution 使用的 Stream Event 输出 seam。生产 adapter 持久化 Output Item 并发送事件；测试 adapter 仅记录事件；Output Item 必须先于对应 `response.output_item.done` 记录；终态操作原子写入 Response 终态、终态 Stream Event 与最终 Attempt。
 - **Stream Translator**: Completion 上游 SSE chunk 流到 Responses Stream Event 的纯协议转换；产出有序下游事件与 Output Item，不持有 HTTP 响应或 State Store。与正向（Responses 请求 -> Chat Completions body）翻译对偶。
 - **Compatibility Fixture**: 可重复的脚本化上游交互，连同对 Bridge 可观察结果的预期，用于验证协议与故障契约。
+- **Codex Integration Gate**: 对已声明的 Codex 调用路径，Compatibility Fixture 与真实 Codex CLI smoke 均通过且每次产生语义 `response.completed`、无协议错误和无伪造 Hosted Web Search 调用的发布门禁；它不承诺外部模型或网络永不发生瞬态故障。
+- **Codex Native Tool Loop**: 真实 Codex CLI 在隔离临时工作目录中发起一次只读 `exec_command` 函数调用、提交工具结果并完成续接的调用路径；它验证 Codex 工具声明与结果回传的端到端协议。`apps` 与 `multi_agent` 保持禁用，不属于此路径或 Bridge 的支持承诺。
+- **Codex Smoke Evidence**: Codex Integration Gate 的稳定验收信号：函数调用与工具结果续接、每轮唯一的 `response.completed`、无 `response.failed` / `response.incomplete` 及无非 Responses SSE；不以模型生成正文或调用 ID 为验收依据。
+- **Codex Compatibility Version**: Codex Integration Gate 唯一允许执行真实预检的 CLI 版本；初始值为 `0.144.5`。升级该版本必须作为显式兼容性变更，更新样本并重新通过完整门禁。
+- **Codex Protocol Fixture**: 真实 Codex CLI 配合脚本化 Completion 上游的确定性预检；上游强制产生 Codex Native Tool Loop 所需的工具调用，以验证客户端协议而不依赖模型的工具选择策略。
+- **Inline Tool Replay**: `store:false` Codex 客户端在单次输入中同时提供工具调用和对应工具输出、但不提供 `previous_response_id` 的续接表达；Bridge 仅在调用与输出的 `call_id` 成对匹配时接受，并将其转为上游 assistant 工具调用与 tool 消息。
+- **Release Preflight Model**: 仅由忽略的 `config.test.yaml` 显式指定、用于全部真实预检请求的模型；没有默认值，以使模型替换成为可见的部署变更。
 - **Service Runtime**: Node.js + TypeScript。
 - **Bridge Configuration**: 部署方持有的单个 YAML 配置，声明 Bridge 认证、Upstream Pool 与运行策略；不从服务进程环境读取配置。
 - **Configuration Home**: 部署用户主目录下固定的 `~/.openai-api-convert/`，持有该 Bridge 实例的配置、状态与日志。
@@ -48,6 +55,7 @@
 - **Failover Policy Execution**: 持有单个 Response 的上游执行生命周期：兼容上游选择、Attempt、重试、取消与终态；不持有 Stream Translator 的协议翻译。
 - **Pre-output Outcome**: 首个 Stream Event 前的上游拒绝或全部不可用结果；Failover Policy Execution 返回该结果，由响应 module 发送 HTTP error 并丢弃未开始的 Response。客户端断开例外，Response 终结为 cancelled。
 - **Upstream Capability Profile**: 启动配置显式声明的 Function Tool、双向 Custom Tool 与并行调用能力；Bridge 按请求筛选兼容上游。
+- **Upstream Thinking Policy**: 可选的上游原生 `thinking.type` 请求策略；仅在已配置的上游请求中透传，值为 `enabled` 或 `disabled`，不改变下游 Responses 的 `reasoning.effort` 语义。
 - **Upstream Selection**: Failover Policy Execution 按请求所需能力从有序 Upstream Pool 选出兼容上游；零匹配不得创建 Attempt。
 - **State Store**: SQLite；保存响应、会话、工具调用与重试所需状态。
 - **State Migration**: Production CLI 在启动时对 State Store 执行自动、仅前向的 schema 迁移；备份由部署方负责。
