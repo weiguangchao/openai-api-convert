@@ -1,15 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AppError, InputItem, OutputItem, RequestContext, ResponseScope, Result, ResponsesPayload, StoredResponse, Tool, Upstream } from './types.js';
+import type { AppError, InputItem, OutputItem, RequestContext, ResponseScope, Result, ResponsesPayload, StoredResponse, Tool } from './types.js';
 import { digest } from './state.js';
 import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort } from './adapter.js';
-import { replaySse } from './sse.js';
-import { redactHeaders, requireBridgeAuthentication, sendError } from './http.js';
-import { streamUpstreamAttempts } from './failover.js';
+import { HttpStreamEventSink, replaySse } from './sse.js';
+import { redactHeaders, requireBridgeAuthentication, sendError, setErrorCode } from './http.js';
+import { executeFailover, planFailoverExecution, type ExecutionNeeds } from './failover-execution.js';
+import { FetchUpstreamStream } from './upstream-stream.js';
 
 type ParsedRequest = { payload: ResponsesPayload; rawBody: string; idempotencyKey: string | undefined; reasoningEffort: string | undefined; input: InputItem[]; tools: Tool[] | undefined };
-type ChainNeeds = { functionTools: boolean; customTools: boolean; parallelToolCalls: boolean };
-type ResolvedChain = { ancestors: StoredResponse[]; effectiveTools: Tool[]; upstreams: Upstream[]; degradeWebSearch: boolean; needs: ChainNeeds };
+type ResolvedChain = { ancestors: StoredResponse[]; effectiveTools: Tool[]; degradeWebSearch: boolean; needs: ExecutionNeeds };
 type ClaimResult = { kind: 'reused'; responseId: string } | { kind: 'created'; responseId: string };
 
 export const handleResponsesRequest = async (ctx: RequestContext, request: IncomingMessage, response: ServerResponse, requestId: string, scope: ResponseScope) => {
@@ -21,6 +21,8 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
   if (!resolved.ok) { fail(resolved.error); return; }
   const built = buildChatRequest(parsed.value.payload, resolved.value.effectiveTools, resolved.value.ancestors, parsed.value.input, resolved.value.degradeWebSearch, parsed.value.reasoningEffort);
   if (!built.ok) { fail(built.error); return; }
+  const planned = planFailoverExecution(ctx.options.upstreams, resolved.value.needs);
+  if (!planned.ok) { fail(planned.error); return; }
   const claimed = await claimOrCreateResponse(ctx, request, parsed.value.payload, parsed.value.input, parsed.value.tools, parsed.value.reasoningEffort, parsed.value.idempotencyKey, built.value.model);
   if (!claimed.ok) { fail(claimed.error); return; }
   scope.responseId = claimed.value.responseId;
@@ -29,7 +31,31 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
     await replaySse(response, ctx.state, claimed.value.responseId);
     return;
   }
-  await streamUpstreamAttempts(ctx, request, response, requestId, { responseId: claimed.value.responseId, model: built.value.model, upstreamBody: built.value.upstreamBody, namespaceAliases: built.value.namespaceAliases, upstreams: resolved.value.upstreams });
+  const cancelled = new AbortController();
+  const cancel = () => {
+    setErrorCode(response, 'client_disconnected');
+    cancelled.abort();
+  };
+  const onResponseClose = () => { if (!response.writableEnded) cancel(); };
+  request.once('aborted', cancel);
+  response.once('close', onResponseClose);
+  try {
+    const outcome = await executeFailover({
+      responseId: claimed.value.responseId, model: built.value.model, upstreamBody: built.value.upstreamBody, upstreams: planned.value,
+      firstEventTimeoutMs: ctx.options.firstEventTimeoutMs ?? 30_000, outputIdleTimeoutMs: ctx.options.outputIdleTimeoutMs ?? 60_000,
+    }, new FetchUpstreamStream(ctx.logging, requestId, built.value.namespaceAliases), new HttpStreamEventSink(response, ctx.state, claimed.value.responseId, ctx.logging, requestId), cancelled.signal);
+    if (outcome.kind === 'pre_output_failure') {
+      ctx.state.discardRejectedResponse(claimed.value.responseId);
+      if (outcome.reason === 'rejected') sendError(response, 400, 'Upstream rejected request', 'upstream_rejected');
+      else sendError(response, 503, 'Upstream unavailable', 'upstream_unavailable');
+      return;
+    }
+    if (outcome.kind === 'failed') setErrorCode(response, 'upstream_stream_failed');
+    if (!response.destroyed && !response.writableEnded) response.end();
+  } finally {
+    request.removeListener('aborted', cancel);
+    response.removeListener('close', onResponseClose);
+  }
 };
 
 const parseAndValidateRequest = async (ctx: RequestContext, request: IncomingMessage, requestId: string): Promise<Result<ParsedRequest>> => {
@@ -95,22 +121,13 @@ const resolveChainAndCapabilities = (ctx: RequestContext, payload: ResponsesPayl
   }
   const effectiveTools = tools ?? [...ancestors].reverse().find((item) => item.tools.length > 0)?.tools ?? [];
   const chainTools = [...ancestors.flatMap((item) => item.tools), ...effectiveTools];
-  const needs: ChainNeeds = {
+  const needs: ExecutionNeeds = {
     functionTools: chainTools.some((tool) => tool.type === 'function' || tool.type === 'namespace'),
     customTools: chainTools.some((tool) => tool.type === 'custom'),
     parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
   };
   const degradeWebSearch = chainTools.some((tool) => tool.type === 'web_search');
-  const matchesCapabilities = (upstream: Upstream) => (
-    (!needs.functionTools || upstream.capabilities?.functionTools === true)
-    && (!needs.customTools || upstream.capabilities?.customTools === true)
-    && (!needs.parallelToolCalls || upstream.capabilities?.parallelToolCalls === true)
-  );
-  const upstreams = options.upstreams.filter(matchesCapabilities);
-  if (!upstreams.length) {
-    return { ok: false, error: { status: 400, message: 'No upstream supports the requested capabilities', code: 'unsupported_capabilities' } };
-  }
-  return { ok: true, value: { ancestors, effectiveTools, upstreams, degradeWebSearch, needs } };
+  return { ok: true, value: { ancestors, effectiveTools, degradeWebSearch, needs } };
 };
 
 const claimOrCreateResponse = async (ctx: RequestContext, request: IncomingMessage, payload: ResponsesPayload, input: InputItem[], tools: Tool[] | undefined, reasoningEffort: string | undefined, idempotencyKey: string | undefined, model: string): Promise<Result<ClaimResult>> => {
