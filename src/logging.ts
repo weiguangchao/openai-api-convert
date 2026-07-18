@@ -2,7 +2,7 @@ import { mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import winston from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
-import type { BridgeLog, LogFields, LogLevel, LoggingPolicy } from './types.ts';
+import type { BridgeLog, LogFields, LogLevel, LoggingPolicy } from './types.js';
 
 export const toLogEntry = (level: LogLevel, event: string, fields: LogFields = {}) => ({
   timestamp: new Date().toISOString(),

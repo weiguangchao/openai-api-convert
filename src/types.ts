@@ -1,4 +1,4 @@
-import type { StateStore } from './state.ts';
+import type { StateStore } from './state.js';
 
 export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
 export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };

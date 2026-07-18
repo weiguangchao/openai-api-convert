@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, Result, StoredResponse, Tool } from './types.ts';
+import type { ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, Result, StoredResponse, Tool } from './types.js';
 
 export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
 

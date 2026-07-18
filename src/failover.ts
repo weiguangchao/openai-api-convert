@@ -1,9 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AttemptCompletion, RequestContext, ResponseEvent, Upstream } from './types.ts';
-import { type NamespaceAliases } from './adapter.ts';
-import { attemptUpstream, type CancelState, type AttemptCounter } from './attempt.ts';
-import { finishUpstreamFailure, terminalSse } from './sse.ts';
-import { setErrorCode } from './http.ts';
+import type { AttemptCompletion, RequestContext, ResponseEvent, Upstream } from './types.js';
+import { type NamespaceAliases } from './adapter.js';
+import { attemptUpstream, type CancelState, type AttemptCounter } from './attempt.js';
+import { finishUpstreamFailure, terminalSse } from './sse.js';
+import { setErrorCode } from './http.js';
 
 export type StreamUpstreamParams = { responseId: string; model: string; upstreamBody: Record<string, unknown>; namespaceAliases: NamespaceAliases; upstreams: Upstream[] };
 

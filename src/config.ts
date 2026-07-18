@@ -1,8 +1,8 @@
-import { mkdir, readFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
-import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, StatePolicy, Upstream } from './types.ts';
+import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, StatePolicy, Upstream } from './types.js';
 
 type RecordValue = Record<string, unknown>;
 const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy', 'logging']);
@@ -80,12 +80,17 @@ export const loadBridgeConfiguration = async (path = resolve('config.yaml')): Pr
   if (document.errors.length) throw new Error(`Bridge configuration is invalid: ${document.errors[0].message}`);
   const configuration = object(document.toJS(), 'Configuration');
   rejectUnknown(configuration, rootKeys, 'Configuration');
-  const port = configuration.port;
-  if (port !== undefined && (typeof port !== 'number' || !Number.isSafeInteger(port) || port < 0 || port > 65_535)) throw new Error('Configuration.port must be an integer from 0 to 65535');
+  const configuredPort = configuration.port;
+  if (configuredPort !== undefined && (typeof configuredPort !== 'number' || !Number.isSafeInteger(configuredPort) || configuredPort <= 0 || configuredPort > 65_535)) throw new Error('Configuration.port must be an integer from 1 to 65535');
+  const port = configuredPort ?? 8417;
   const usesDefaultStatePath = configuration.statePath === undefined;
   const configuredStatePath = usesDefaultStatePath ? join(homedir(), '.openai-api-convert', 'response-bridge.db') : requiredText(configuration.statePath, 'Configuration.statePath');
   const statePath = isAbsolute(configuredStatePath) ? configuredStatePath : resolve(dirname(path), configuredStatePath);
-  if (usesDefaultStatePath) await mkdir(dirname(statePath), { recursive: true });
+  if (usesDefaultStatePath) {
+    const stateDirectory = dirname(statePath);
+    await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+    if (process.platform !== 'win32') await chmod(stateDirectory, 0o700);
+  }
   return {
     apiKey: requiredText(configuration.apiKey, 'Configuration.apiKey'),
     upstreams: upstreams(configuration.upstreams),

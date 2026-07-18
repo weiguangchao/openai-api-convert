@@ -1,13 +1,30 @@
 {
   "name": "openai-api-convert",
-  "private": true,
+  "version": "0.0.1",
+  "description": "OpenAI Responses API to Chat Completions bridge",
+  "license": "MIT",
   "type": "module",
+  "bin": {
+    "openai-api-convert": "./dist/src/index.js"
+  },
+  "files": [
+    "dist/src",
+    "config.example.yaml",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "build": "tsc --noEmit",
-    "start": "node --experimental-strip-types src/index.ts",
-    "test": "node --experimental-strip-types scripts/release-smoke.ts",
-    "test:unit": "node --test --experimental-strip-types test/**/*.test.ts",
-    "test:codex-mixed-tools": "node --test --experimental-strip-types --test-name-pattern='Codex mixed-tools' test/bridge.test.ts"
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-build-assets.mjs",
+    "check": "tsc --noEmit",
+    "start": "node dist/src/index.js start",
+    "test": "npm run build && node dist/scripts/release-smoke.js",
+    "test:unit": "npm run build && node --test dist/test/**/*.test.js",
+    "test:codex-mixed-tools": "npm run build && node --test --test-name-pattern='Codex mixed-tools' dist/test/bridge.test.js",
+    "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

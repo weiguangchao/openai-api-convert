@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { StreamTranslator, buildNamespaceAliasMaps } from '../src/adapter.ts';
+import { StreamTranslator, buildNamespaceAliasMaps } from '../src/adapter.js';
 
 const emptyAliases = () => buildNamespaceAliasMaps([]);
 const chunk = (delta: Record<string, unknown>) => JSON.stringify({ choices: [{ delta }] });

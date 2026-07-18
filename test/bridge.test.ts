@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { startBridge, type RunningBridge } from '../src/server.ts';
+import { startBridge, type RunningBridge } from '../src/server.js';
 
 const captureStdoutLines = () => {
   const lines: string[] = [];

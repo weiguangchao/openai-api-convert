@@ -1,7 +1,7 @@
-apiKey: replace-with-bridge-api-key
+apiKey: ""
 upstreams:
-  - baseUrl: https://upstream.example.com
-    apiKey: replace-with-upstream-api-key
+  - baseUrl: ""
+    apiKey: ""
     capabilities:
       functionTools: true
       customTools: true

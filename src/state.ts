@@ -12,7 +12,7 @@ import type {
   StoredEvent,
   StoredResponse,
   Tool,
-} from './types.ts';
+} from './types.js';
 
 export const GIB = 1024 ** 3;
 export const HOUR = 60 * 60 * 1000;
