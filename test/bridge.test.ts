@@ -2003,7 +2003,7 @@ test('a valid first upstream event prevents a first-event timeout', async () => 
   }
 });
 
-test('all-upstreams-fail Compatibility Fixture emits response.failed after every compatible upstream', async () => {
+test('all-upstreams-fail Compatibility Fixture returns a pre-output error after a malformed first frame', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const first = await startScriptedFixture([{ status: 429 }]);
   const second = await startScriptedFixture([{ frames: ['data: not-json\r\n\r\n'] }]);
@@ -2021,11 +2021,12 @@ test('all-upstreams-fail Compatibility Fixture emits response.failed after every
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({ stream: true, input: 'Hello' }),
     });
-    assert.deepEqual(sseTypes(await response.text()).map(({ type }) => type), ['response.created', 'response.failed']);
+    assert.equal(response.status, 503);
+    assert.deepEqual(sseTypes(await response.text()), []);
     assert.equal(first.requests.length, 1);
     assert.equal(second.requests.length, 1);
-    assert.equal(bridge.state.attempts().length, 2);
-    assert.deepEqual(bridge.state.responses(), [{ status: 'failed', outputText: '' }]);
+    assert.deepEqual(bridge.state.attempts(), []);
+    assert.deepEqual(bridge.state.responses(), []);
   } finally {
     await bridge?.close();
     await first.close();

@@ -5,7 +5,7 @@ import { digest } from './state.js';
 import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort } from './adapter.js';
 import { HttpStreamEventSink, replaySse } from './sse.js';
 import { redactHeaders, requireBridgeAuthentication, sendError, setErrorCode } from './http.js';
-import { executeFailover, planFailoverExecution, type ExecutionNeeds } from './failover-execution.js';
+import { executeFailover, type ExecutionNeeds } from './failover-execution.js';
 import { FetchUpstreamStream } from './upstream-stream.js';
 
 type ParsedRequest = { payload: ResponsesPayload; rawBody: string; idempotencyKey: string | undefined; reasoningEffort: string | undefined; input: InputItem[]; tools: Tool[] | undefined };
@@ -21,8 +21,6 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
   if (!resolved.ok) { fail(resolved.error); return; }
   const built = buildChatRequest(parsed.value.payload, resolved.value.effectiveTools, resolved.value.ancestors, parsed.value.input, resolved.value.degradeWebSearch, parsed.value.reasoningEffort);
   if (!built.ok) { fail(built.error); return; }
-  const planned = planFailoverExecution(ctx.options.upstreams, resolved.value.needs);
-  if (!planned.ok) { fail(planned.error); return; }
   const claimed = await claimOrCreateResponse(ctx, request, parsed.value.payload, parsed.value.input, parsed.value.tools, parsed.value.reasoningEffort, parsed.value.idempotencyKey, built.value.model);
   if (!claimed.ok) { fail(claimed.error); return; }
   scope.responseId = claimed.value.responseId;
@@ -41,12 +39,14 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
   response.once('close', onResponseClose);
   try {
     const outcome = await executeFailover({
-      responseId: claimed.value.responseId, model: built.value.model, upstreamBody: built.value.upstreamBody, upstreams: planned.value,
+      responseId: claimed.value.responseId, model: built.value.model, upstreamBody: built.value.upstreamBody,
+      upstreams: ctx.options.upstreams, needs: resolved.value.needs,
       firstEventTimeoutMs: ctx.options.firstEventTimeoutMs ?? 30_000, outputIdleTimeoutMs: ctx.options.outputIdleTimeoutMs ?? 60_000,
     }, new FetchUpstreamStream(ctx.logging, requestId, built.value.namespaceAliases), new HttpStreamEventSink(response, ctx.state, claimed.value.responseId, ctx.logging, requestId), cancelled.signal);
     if (outcome.kind === 'pre_output_failure') {
       ctx.state.discardRejectedResponse(claimed.value.responseId);
       if (outcome.reason === 'rejected') sendError(response, 400, 'Upstream rejected request', 'upstream_rejected');
+      else if (outcome.reason === 'unsupported_capabilities') sendError(response, 400, 'No upstream supports the requested capabilities', 'unsupported_capabilities');
       else sendError(response, 503, 'Upstream unavailable', 'upstream_unavailable');
       return;
     }

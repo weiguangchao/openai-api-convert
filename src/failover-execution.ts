@@ -29,6 +29,7 @@ export type FailoverExecutionInput = {
   model: string;
   upstreamBody: Record<string, unknown>;
   upstreams: Upstream[];
+  needs: ExecutionNeeds;
   firstEventTimeoutMs: number;
   outputIdleTimeoutMs: number;
 };
@@ -37,7 +38,7 @@ export type FailoverExecutionOutcome =
   | { kind: 'completed' }
   | { kind: 'failed' }
   | { kind: 'cancelled' }
-  | { kind: 'pre_output_failure'; reason: 'rejected' | 'unavailable' };
+  | { kind: 'pre_output_failure'; reason: 'rejected' | 'unavailable' | 'unsupported_capabilities' };
 
 export const planFailoverExecution = (upstreams: Upstream[], needs: ExecutionNeeds): Result<Upstream[]> => {
   const compatible = upstreams.filter((upstream) => (
@@ -57,6 +58,8 @@ export const executeFailover = async (
   sink: StreamEventSink,
   cancelled?: AbortSignal,
 ): Promise<FailoverExecutionOutcome> => {
+  const planned = planFailoverExecution(input.upstreams, input.needs);
+  if (!planned.ok) return { kind: 'pre_output_failure', reason: 'unsupported_capabilities' };
   let streamStarted = false;
   let attemptIndex = 0;
   let failedOutputText = '';
@@ -69,7 +72,7 @@ export const executeFailover = async (
     return { kind: 'cancelled' } as const;
   };
 
-  for (const upstream of input.upstreams) {
+  for (const upstream of planned.value) {
     if (cancelled?.aborted) return cancel(retryAttempt, failedOutputText);
     attemptIndex += 1;
     const attemptId = sink.startAttempt(attemptIndex);
@@ -108,6 +111,7 @@ export const executeFailover = async (
       let completed = false;
       for await (const streamEvent of outcome.events) {
         clearTimeoutForAttempt();
+        if (streamEvent.kind === 'heartbeat') continue;
         if (!streamStarted) {
           sink.emit({
             type: 'response.created', response: { id: input.responseId, object: 'response', status: 'in_progress', model: input.model, output: [] },
@@ -125,7 +129,6 @@ export const executeFailover = async (
           completed = true;
           break;
         }
-        if (streamEvent.kind === 'heartbeat') continue;
         sink.emit(streamEvent.event);
         attemptOutputText = streamEvent.outputText;
         failedOutputText = attemptOutputText;
