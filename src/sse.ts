@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
-import type { AttemptCompletion, ResponseEvent } from './types.ts';
-import type { StateStore } from './state.ts';
-import { sendError } from './http.ts';
+import type { AttemptCompletion, ResponseEvent } from './types.js';
+import type { StateStore } from './state.js';
+import { sendError } from './http.js';
 
 export const sse = (response: ServerResponse, store: StateStore, responseId: string, event: ResponseEvent, logDownstream?: (event: ResponseEvent) => void) => {
   store.appendEvent(responseId, event);

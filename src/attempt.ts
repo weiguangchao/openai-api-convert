@@ -1,8 +1,8 @@
 import type { ServerResponse } from 'node:http';
-import type { AttemptCompletion, RequestContext, ResponseEvent, Upstream } from './types.ts';
-import { StreamTranslator, type NamespaceAliases } from './adapter.ts';
-import { finishUpstreamFailure, parseUpstream, sse, terminalSse } from './sse.ts';
-import { redactHeaders } from './http.ts';
+import type { AttemptCompletion, RequestContext, ResponseEvent, Upstream } from './types.js';
+import { StreamTranslator, type NamespaceAliases } from './adapter.js';
+import { finishUpstreamFailure, parseUpstream, sse, terminalSse } from './sse.js';
+import { redactHeaders } from './http.js';
 
 export type CancelState = { cancelled: boolean; activeAbort: AbortController | undefined };
 export type AttemptCounter = { value: number };

@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { BridgeOptions, Metrics, RequestContext, ResponseScope, RunningBridge, StateObservability, Upstream } from './types.ts';
-import { createBridgeLogger } from './logging.ts';
-import { StateStore, defaultStatePolicy } from './state.ts';
-import { sendError, requireBridgeAuthentication, requestIds, setErrorCode, getErrorCode } from './http.ts';
-import { handleResponsesRequest } from './responses.ts';
+import type { BridgeOptions, Metrics, RequestContext, ResponseScope, RunningBridge, StateObservability, Upstream } from './types.js';
+import { createBridgeLogger } from './logging.js';
+import { StateStore, defaultStatePolicy } from './state.js';
+import { sendError, requireBridgeAuthentication, requestIds, setErrorCode, getErrorCode } from './http.js';
+import { handleResponsesRequest } from './responses.js';
 
-export type { CapabilityProfile, Upstream, StatePolicy, LogLevel, LoggingPolicy, BridgeOptions, RunningBridge } from './types.ts';
+export type { CapabilityProfile, Upstream, StatePolicy, LogLevel, LoggingPolicy, BridgeOptions, RunningBridge } from './types.js';
 
 const prometheus = (metrics: Metrics, observability: StateObservability) => [
   '# TYPE bridge_requests_total counter', `bridge_requests_total ${metrics.requests}`,

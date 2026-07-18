@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AppError, InputItem, OutputItem, RequestContext, ResponseScope, Result, ResponsesPayload, StoredResponse, Tool, Upstream } from './types.ts';
-import { digest } from './state.ts';
-import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort } from './adapter.ts';
-import { replaySse } from './sse.ts';
-import { redactHeaders, requireBridgeAuthentication, sendError } from './http.ts';
-import { streamUpstreamAttempts } from './failover.ts';
+import type { AppError, InputItem, OutputItem, RequestContext, ResponseScope, Result, ResponsesPayload, StoredResponse, Tool, Upstream } from './types.js';
+import { digest } from './state.js';
+import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort } from './adapter.js';
+import { replaySse } from './sse.js';
+import { redactHeaders, requireBridgeAuthentication, sendError } from './http.js';
+import { streamUpstreamAttempts } from './failover.js';
 
 type ParsedRequest = { payload: ResponsesPayload; rawBody: string; idempotencyKey: string | undefined; reasoningEffort: string | undefined; input: InputItem[]; tools: Tool[] | undefined };
 type ChainNeeds = { functionTools: boolean; customTools: boolean; parallelToolCalls: boolean };

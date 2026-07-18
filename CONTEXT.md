@@ -20,10 +20,27 @@
 - **Compatibility Fixture**: 可重复的脚本化上游交互，连同对 Bridge 可观察结果的预期，用于验证协议与故障契约。
 - **Service Runtime**: Node.js + TypeScript。
 - **Bridge Configuration**: 部署方持有的单个 YAML 配置，声明 Bridge 认证、Upstream Pool 与运行策略；不从服务进程环境读取配置。
+- **Configuration Home**: 部署用户主目录下固定的 `~/.openai-api-convert/`，持有该 Bridge 实例的配置、状态与日志。
+- **Configuration Bootstrap**: 首次 `start` 发现 Configuration Home 中缺少配置时，写入必填密钥留空的可编辑 YAML 模板并正常退出的初始化结果；不是可运行服务，且绝不覆盖既有配置。
+- **Configuration Home Permissions**: POSIX 上 Configuration Home 为 `0700`、其中的配置文件为 `0600`；权限更宽的配置拒绝启动。Windows 不执行此校验。
+- **Configuration Override**: `start --config <path>` 显式选定的配置文件；仅覆盖默认配置位置，不改变未显式配置的运行数据默认值。
+- **Configuration Activation**: Bridge 仅在启动时读取配置；文件修改必须经进程重启生效。
+- **Configuration Compatibility**: Bridge 不自动改写 YAML；不兼容配置由 `start` 严格拒绝，部署方按发行说明手动调整。
+- **Production CLI**: 公开 npm 包 `openai-api-convert` 提供的可执行入口；由全局安装后的部署用户直接调用。
+- **Production Tarball**: npm 发布物中仅包含运行所需的 `dist/`、配置模板、README、LICENSE 与 package 元数据；不包含源码、测试或构建工具。
+- **Production Runtime**: 运行 Production CLI 的 Node.js `>=24` 环境。
+- **Supported Platform**: Production CLI 正式支持 Linux 与 macOS；Windows 仅尽力运行，不承诺 Configuration Home Permissions。
+- **Service Supervisor**: 管理 Production CLI 前台进程的外部系统组件；Bridge CLI 不实现 daemon、重启或进程守护。
+- **Supervisor Example**: README 中的 systemd 或 launchd 参考配置；不属于 npm 包的安装或管理范围。
+- **Graceful Shutdown**: 收到 `SIGTERM` 或 `SIGINT` 后停止接收新连接、最多等待 30 秒完成在途请求，再关闭运行数据的退出过程。
+- **Network Boundary**: Production CLI 仅绑定 `127.0.0.1`；外部客户端只能经部署方反向代理访问。
+- **Proxy Exposure Boundary**: 反向代理只公开 `/v1/responses`；未认证 `/healthz` 仅供本机探针，`/readyz` 与 `/metrics` 仍要求 Bridge Authentication。
+- **Default Port**: Production CLI 在未配置 `port` 时监听的 `8417` 端口。
 - **Upstream Pool**: 由 Bridge 配置文件声明的有序 Chat Completions 上游；请求失败时按顺序切换。
 - **Failover Policy**: 单个 Attempt 失败时，决定按 Upstream Pool 顺序切换下一上游还是终结 Response 的策略。首个 Stream Event 发出前的失败可重试；此后任何失败为终态，不再切换，Response 终结为 failed；客户端断开终结为 cancelled，不重试。
 - **Upstream Capability Profile**: 启动配置显式声明的 Function Tool、双向 Custom Tool 与并行调用能力；Bridge 按请求筛选兼容上游。
 - **State Store**: SQLite；保存响应、会话、工具调用与重试所需状态。
+- **State Migration**: Production CLI 在启动时对 State Store 执行自动、仅前向的 schema 迁移；备份由部署方负责。
 - **Idempotent Request**: 同一 Bridge Authentication 主体的 `POST /v1/responses`，以 `Idempotency-Key` 和规范化已接受请求的摘要识别；命中时复用同一 Response；摘要含合法 `reasoning.effort`。
 - **Bridge Authentication**: 客户端以 `Authorization: Bearer <API_KEY>` 访问受保护的桥接端点；上游密钥仅由服务持有。
 - **Retention Policy**: 仅由部署方配置的全局状态保留、容量限制与清理策略；客户端不得通过请求或 API Key 覆盖。
@@ -33,4 +50,5 @@
 - **State Capacity Rejection**: 状态库满 10 GiB 且同步清理无可回收状态时，新建请求以可重试的 `503 state_store_capacity_exceeded` 失败，且不得创建 Response、幂等记录或 Attempt；进行中请求继续完成。
 - **State Cleanup Observability**: 每次清理记录起止时间、删除链数、回收字节数与失败原因；暴露当前状态库字节数和容量拒绝计数，且不得记录 Response 内容或密钥。与 Traffic Log 分离：本轨始终不记交互正文。
 - **Traffic Log**: 上下游四跳交互的可观测记录（下游入、上游出、上游回、下游出），含 failover 的每次 Attempt；完整 body 与 SSE 仅在 `debug` 级别写入；密钥始终脱敏。
+- **Production Log Delivery**: Traffic Log 同时写入 Configuration Home 的轮转文件与 stdout JSON Lines；后者供 Service Supervisor 采集。
 - **Log Retention**: Traffic Log 文件保留策略，默认 7 天，由成熟日志框架执行轮转与删除；独立于 Retention Policy 与 State Cleanup。默认目录为 State Store 同级的 `logs/`。

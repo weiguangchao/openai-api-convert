@@ -17,8 +17,8 @@ import {
   toChatMessages,
   toChatToolChoice,
   toChatTools,
-} from '../src/adapter.ts';
-import type { StoredResponse, Tool } from '../src/types.ts';
+} from '../src/adapter.js';
+import type { StoredResponse, Tool } from '../src/types.js';
 
 const hash8 = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, ALIAS_HASH_LEN);
 
