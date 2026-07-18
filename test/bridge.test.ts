@@ -392,6 +392,33 @@ test('Traffic Log records downstream inbound and upstream outbound at info level
   }
 });
 
+test('logs the actual loopback endpoint after binding a dynamic port', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+      port: 0,
+    });
+    const port = Number(new URL(bridge.url).port);
+    await bridge.close();
+    bridge = undefined;
+    const logFiles = await readdir(join(dir, 'logs'));
+    const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
+    assert.match(content, /"level": "info"/);
+    assert.match(content, /"event": "bridge_started"/);
+    assert.match(content, /"address": "127.0.0.1"/);
+    assert.match(content, new RegExp(`"port": ${port}(?:\\n|,)`));
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('Traffic Log at debug level records body and upstream URL with redacted secrets', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
