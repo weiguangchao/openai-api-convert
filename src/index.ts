@@ -1,5 +1,8 @@
-import { loadBridgeConfiguration } from './config.ts';
-import { startBridge } from './server.ts';
+#!/usr/bin/env node
 
-const bridge = await startBridge(await loadBridgeConfiguration());
-bridge.log('info', 'bridge_started');
+import { runCli } from './cli.js';
+
+await runCli().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});

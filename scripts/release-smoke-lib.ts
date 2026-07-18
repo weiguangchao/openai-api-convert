@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { startBridge, type Upstream } from '../src/server.ts';
+import { startBridge, type Upstream } from '../src/server.js';
 
 type SmokeEvent = { type?: unknown };
 type CodexRunner = (args: string[], env: NodeJS.ProcessEnv) => Promise<void>;
