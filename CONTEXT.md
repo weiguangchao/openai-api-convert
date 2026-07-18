@@ -12,7 +12,7 @@
 - **Hosted Web Search**: `type=web_search` 的 Responses 托管工具；上游仅为 Completion，一律降级：移除 `web_search`、注入不可用提示、强制选择降为 `auto`，且不伪造搜索调用、引用或结果。
 - **Search Citation**: Hosted Web Search 消息文本上的 URL 注释；Completion 降级路径不产生引用。
 - **Web Search Request Controls**: `web_search` 工具配置及关联的 `tool_choice`、`include`；降级路径移除 `web_search` 并将强制 `web_search` 选择降为 `auto`。
-- **Reasoning Effort**: 下游 Responses 的 `reasoning.effort`；Completion 上游映射为顶层 `reasoning_effort`。其它 `reasoning.*` 字段忽略；非法 `reasoning` / `effort` 拒绝。
+- **Reasoning Effort**: 下游 Responses 的 `reasoning.effort` 或兼容标量；`null` 表示未设置。Completion 上游映射为顶层 `reasoning_effort`。其它对象字段忽略；未知值拒绝。
 - **Parallel Tool Calling**: 同一 Response 中并行产生多个工具调用的语义；不得串行化替代。
 - **Attempt**: 针对单个 Response 的一次上游调用记录；不参与会话重建。
 - **Stream Event**: 向客户端发出的、带单调序号的 Responses 语义 SSE 事件。
