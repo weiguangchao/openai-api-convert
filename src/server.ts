@@ -1,25 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { BridgeOptions, Metrics, RequestContext, ResponseScope, RunningBridge, StateObservability, Upstream } from './types.js';
+import type { BridgeOptions, RequestContext, ResponseScope, RunningBridge, Upstream } from './types.js';
 import { createBridgeLogger } from './logging.js';
 import { StateStore, defaultStatePolicy } from './state.js';
 import { sendError, requireBridgeAuthentication, requestIds, setErrorCode, getErrorCode } from './http.js';
 import { handleResponsesRequest } from './responses.js';
 
 export type { CapabilityProfile, Upstream, StatePolicy, LogLevel, LoggingPolicy, BridgeOptions, RunningBridge } from './types.js';
-
-const prometheus = (metrics: Metrics, observability: StateObservability) => [
-  '# TYPE bridge_requests_total counter', `bridge_requests_total ${metrics.requests}`,
-  '# TYPE bridge_request_failures_total counter', `bridge_request_failures_total ${metrics.failures}`,
-  '# TYPE bridge_request_duration_seconds_sum counter', `bridge_request_duration_seconds_sum ${metrics.durationMs / 1_000}`,
-  '# TYPE bridge_request_duration_seconds_count counter', `bridge_request_duration_seconds_count ${metrics.requests}`,
-  '# TYPE bridge_upstream_switches_total counter', `bridge_upstream_switches_total ${metrics.upstreamSwitches}`,
-  '# TYPE bridge_state_store_bytes gauge', `bridge_state_store_bytes ${observability.bytes}`,
-  '# TYPE bridge_state_store_cleanup_runs_total counter', `bridge_state_store_cleanup_runs_total ${observability.cleanupRuns}`,
-  '# TYPE bridge_state_store_deleted_chains_total counter', `bridge_state_store_deleted_chains_total ${observability.deletedChains}`,
-  '# TYPE bridge_state_store_reclaimed_bytes_total counter', `bridge_state_store_reclaimed_bytes_total ${observability.reclaimedBytes}`,
-  '# TYPE bridge_state_store_capacity_rejections_total counter', `bridge_state_store_capacity_rejections_total ${observability.capacityRejections}`,
-].join('\n') + '\n';
 
 const upstreamReady = async (upstream: Upstream) => {
   try {
@@ -57,25 +44,19 @@ const assertOptions = (options: BridgeOptions) => {
 };
 
 const handleRequest = async (ctx: RequestContext, request: IncomingMessage, response: ServerResponse) => {
-  const { options, state, logging, metrics } = ctx;
+  const { options, state, logging } = ctx;
   const requestId = randomUUID();
   const startedAt = Date.now();
   const scope: ResponseScope = { responseId: undefined };
   requestIds.set(response, requestId);
   response.setHeader('x-request-id', requestId);
-  const measuresRequest = request.method === 'POST' && request.url === '/v1/responses';
   let observed = false;
   const observeRequest = (disconnected = false) => {
     if (observed) return;
     observed = true;
     if (disconnected && getErrorCode(response) === undefined) setErrorCode(response, 'client_disconnected');
     const durationMs = Date.now() - startedAt;
-    if (measuresRequest) {
-      metrics.requests += 1;
-      metrics.durationMs += durationMs;
-    }
     const errorCode = getErrorCode(response) ?? null;
-    if (measuresRequest && (response.statusCode >= 400 || errorCode)) metrics.failures += 1;
     logging.log(response.statusCode >= 400 || errorCode ? 'error' : 'info', 'http_request_completed', {
       requestId, responseId: scope.responseId ?? null, durationMs, errorCode, method: request.method ?? null, status: response.statusCode,
     });
@@ -99,12 +80,6 @@ const handleRequest = async (ctx: RequestContext, request: IncomingMessage, resp
     response.end(JSON.stringify({ status: ready ? 'ready' : 'not_ready' }));
     return;
   }
-  if (request.method === 'GET' && request.url === '/metrics') {
-    if (!requireBridgeAuthentication(request, response, options.apiKey)) return;
-    response.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
-    response.end(prometheus(metrics, state.observability()));
-    return;
-  }
   if (request.method !== 'POST' || request.url !== '/v1/responses') {
     sendError(response, 404, 'Not found', 'not_found');
     return;
@@ -116,8 +91,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
   assertOptions(options);
   const logging = await createBridgeLogger(options.statePath, options.logging);
   const state = new StateStore(options.statePath, { ...defaultStatePolicy, ...options.statePolicy }, logging.log);
-  const metrics: Metrics = { requests: 0, failures: 0, durationMs: 0, upstreamSwitches: 0 };
-  const ctx: RequestContext = { options, state, logging, metrics };
+  const ctx: RequestContext = { options, state, logging };
   let server: Server | undefined;
   try {
     server = createServer((request, response) => handleRequest(ctx, request, response));

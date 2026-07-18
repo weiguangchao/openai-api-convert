@@ -39,7 +39,7 @@
 - **Supervisor Example**: README 中的 systemd 或 launchd 参考配置；不属于 npm 包的安装或管理范围。
 - **Graceful Shutdown**: 收到 `SIGTERM` 或 `SIGINT` 后停止接收新连接、最多等待 30 秒完成在途请求，再关闭运行数据的退出过程。
 - **Network Boundary**: Production CLI 仅绑定 `127.0.0.1`；外部客户端只能经部署方反向代理访问。
-- **Proxy Exposure Boundary**: 反向代理只公开 `/v1/responses`；未认证 `/healthz` 仅供本机探针，`/readyz` 与 `/metrics` 仍要求 Bridge Authentication。
+- **Proxy Exposure Boundary**: 反向代理只公开 `/v1/responses`；未认证 `/healthz` 仅供本机探针，`/readyz` 仍要求 Bridge Authentication；不提供 `/metrics`。
 - **Default Port**: Production CLI 在未配置 `port` 时监听的 `8417` 端口。
 - **Upstream Pool**: 由 Bridge 配置文件声明的有序 Chat Completions 上游；请求失败时按顺序切换。
 - **Failover Policy**: 单个 Attempt 失败时，决定按 Upstream Pool 顺序切换下一上游还是终结 Response 的策略。首个 Stream Event 发出前的失败可重试；此后任何失败为终态，不再切换，Response 终结为 failed；客户端断开终结为 cancelled，不重试。
@@ -53,7 +53,7 @@
 - **State Capacity**: SQLite 状态库硬上限为 10 GiB；达到 8 GiB 时清理最旧的可删终态状态，无法回收时拒绝新请求。
 - **State Cleanup**: 启动时及每小时清理；仅整链删除超过保留窗口的终态状态，容量回收同样按最旧可删链进行，绝不删除进行中状态。
 - **State Capacity Rejection**: 状态库满 10 GiB 且同步清理无可回收状态时，新建请求以可重试的 `503 state_store_capacity_exceeded` 失败，且不得创建 Response、幂等记录或 Attempt；进行中请求继续完成。
-- **State Cleanup Observability**: 每次清理记录起止时间、删除链数、回收字节数与失败原因；暴露当前状态库字节数和容量拒绝计数，且不得记录 Response 内容或密钥。与 Traffic Log 分离：本轨始终不记交互正文。
+- **State Cleanup Log**: 每次清理的结构化日志，记录起止时间、删除链数、回收字节数与失败原因，且不得记录 Response 内容或密钥。与 Traffic Log 分离：本轨始终不记交互正文；不提供 metrics 导出。
 - **Traffic Log**: 上下游四跳交互的可观测记录（下游入、上游出、上游回、下游出），含 failover 的每次 Attempt；完整 body 与 SSE 仅在 `debug` 级别写入；密钥始终脱敏。
 - **Production Log Delivery**: Traffic Log 同时写入 Configuration Home 的轮转文件与 stdout JSON Lines；后者供 Service Supervisor 采集。
 - **Log Retention**: Traffic Log 文件保留策略，默认 7 天，由成熟日志框架执行轮转与删除；独立于 Retention Policy 与 State Cleanup。默认目录为 State Store 同级的 `logs/`。

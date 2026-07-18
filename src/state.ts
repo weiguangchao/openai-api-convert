@@ -8,7 +8,6 @@ import type {
   OutputItem,
   ResolvedStatePolicy,
   ResponseEvent,
-  StateObservability,
   StoredEvent,
   StoredResponse,
   Tool,
@@ -39,7 +38,6 @@ export class StateStore {
   #policy: ResolvedStatePolicy;
   #log: BridgeLog;
   #cleanupTimer?: ReturnType<typeof setInterval>;
-  #observability: StateObservability = { bytes: 0, cleanupRuns: 0, deletedChains: 0, reclaimedBytes: 0, capacityRejections: 0 };
 
   constructor(path: string, policy: ResolvedStatePolicy, log: BridgeLog) {
     this.#policy = policy;
@@ -205,17 +203,15 @@ export class StateStore {
         deletedChains += 1;
       }
       const reclaimedBytes = Math.max(0, beforeBytes - this.#bytes());
-      this.#observability.cleanupRuns += 1;
-      this.#observability.deletedChains += deletedChains;
-      this.#observability.reclaimedBytes += reclaimedBytes;
-      this.#observability.bytes = this.#bytes();
-      this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes };
-      this.#log('info', 'state_store_cleanup', { durationMs: Date.now() - startedAt, deleted_chains: deletedChains, reclaimed_bytes: reclaimedBytes });
+      const endedAt = Date.now();
+      this.#log('info', 'state_store_cleanup', {
+        durationMs: endedAt - startedAt, started_at: startedAt, ended_at: endedAt, deleted_chains: deletedChains, reclaimed_bytes: reclaimedBytes,
+      });
     } catch {
-      this.#observability.cleanupRuns += 1;
-      this.#observability.bytes = this.#bytes();
-      this.#observability.lastCleanup = { startedAt, endedAt: Date.now(), deletedChains, reclaimedBytes: 0, failureReason: 'cleanup_failed' };
-      this.#log('error', 'state_store_cleanup', { durationMs: Date.now() - startedAt, errorCode: 'cleanup_failed' });
+      const endedAt = Date.now();
+      this.#log('error', 'state_store_cleanup', {
+        durationMs: endedAt - startedAt, errorCode: 'cleanup_failed', started_at: startedAt, ended_at: endedAt, deleted_chains: deletedChains, reclaimed_bytes: 0,
+      });
     }
   }
 
@@ -225,8 +221,6 @@ export class StateStore {
       this.cleanup(Math.max(0, this.#policy.cleanupThresholdBytes - reservedBytes));
     }
     if (this.#bytes() + reservedBytes < this.#policy.hardLimitBytes) return true;
-    this.#observability.capacityRejections += 1;
-    this.#observability.bytes = this.#bytes();
     return false;
   }
 
@@ -378,10 +372,6 @@ export class StateStore {
         finishedAt: row.finished_at === null ? undefined : Number(row.finished_at), result: row.result === null ? undefined : String(row.result),
         preOutputFailure: row.pre_output_failure === null ? undefined : Boolean(row.pre_output_failure), errorCode: row.error_code === null ? undefined : String(row.error_code),
       }));
-  }
-
-  observability(): StateObservability {
-    return { ...this.#observability, bytes: this.#bytes(), lastCleanup: this.#observability.lastCleanup && { ...this.#observability.lastCleanup } };
   }
 
   isReady() {
