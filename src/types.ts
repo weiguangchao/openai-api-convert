@@ -1,3 +1,5 @@
+import type { StateStore } from './state.ts';
+
 export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
 export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
 export type StatePolicy = {
@@ -78,4 +80,11 @@ export type Metrics = {
   failures: number;
   durationMs: number;
   upstreamSwitches: number;
+};
+
+export type RunningBridge = {
+  url: string;
+  state: Pick<StateStore, 'events' | 'responses' | 'attempts' | 'attemptDetails' | 'observability'>;
+  log: BridgeLog;
+  close: () => Promise<void>;
 };
