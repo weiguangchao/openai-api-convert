@@ -11,13 +11,12 @@
 | `declared-capability-client-4xx` | Direct 4xx without failover |
 | `idempotency-in-progress`, `idempotency-terminal`, `idempotency-failed` | Replay, atomic terminal state and conflict safety |
 | `failover-before-output`, `failure-after-output`, `all-upstreams-fail` | Retry boundary and terminal failure |
-| Retention, capacity and operations | Cleanup safety, capacity-before-write, auth, readiness, metrics, logs and disconnect |
+| Retention, capacity and operations | Cleanup safety, capacity-before-write, auth, readiness, logs and disconnect |
 
-Run the real-upstream and Codex CLI preflight only with deployment credentials in the ignored `config.yaml`:
+Run the real-upstream and Codex CLI preflight only with deployment credentials in the ignored `config.test.yaml`:
 
 ```sh
-cp config.example.yaml config.yaml
-# Fill both API keys and the upstream base URL in config.yaml.
+cp config.dev.yaml config.test.yaml
 npm test
 ```
 

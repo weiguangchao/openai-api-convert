@@ -4,7 +4,6 @@
     "moduleResolution": "NodeNext",
     "target": "ES2024",
     "strict": true,
-    "allowImportingTsExtensions": true,
     "noEmit": true,
     "types": ["node"]
   },

@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
-import { loadBridgeConfiguration } from '../src/config.ts';
+import { loadBridgeConfiguration } from '../src/config.js';
 
-const root = fileURLToPath(new URL('..', import.meta.url));
+const root = fileURLToPath(new URL('../..', import.meta.url));
 
 const reservePort = async () => {
   const server = createServer();
@@ -20,8 +20,8 @@ const reservePort = async () => {
   return address.port;
 };
 
-const startConfiguredBridge = async (dir: string, env?: NodeJS.ProcessEnv) => {
-  const child = spawn(process.execPath, ['--experimental-strip-types', join(root, 'src/index.ts')], { cwd: dir, env });
+const startConfiguredBridge = async (configPath: string, env?: NodeJS.ProcessEnv) => {
+  const child = spawn(process.execPath, [join(root, 'dist/src/index.js'), 'start', '--config', configPath], { cwd: dirname(configPath), env });
   let output = '';
   child.stdout.on('data', (chunk) => { output += String(chunk); });
   child.stderr.on('data', (chunk) => { output += String(chunk); });
@@ -45,7 +45,8 @@ const startConfiguredBridge = async (dir: string, env?: NodeJS.ProcessEnv) => {
 const runRejectedConfiguration = async (source: string) => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
   await writeFile(join(dir, 'config.yaml'), source);
-  const child = spawn(process.execPath, ['--experimental-strip-types', join(root, 'src/index.ts')], { cwd: dir });
+  await chmod(join(dir, 'config.yaml'), 0o600);
+  const child = spawn(process.execPath, [join(root, 'dist/src/index.js'), 'start', '--config', join(dir, 'config.yaml')], { cwd: dir });
   let output = '';
   child.stdout.on('data', (chunk) => { output += String(chunk); });
   child.stderr.on('data', (chunk) => { output += String(chunk); });
@@ -58,8 +59,9 @@ const runRejectedConfiguration = async (source: string) => {
     return { code, output };
   } finally {
     if (child.exitCode === null) {
-      child.kill();
-      await once(child, 'exit');
+      child.kill('SIGTERM');
+      const [code] = await once(child, 'exit') as [number | null];
+      assert.equal(code, 0);
     }
     await rm(dir, { recursive: true, force: true });
   }
@@ -77,7 +79,8 @@ test('CLI starts from config.yaml and ignores legacy environment configuration',
     `port: ${port}`,
     '',
   ].join('\n'));
-  const child = await startConfiguredBridge(dir, {
+  await chmod(join(dir, 'config.yaml'), 0o600);
+  const child = await startConfiguredBridge(join(dir, 'config.yaml'), {
       ...process.env,
       BRIDGE_API_KEY: 'environment-key',
       UPSTREAM_POOL: '[]',
@@ -99,7 +102,9 @@ test('CLI creates the default State Store in the user home directory', async () 
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
   const home = join(dir, 'home');
   const port = await reservePort();
-  await writeFile(join(dir, 'config.yaml'), [
+  await mkdir(join(home, '.openai-api-convert'), { recursive: true, mode: 0o700 });
+  const configPath = join(home, '.openai-api-convert', 'config.yaml');
+  await writeFile(configPath, [
     'apiKey: yaml-key',
     'upstreams:',
     '  - baseUrl: http://127.0.0.1:1',
@@ -107,7 +112,16 @@ test('CLI creates the default State Store in the user home directory', async () 
     `port: ${port}`,
     '',
   ].join('\n'));
-  const child = await startConfiguredBridge(dir, { ...process.env, HOME: home });
+  await chmod(configPath, 0o600);
+  const child = spawn(process.execPath, [join(root, 'dist/src/index.js'), 'start'], { cwd: dir, env: { ...process.env, HOME: home } });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += String(chunk); });
+  child.stderr.on('data', (chunk) => { output += String(chunk); });
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Bridge did not start: ${output}`)), 3_000);
+    child.stdout.on('data', () => output.includes('bridge_started') && (clearTimeout(timeout), resolve()));
+    child.once('exit', (code) => { clearTimeout(timeout); reject(new Error(`Bridge exited before startup (${code}): ${output}`)); });
+  });
   try {
     assert.equal((await stat(join(home, '.openai-api-convert', 'response-bridge.db'))).isFile(), true);
   } finally {
@@ -115,6 +129,28 @@ test('CLI creates the default State Store in the user home directory', async () 
       child.kill();
       await once(child, 'exit');
     }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI bootstraps the default configuration with owner-only permissions', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
+  const home = join(dir, 'home');
+  const child = spawn(process.execPath, [join(root, 'dist/src/index.js'), 'start'], { cwd: dir, env: { ...process.env, HOME: home } });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += String(chunk); });
+  child.stderr.on('data', (chunk) => { output += String(chunk); });
+  try {
+    const [code] = await once(child, 'exit') as [number | null];
+    const configPath = join(home, '.openai-api-convert', 'config.yaml');
+    assert.equal(code, 0);
+    assert.equal(output.includes('Fill required values'), true);
+    assert.equal((await readFile(configPath, 'utf8')).includes('apiKey: ""'), true);
+    if (process.platform !== 'win32') {
+      assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+      assert.equal((await stat(dirname(configPath))).mode & 0o777, 0o700);
+    }
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -154,6 +190,7 @@ test('loadBridgeConfiguration parses logging overrides for level, path, and rete
       '',
     ].join('\n'));
     const configuration = await loadBridgeConfiguration(configPath);
+    assert.equal(configuration.port, 8417);
     assert.deepEqual(configuration.logging, {
       level: 'debug',
       path: logPath,
@@ -252,7 +289,8 @@ test('CLI writes Traffic Log files to the configured logging.path', async () => 
     `  path: ${logPath}`,
     '',
   ].join('\n'));
-  const child = await startConfiguredBridge(dir);
+  await chmod(join(dir, 'config.yaml'), 0o600);
+  const child = await startConfiguredBridge(join(dir, 'config.yaml'));
   try {
     const logFiles = await readdir(logPath);
     assert.ok(logFiles.length > 0, 'expected log files under configured logging.path');
