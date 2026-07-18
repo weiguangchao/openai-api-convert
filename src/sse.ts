@@ -1,24 +1,67 @@
 import type { ServerResponse } from 'node:http';
-import type { AttemptCompletion, ResponseEvent } from './types.js';
+import type { AttemptCompletion, BridgeLogger, OutputItem, ResponseEvent } from './types.js';
 import type { StateStore } from './state.js';
-import { sendError } from './http.js';
+import type { StreamEventSink } from './failover-execution.js';
 
-export const sse = (response: ServerResponse, store: StateStore, responseId: string, event: ResponseEvent, logDownstream?: (event: ResponseEvent) => void) => {
-  store.appendEvent(responseId, event);
-  response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-  logDownstream?.(event);
-};
+export class HttpStreamEventSink implements StreamEventSink {
+  #response: ServerResponse;
+  #store: StateStore;
+  #responseId: string;
+  #logging: BridgeLogger;
+  #requestId: string;
+  #started = false;
 
-export const terminalSse = (response: ServerResponse, store: StateStore, responseId: string, status: 'completed' | 'failed', outputText: string, event: ResponseEvent, attempt?: AttemptCompletion, logDownstream?: (event: ResponseEvent) => void) => {
-  store.terminal(responseId, status, outputText, event, attempt);
-  response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-  logDownstream?.(event);
-};
+  constructor(response: ServerResponse, store: StateStore, responseId: string, logging: BridgeLogger, requestId: string) {
+    this.#response = response;
+    this.#store = store;
+    this.#responseId = responseId;
+    this.#logging = logging;
+    this.#requestId = requestId;
+  }
 
-export const finishUpstreamFailure = (response: ServerResponse, store: StateStore, id: string, status: number, message: string, code: string) => {
-  store.discardRejectedResponse(id);
-  sendError(response, status, message, code);
-};
+  startAttempt() {
+    return this.#store.startAttempt(this.#responseId);
+  }
+
+  finishAttempt(attempt: AttemptCompletion) {
+    this.#store.finishAttempt(attempt);
+  }
+
+  emit(event: ResponseEvent, attemptIndex: number) {
+    this.#store.appendEvent(this.#responseId, event);
+    this.#write(event, attemptIndex);
+  }
+
+  emitOutputItems(output: OutputItem[], attemptIndex: number) {
+    for (const [outputIndex, item] of output.entries()) {
+      this.#store.appendOutputItem(this.#responseId, outputIndex, item);
+      this.emit({ type: 'response.output_item.done', output_index: outputIndex, item }, attemptIndex);
+    }
+  }
+
+  terminal(status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt: AttemptCompletion | undefined, attemptIndex: number) {
+    this.#store.terminal(this.#responseId, status, outputText, event, attempt);
+    this.#write(event, attemptIndex);
+  }
+
+  #write(event: ResponseEvent, attemptIndex: number) {
+    if (!this.#response.destroyed && !this.#response.writableEnded) {
+      if (!this.#started) {
+        this.#response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        this.#started = true;
+      }
+      this.#response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+    this.#logging.log('info', 'traffic_downstream_outbound', {
+      requestId: this.#requestId, responseId: this.#responseId, attempt_index: attemptIndex, event_type: event.type,
+    });
+    if (this.#logging.level === 'debug') {
+      this.#logging.log('debug', 'traffic_downstream_outbound', {
+        requestId: this.#requestId, responseId: this.#responseId, attempt_index: attemptIndex, event_type: event.type, sse_event: event,
+      });
+    }
+  }
+}
 
 export const writeSse = (response: ServerResponse, event: ResponseEvent) => {
   response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
@@ -36,22 +79,4 @@ export const replaySse = async (response: ServerResponse, store: StateStore, res
     if (!events.length) await new Promise((resolve) => setTimeout(resolve, 10));
   }
   response.end();
-};
-
-export const parseUpstream = async function* (body: ReadableStream<Uint8Array>) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    let boundary: RegExpExecArray | null;
-    while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
-      const frame = buffer.slice(0, boundary.index).replace(/\r/g, '');
-      buffer = buffer.slice(boundary.index + boundary[0].length);
-      const data = frame.split('\n').find((line) => line.startsWith('data: '))?.slice(6);
-      if (data) yield data;
-    }
-    if (done) break;
-  }
 };
