@@ -40,7 +40,7 @@ npm run dev
 
 ## 生产部署
 
-使用反向代理对外转发 `/v1/responses`。`/healthz` 仅用于本机探针；`/readyz` 与 `/metrics` 要求 Bearer 鉴权。
+使用反向代理对外转发 `/v1/responses`。`/healthz` 仅用于本机探针；`/readyz` 要求 Bearer 鉴权。
 
 `start` 保持前台运行。收到 `SIGTERM` 或 `SIGINT` 后最多等待 30 秒处理在途请求，再关闭状态库与日志。使用 systemd、launchd 或容器负责重启。
 

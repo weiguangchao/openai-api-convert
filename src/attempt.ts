@@ -17,7 +17,7 @@ type AttemptOutcome =
   | { outcome: 'terminal'; attempt: AttemptCompletion; failedOutputText: string; streamStarted: boolean };
 
 export const attemptUpstream = async (ctx: RequestContext, response: ServerResponse, requestId: string, params: AttemptUpstreamParams): Promise<AttemptOutcome> => {
-  const { options, state, logging, metrics } = ctx;
+  const { options, state, logging } = ctx;
   const { upstream, id, model, upstreamBody, namespaceAliases, upstreamAttempts, cancelState, logDownstreamOutbound } = params;
   let streamStarted = params.streamStarted;
   const abort = new AbortController();
@@ -33,7 +33,6 @@ export const attemptUpstream = async (ctx: RequestContext, response: ServerRespo
   };
   armTimeout(options.firstEventTimeoutMs ?? 30_000);
   const attemptId = state.startAttempt(id);
-  if (upstreamAttempts.value > 0) metrics.upstreamSwitches += 1;
   upstreamAttempts.value += 1;
   const upstreamUrl = new URL('/v1/chat/completions', upstream.baseUrl);
   const upstreamHeaders: Record<string, string> = { authorization: `Bearer ${upstream.apiKey}`, 'content-type': 'application/json', accept: 'text/event-stream' };

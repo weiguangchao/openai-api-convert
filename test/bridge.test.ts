@@ -268,7 +268,7 @@ test('reports not ready when every upstream probe fails', async () => {
   }
 });
 
-test('exports protected metrics and redacted JSON Lines logs', async () => {
+test('returns not found for removed metrics and emits redacted JSON Lines logs', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
   const captured = captureStdoutLines();
@@ -289,13 +289,8 @@ test('exports protected metrics and redacted JSON Lines logs', async () => {
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({ stream: true, input: 'secret response input' }),
     })).status, 200);
-    assert.equal((await fetch(`${bridge.url}/metrics`)).status, 401);
-    const metrics = await (await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).text();
-    for (const metric of [
-      'bridge_requests_total 2', 'bridge_request_failures_total 1', 'bridge_request_duration_seconds_sum',
-      'bridge_upstream_switches_total', 'bridge_state_store_bytes', 'bridge_state_store_cleanup_runs_total',
-      'bridge_state_store_capacity_rejections_total',
-    ]) assert.equal(metrics.includes(metric), true);
+    assert.equal((await fetch(`${bridge.url}/metrics`)).status, 404);
+    assert.equal((await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).status, 404);
     const requestLog = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>)
       .find(({ event }) => event === 'http_request_completed');
     assert(requestLog);
@@ -633,10 +628,11 @@ test('rejects invalid startup configuration', async () => {
   }
 });
 
-test('State Store startup cleanup removes only expired terminal Response Chains and safe observability', async () => {
+test('State Store startup cleanup removes only expired terminal Response Chains and logs safe cleanup data', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const statePath = join(dir, 'state.db');
   const upstream = await startCompatibilityFixture();
+  const captured = captureStdoutLines();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
@@ -688,11 +684,18 @@ test('State Store startup cleanup removes only expired terminal Response Chains 
     assert.deepEqual(bridge.state.responses(), [{ status: 'in_progress', outputText: '' }]);
     assert.deepEqual(bridge.state.events(), []);
     assert.deepEqual(bridge.state.attempts(), [{ responseId: 'resp_active' }]);
-    const observability = bridge.state.observability();
-    assert.equal(observability.deletedChains, 1);
-    assert.equal(JSON.stringify(observability).includes('retained input'), false);
-    assert.equal(JSON.stringify(observability).includes('bridge-key'), false);
+    const cleanupLog = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find(({ event, deleted_chains: deletedChains }) => event === 'state_store_cleanup' && deletedChains === 1);
+    assert(cleanupLog);
+    assert.equal(typeof cleanupLog.started_at, 'number');
+    assert.equal(typeof cleanupLog.ended_at, 'number');
+    assert.equal(typeof cleanupLog.reclaimed_bytes, 'number');
+    assert.equal(Number(cleanupLog.started_at) <= Number(cleanupLog.ended_at), true);
+    const serialized = captured.lines.join('\n');
+    assert.equal(serialized.includes('retained input'), false);
+    assert.equal(serialized.includes('bridge-key'), false);
   } finally {
+    captured.restore();
     await bridge?.close();
     await upstream.close();
     await rm(dir, { recursive: true, force: true });
@@ -709,14 +712,7 @@ test('State Store rejects a new Response before writes at the hard capacity limi
       apiKey: 'bridge-key',
       upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
       statePath,
-    });
-    const bytes = bridge.state.observability().bytes;
-    await bridge.close();
-    bridge = await startBridge({
-      apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
-      statePath,
-      statePolicy: { cleanupThresholdBytes: Math.max(1, bytes - 1), hardLimitBytes: bytes, responseRetentionDays: 30, attemptRetentionDays: 7 },
+      statePolicy: { cleanupThresholdBytes: 1, hardLimitBytes: 2, responseRetentionDays: 30, attemptRetentionDays: 7 },
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
@@ -729,7 +725,6 @@ test('State Store rejects a new Response before writes at the hard capacity limi
     });
     assert.deepEqual(bridge.state.responses(), []);
     assert.deepEqual(bridge.state.attempts(), []);
-    assert.equal(bridge.state.observability().capacityRejections, 1);
     assert.equal(upstream.requests.length, 0);
   } finally {
     await bridge?.close();
@@ -2063,9 +2058,6 @@ test('client disconnect aborts the active Attempt and cancels the Response', asy
     assert.deepEqual(bridge.state.responses(), [{ status: 'cancelled', outputText: 'first ' }]);
     assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.cancelled']);
     assert.equal(bridge.state.attempts().length, 1);
-    const metrics = await (await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).text();
-    assert.equal(metrics.includes('bridge_requests_total 1'), true);
-    assert.equal(metrics.includes('bridge_request_failures_total 1'), true);
     assert.equal(captured.lines.some((line) => line.includes('"event":"http_request_completed"') && line.includes('"error_code":"client_disconnected"')), true);
   } finally {
     captured.restore();
