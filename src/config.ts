@@ -2,7 +2,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
-import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, StatePolicy, Upstream } from './server.ts';
+import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, StatePolicy, Upstream } from './types.ts';
 
 type RecordValue = Record<string, unknown>;
 const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy', 'logging']);

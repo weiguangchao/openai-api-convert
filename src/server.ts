@@ -6,87 +6,38 @@ import { DatabaseSync } from 'node:sqlite';
 import winston from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
 
-export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
-export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
-export type StatePolicy = {
-  responseRetentionDays?: number;
-  attemptRetentionDays?: number;
-  cleanupThresholdBytes?: number;
-  hardLimitBytes?: number;
-};
-export type LogLevel = 'debug' | 'info' | 'error';
-export type LoggingPolicy = {
-  level?: LogLevel;
-  path?: string;
-  retentionDays?: number;
-};
-export type BridgeOptions = {
-  apiKey: string;
-  upstreams: Upstream[];
-  statePath: string;
-  port?: number;
-  firstEventTimeoutMs?: number;
-  outputIdleTimeoutMs?: number;
-  statePolicy?: StatePolicy;
-  logging?: LoggingPolicy;
-};
-type LogFields = {
-  requestId?: string | null;
-  responseId?: string | null;
-  durationMs?: number;
-  errorCode?: string | null;
-  [key: string]: string | number | null | undefined | Record<string, unknown>;
-};
-type BridgeLog = (level: LogLevel, event: string, fields?: LogFields) => void;
-type StoredEvent = { sequence: number; type: string };
-type ResponseEvent = { type: string; [key: string]: unknown };
-type FunctionTool = { type: 'function'; name: string; description?: string; parameters?: unknown; strict?: boolean };
-type CustomTool = { type: 'custom'; name: string; description?: string; format?: unknown };
-type WebSearchTool = { type: 'web_search' };
-type NamespaceTool = { type: 'namespace'; name: string; description: string; tools: FunctionTool[] };
-type Tool = FunctionTool | CustomTool | WebSearchTool | NamespaceTool;
-type FunctionToolOutput = { type: 'function_call_output'; call_id: string; output: string };
-type CustomToolOutput = { type: 'custom_tool_call_output'; call_id: string; output: string };
-type InputMessage = { type: 'message'; role: 'user' | 'developer'; content: string };
-type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput;
-type OutputItem =
-  | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
-  | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string; namespace?: string }
-  | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string }
-  | { id: string; type: 'web_search_call'; status: string; [key: string]: unknown };
-type StoredResponse = {
-  id: string; parentId?: string; model: string; input: InputItem[]; tools: Tool[]; parallelToolCalls: boolean; output: OutputItem[];
-};
-type IdempotencyClaim =
-  | { kind: 'created'; responseId: string }
-  | { kind: 'reused'; responseId: string }
-  | { kind: 'conflict' }
-  | { kind: 'capacity_exceeded' };
-type AttemptResult = 'completed' | 'failed' | 'cancelled';
-type AttemptCompletion = { id: number; result: AttemptResult; preOutputFailure: boolean; errorCode?: string };
-type ChatToolCall =
-  | { id: string; type: 'function'; function: { name: string; arguments: string } }
-  | { id: string; type: 'custom'; custom: { name: string; input: string } };
-type ChatMessage =
-  | { role: 'user' | 'system'; content: string }
-  | { role: 'tool'; tool_call_id: string; content: string }
-  | { role: 'assistant'; content?: string; tool_calls?: ChatToolCall[] };
+import type {
+  AttemptCompletion,
+  AttemptResult,
+  BridgeLog,
+  BridgeOptions,
+  ChatMessage,
+  ChatToolCall,
+  CapabilityProfile,
+  CustomTool,
+  CustomToolOutput,
+  FunctionTool,
+  FunctionToolOutput,
+  IdempotencyClaim,
+  InputItem,
+  InputMessage,
+  LogFields,
+  LogLevel,
+  LoggingPolicy,
+  Metrics,
+  NamespaceTool,
+  OutputItem,
+  ResolvedStatePolicy,
+  ResponseEvent,
+  StateObservability,
+  StoredEvent,
+  StoredResponse,
+  Tool,
+  Upstream,
+  WebSearchTool,
+} from './types.ts';
 
-type ResolvedStatePolicy = Required<StatePolicy>;
-type StateObservability = {
-  bytes: number;
-  cleanupRuns: number;
-  deletedChains: number;
-  reclaimedBytes: number;
-  capacityRejections: number;
-  lastCleanup?: { startedAt: number; endedAt: number; deletedChains: number; reclaimedBytes: number; failureReason?: 'cleanup_failed' };
-};
-type Metrics = {
-  requests: number;
-  failures: number;
-  durationMs: number;
-  upstreamSwitches: number;
-};
+export type { CapabilityProfile, Upstream, StatePolicy, LogLevel, LoggingPolicy, BridgeOptions } from './types.ts';
 
 const GIB = 1024 ** 3;
 const HOUR = 60 * 60 * 1000;
