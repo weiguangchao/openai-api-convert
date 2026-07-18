@@ -17,11 +17,11 @@ export interface UpstreamStream {
 }
 
 export interface StreamEventSink {
-  startAttempt(): number;
+  startAttempt(attemptIndex: number): number;
   finishAttempt(attempt: AttemptCompletion): void;
-  emit(event: ResponseEvent, attemptIndex: number): void;
-  emitOutputItems(output: OutputItem[], attemptIndex: number): void;
-  terminal(status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt: AttemptCompletion | undefined, attemptIndex: number): void;
+  emit(event: ResponseEvent): void;
+  emitOutputItems(output: OutputItem[]): void;
+  terminal(status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt: AttemptCompletion | undefined): void;
 }
 
 export type FailoverExecutionInput = {
@@ -65,14 +65,14 @@ export const executeFailover = async (
   const cancel = (attempt: AttemptCompletion | undefined, outputText: string) => {
     sink.terminal('cancelled', outputText, {
       type: 'response.cancelled', response: { id: input.responseId, object: 'response', status: 'cancelled' },
-    }, attempt, attemptIndex);
+    }, attempt);
     return { kind: 'cancelled' } as const;
   };
 
   for (const upstream of input.upstreams) {
     if (cancelled?.aborted) return cancel(retryAttempt, failedOutputText);
     attemptIndex += 1;
-    const attemptId = sink.startAttempt();
+    const attemptId = sink.startAttempt(attemptIndex);
     const abort = new AbortController();
     const onCancel = () => abort.abort();
     cancelled?.addEventListener('abort', onCancel, { once: true });
@@ -111,22 +111,22 @@ export const executeFailover = async (
         if (!streamStarted) {
           sink.emit({
             type: 'response.created', response: { id: input.responseId, object: 'response', status: 'in_progress', model: input.model, output: [] },
-          }, attemptIndex);
+          });
           streamStarted = true;
         }
         if (streamEvent.kind === 'completed') {
-          for (const event of streamEvent.eventsBeforeOutputItems) sink.emit(event, attemptIndex);
-          sink.emitOutputItems(streamEvent.output, attemptIndex);
+          for (const event of streamEvent.eventsBeforeOutputItems) sink.emit(event);
+          sink.emitOutputItems(streamEvent.output);
           sink.terminal('completed', streamEvent.outputText, {
             type: 'response.completed', response: {
               id: input.responseId, object: 'response', status: 'completed', model: input.model, output: streamEvent.output,
             },
-          }, { id: attemptId, result: 'completed', preOutputFailure: false }, attemptIndex);
+          }, { id: attemptId, result: 'completed', preOutputFailure: false });
           completed = true;
           break;
         }
         if (streamEvent.kind === 'heartbeat') continue;
-        sink.emit(streamEvent.event, attemptIndex);
+        sink.emit(streamEvent.event);
         attemptOutputText = streamEvent.outputText;
         failedOutputText = attemptOutputText;
         if (cancelled?.aborted) {
@@ -147,7 +147,7 @@ export const executeFailover = async (
       const outputText = failedOutputText || '';
       sink.terminal('failed', outputText, {
         type: 'response.failed', response: { id: input.responseId, object: 'response', status: 'failed' },
-      }, { id: attemptId, result: 'failed', preOutputFailure: false, errorCode: 'upstream_stream_failed' }, attemptIndex);
+      }, { id: attemptId, result: 'failed', preOutputFailure: false, errorCode: 'upstream_stream_failed' });
       return { kind: 'failed' };
     } finally {
       clearTimeoutForAttempt();

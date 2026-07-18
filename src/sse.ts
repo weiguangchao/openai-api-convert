@@ -9,6 +9,7 @@ export class HttpStreamEventSink implements StreamEventSink {
   #responseId: string;
   #logging: BridgeLogger;
   #requestId: string;
+  #attemptIndex = 0;
   #started = false;
 
   constructor(response: ServerResponse, store: StateStore, responseId: string, logging: BridgeLogger, requestId: string) {
@@ -19,7 +20,8 @@ export class HttpStreamEventSink implements StreamEventSink {
     this.#requestId = requestId;
   }
 
-  startAttempt() {
+  startAttempt(attemptIndex: number) {
+    this.#attemptIndex = attemptIndex;
     return this.#store.startAttempt(this.#responseId);
   }
 
@@ -27,24 +29,24 @@ export class HttpStreamEventSink implements StreamEventSink {
     this.#store.finishAttempt(attempt);
   }
 
-  emit(event: ResponseEvent, attemptIndex: number) {
+  emit(event: ResponseEvent) {
     this.#store.appendEvent(this.#responseId, event);
-    this.#write(event, attemptIndex);
+    this.#write(event);
   }
 
-  emitOutputItems(output: OutputItem[], attemptIndex: number) {
+  emitOutputItems(output: OutputItem[]) {
     for (const [outputIndex, item] of output.entries()) {
       this.#store.appendOutputItem(this.#responseId, outputIndex, item);
-      this.emit({ type: 'response.output_item.done', output_index: outputIndex, item }, attemptIndex);
+      this.emit({ type: 'response.output_item.done', output_index: outputIndex, item });
     }
   }
 
-  terminal(status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt: AttemptCompletion | undefined, attemptIndex: number) {
+  terminal(status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt: AttemptCompletion | undefined) {
     this.#store.terminal(this.#responseId, status, outputText, event, attempt);
-    this.#write(event, attemptIndex);
+    this.#write(event);
   }
 
-  #write(event: ResponseEvent, attemptIndex: number) {
+  #write(event: ResponseEvent) {
     if (!this.#response.destroyed && !this.#response.writableEnded) {
       if (!this.#started) {
         this.#response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -53,11 +55,11 @@ export class HttpStreamEventSink implements StreamEventSink {
       this.#response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     }
     this.#logging.log('info', 'traffic_downstream_outbound', {
-      requestId: this.#requestId, responseId: this.#responseId, attempt_index: attemptIndex, event_type: event.type,
+      requestId: this.#requestId, responseId: this.#responseId, attempt_index: this.#attemptIndex, event_type: event.type,
     });
     if (this.#logging.level === 'debug') {
       this.#logging.log('debug', 'traffic_downstream_outbound', {
-        requestId: this.#requestId, responseId: this.#responseId, attempt_index: attemptIndex, event_type: event.type, sse_event: event,
+        requestId: this.#requestId, responseId: this.#responseId, attempt_index: this.#attemptIndex, event_type: event.type, sse_event: event,
       });
     }
   }
