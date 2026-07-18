@@ -67,6 +67,7 @@ out/
 .env.local
 .env.*.local
 config.yaml
+config.dev.yaml
 
 # npm cache directory
 .npm
@@ -80,3 +81,5 @@ config.yaml
 
 
 docs/research
+response-bridge.db
+logs/
