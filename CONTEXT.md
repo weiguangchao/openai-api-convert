@@ -16,6 +16,7 @@
 - **Parallel Tool Calling**: 同一 Response 中并行产生多个工具调用的语义；不得串行化替代。
 - **Attempt**: 针对单个 Response 的一次上游调用记录；不参与会话重建。
 - **Stream Event**: 向客户端发出的、带单调序号的 Responses 语义 SSE 事件。
+- **Stream Event Sink**: Failover Policy Execution 使用的 Stream Event 输出 seam。生产 adapter 持久化 Output Item 并发送事件；测试 adapter 仅记录事件；Output Item 必须先于对应 `response.output_item.done` 记录；终态操作原子写入 Response 终态、终态 Stream Event 与最终 Attempt。
 - **Stream Translator**: Completion 上游 SSE chunk 流到 Responses Stream Event 的纯协议转换；产出有序下游事件与 Output Item，不持有 HTTP 响应或 State Store。与正向（Responses 请求 -> Chat Completions body）翻译对偶。
 - **Compatibility Fixture**: 可重复的脚本化上游交互，连同对 Bridge 可观察结果的预期，用于验证协议与故障契约。
 - **Service Runtime**: Node.js + TypeScript。
@@ -42,8 +43,12 @@
 - **Proxy Exposure Boundary**: 反向代理只公开 `/v1/responses`；未认证 `/healthz` 仅供本机探针，`/readyz` 仍要求 Bridge Authentication；不提供 `/metrics`。
 - **Default Port**: Production CLI 在未配置 `port` 时监听的 `8417` 端口。
 - **Upstream Pool**: 由 Bridge 配置文件声明的有序 Chat Completions 上游；请求失败时按顺序切换。
+- **Upstream Stream**: Failover Policy Execution 使用的上游输入 seam。生产 adapter 发起 Chat Completions 请求并提供 SSE 数据；测试 adapter 提供脚本化结果。
 - **Failover Policy**: 单个 Attempt 失败时，决定按 Upstream Pool 顺序切换下一上游还是终结 Response 的策略。首个 Stream Event 发出前的失败可重试；此后任何失败为终态，不再切换，Response 终结为 failed；客户端断开终结为 cancelled，不重试。
+- **Failover Policy Execution**: 持有单个 Response 的上游执行生命周期：兼容上游选择、Attempt、重试、取消与终态；不持有 Stream Translator 的协议翻译。
+- **Pre-output Outcome**: 首个 Stream Event 前的上游拒绝或全部不可用结果；Failover Policy Execution 返回该结果，由响应 module 发送 HTTP error 并丢弃未开始的 Response。客户端断开例外，Response 终结为 cancelled。
 - **Upstream Capability Profile**: 启动配置显式声明的 Function Tool、双向 Custom Tool 与并行调用能力；Bridge 按请求筛选兼容上游。
+- **Upstream Selection**: Failover Policy Execution 按请求所需能力从有序 Upstream Pool 选出兼容上游；零匹配不得创建 Attempt。
 - **State Store**: SQLite；保存响应、会话、工具调用与重试所需状态。
 - **State Migration**: Production CLI 在启动时对 State Store 执行自动、仅前向的 schema 迁移；备份由部署方负责。
 - **Idempotent Request**: 同一 Bridge Authentication 主体的 `POST /v1/responses`，以 `Idempotency-Key` 和规范化已接受请求的摘要识别；命中时复用同一 Response；摘要含合法 `reasoning.effort`。
