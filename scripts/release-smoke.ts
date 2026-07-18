@@ -6,6 +6,6 @@ const configuration = await loadBridgeConfiguration(process.argv[2] ?? 'config.t
 await runReleaseSmoke({
   apiKey: configuration.apiKey,
   upstreams: configuration.upstreams,
-  model: 'glm-5.2',
+  model: 'deepseek-v4-flash',
 });
 console.log('Release smoke passed.');
