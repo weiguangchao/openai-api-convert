@@ -60,5 +60,5 @@
 - **State Capacity Rejection**: 状态库满 10 GiB 且同步清理无可回收状态时，新建请求以可重试的 `503 state_store_capacity_exceeded` 失败，且不得创建 Response、幂等记录或 Attempt；进行中请求继续完成。
 - **State Cleanup Log**: 每次清理的结构化日志，记录起止时间、删除链数、回收字节数与失败原因，且不得记录 Response 内容或密钥。与 Traffic Log 分离：本轨始终不记交互正文；不提供 metrics 导出。
 - **Traffic Log**: 上下游四跳交互的可观测记录（下游入、上游出、上游回、下游出），含 failover 的每次 Attempt；完整 body 与 SSE 仅在 `debug` 级别写入；密钥始终脱敏。
-- **Production Log Delivery**: Traffic Log 同时写入 Configuration Home 的轮转文件与 stdout JSON Lines；后者供 Service Supervisor 采集。
+- **Production Log Delivery**: Traffic Log 同时写入 Configuration Home 的轮转文件与 stdout；两者均采用面向人的单行文本格式，stdout 供 Service Supervisor 采集。
 - **Log Retention**: Traffic Log 文件保留策略，默认 7 天，由成熟日志框架执行轮转与删除；独立于 Retention Policy 与 State Cleanup。默认目录为 State Store 同级的 `logs/`。

@@ -33,6 +33,9 @@ const captureStdoutLines = () => {
   };
 };
 
+const logLinesFor = (lines: string[], event: string, level?: 'debug' | 'info' | 'error') => lines.filter((line) => line.includes(`[bridge] ${event}`)
+  && (level === undefined || line.includes(` ${level.toUpperCase()} [bridge] `)));
+
 const codexMixedTools = JSON.parse(
   await readFile(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/codex-0.144.5-mixed-tools.json'), 'utf8'),
 ) as unknown[];
@@ -268,7 +271,7 @@ test('reports not ready when every upstream probe fails', async () => {
   }
 });
 
-test('returns not found for removed metrics and emits redacted JSON Lines logs', async () => {
+test('returns not found for removed metrics and emits redacted single-line backend logs', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
   const captured = captureStdoutLines();
@@ -291,15 +294,13 @@ test('returns not found for removed metrics and emits redacted JSON Lines logs',
     })).status, 200);
     assert.equal((await fetch(`${bridge.url}/metrics`)).status, 404);
     assert.equal((await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).status, 404);
-    const requestLog = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>)
-      .find(({ event }) => event === 'http_request_completed');
+    const requestLog = captured.lines.find((line) => line.includes('http_request_completed'));
     assert(requestLog);
-    assert.equal(typeof requestLog.timestamp, 'string');
-    assert.equal(typeof requestLog.level, 'string');
-    assert.equal(typeof requestLog.request_id, 'string');
-    assert.equal(typeof requestLog.duration_ms, 'number');
-    assert.equal(Object.hasOwn(requestLog, 'response_id'), true);
-    assert.equal(Object.hasOwn(requestLog, 'error_code'), true);
+    assert.match(requestLog, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z (INFO|ERROR) \[bridge\] http_request_completed\b/);
+    assert.match(requestLog, /\brequest_id=[^\s]+/);
+    assert.match(requestLog, /\bduration_ms=\d+/);
+    assert.equal(requestLog.includes('response_id=null'), false);
+    assert.equal(requestLog.includes('error_code=null'), false);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('secret invalid payload'), false);
     assert.equal(serialized.includes('secret response input'), false);
@@ -335,9 +336,9 @@ test('writes human-readable Traffic Log files beside State Store without secrets
     const logFiles = await readdir(join(dir, 'logs'));
     assert.ok(logFiles.length > 0, 'expected log files under dirname(statePath)/logs/');
     const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
-    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ (INFO|ERROR) http_request_completed$/m);
-    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ INFO state_store_cleanup$/m);
-    assert.match(content, /\n  "[a-z_]+": /);
+    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ (INFO|ERROR) \[bridge\] http_request_completed\b/m);
+    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ INFO \[bridge\] state_store_cleanup\b/m);
+    assert.equal(content.includes('\n  "'), false);
     assert.equal(content.includes('secret response input'), false);
     assert.equal(content.includes('bridge-key'), false);
     assert.equal(content.includes('upstream-key'), false);
@@ -365,20 +366,19 @@ test('Traffic Log records downstream inbound and upstream outbound at info level
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({ stream: true, input: 'secret response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const inbound = entries.find(({ event, level }) => event === 'traffic_downstream_inbound' && level === 'info');
+    const inbound = logLinesFor(captured.lines, 'traffic_downstream_inbound', 'info').at(0);
     assert(inbound, 'expected info-level traffic_downstream_inbound log entry');
-    assert.equal(inbound.method, 'POST');
-    assert.equal(inbound.path, '/v1/responses');
-    assert.equal(Object.hasOwn(inbound, 'body'), false);
-    assert.equal(Object.hasOwn(inbound, 'headers'), false);
-    assert.equal(Object.hasOwn(inbound, 'upstream_url'), false);
-    const outbound = entries.find(({ event, level }) => event === 'traffic_upstream_outbound' && level === 'info');
+    assert.match(inbound, /\bmethod=POST\b/);
+    assert.match(inbound, /\bpath=\/v1\/responses\b/);
+    assert.equal(inbound.includes('body='), false);
+    assert.equal(inbound.includes('headers='), false);
+    assert.equal(inbound.includes('upstream_url='), false);
+    const outbound = logLinesFor(captured.lines, 'traffic_upstream_outbound', 'info').at(0);
     assert(outbound, 'expected info-level traffic_upstream_outbound log entry');
-    assert.equal(typeof outbound.attempt_index, 'number');
-    assert.equal(Object.hasOwn(outbound, 'body'), false);
-    assert.equal(Object.hasOwn(outbound, 'headers'), false);
-    assert.equal(Object.hasOwn(outbound, 'upstream_url'), false);
+    assert.match(outbound, /\battempt_index=1\b/);
+    assert.equal(outbound.includes('body='), false);
+    assert.equal(outbound.includes('headers='), false);
+    assert.equal(outbound.includes('upstream_url='), false);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('secret response input'), false);
     assert.equal(serialized.includes('bridge-key'), false);
@@ -408,10 +408,9 @@ test('logs the actual loopback endpoint after binding a dynamic port', async () 
     bridge = undefined;
     const logFiles = await readdir(join(dir, 'logs'));
     const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
-    assert.match(content, /"level": "info"/);
-    assert.match(content, /"event": "bridge_started"/);
-    assert.match(content, /"address": "127.0.0.1"/);
-    assert.match(content, new RegExp(`"port": ${port}(?:\\n|,)`));
+    assert.match(content, /INFO \[bridge\] bridge_started\b/);
+    assert.match(content, /\baddress=127\.0\.0\.1\b/);
+    assert.match(content, new RegExp(`\\bport=${port}\\b`));
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -436,18 +435,15 @@ test('Traffic Log at debug level records body and upstream URL with redacted sec
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({ stream: true, input: 'visible response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const inboundDebug = entries.find(({ event, level }) => event === 'traffic_downstream_inbound' && level === 'debug');
+    const inboundDebug = logLinesFor(captured.lines, 'traffic_downstream_inbound', 'debug').at(0);
     assert(inboundDebug, 'expected debug-level traffic_downstream_inbound');
-    assert.equal(inboundDebug.body, JSON.stringify({ stream: true, input: 'visible response input' }));
-    assert.equal((inboundDebug.headers as Record<string, unknown>).authorization, '[REDACTED]');
-    const outboundDebug = entries.find(({ event, level }) => event === 'traffic_upstream_outbound' && level === 'debug');
+    assert.match(inboundDebug, /body="\{\\"stream\\":true,\\"input\\":\\"visible response input\\"\}"/);
+    assert.match(inboundDebug, /headers=\{.*"authorization":"\[REDACTED\]".*\}/);
+    const outboundDebug = logLinesFor(captured.lines, 'traffic_upstream_outbound', 'debug').at(0);
     assert(outboundDebug, 'expected debug-level traffic_upstream_outbound');
-    assert.equal(typeof outboundDebug.upstream_url, 'string');
-    assert.ok(String(outboundDebug.upstream_url).includes(upstream.url));
-    assert.equal(typeof outboundDebug.body, 'string');
-    assert.ok((outboundDebug.body as string).includes('visible response input'));
-    assert.equal((outboundDebug.headers as Record<string, unknown>).authorization, '[REDACTED]');
+    assert.equal(outboundDebug.includes(`upstream_url=${upstream.url}/v1/chat/completions`), true);
+    assert.match(outboundDebug, /body="\{.*visible response input.*\}"/);
+    assert.match(outboundDebug, /headers=\{.*"authorization":"\[REDACTED\]".*\}/);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('bridge-key'), false);
     assert.equal(serialized.includes('upstream-key'), false);
@@ -475,19 +471,18 @@ test('Traffic Log records upstream inbound and downstream outbound at info level
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({ stream: true, input: 'secret response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const upstreamInbound = entries.filter(({ event, level }) => event === 'traffic_upstream_inbound' && level === 'info');
+    const upstreamInbound = logLinesFor(captured.lines, 'traffic_upstream_inbound', 'info');
     assert.ok(upstreamInbound.length > 0, 'expected info-level traffic_upstream_inbound log entries');
-    for (const entry of upstreamInbound) {
-      assert.equal(typeof entry.status, 'number');
-      assert.equal(Object.hasOwn(entry, 'body'), false);
-      assert.equal(Object.hasOwn(entry, 'headers'), false);
+    for (const line of upstreamInbound) {
+      assert.match(line, /\bstatus=\d+\b/);
+      assert.equal(line.includes('body='), false);
+      assert.equal(line.includes('headers='), false);
     }
-    const downstreamOutbound = entries.filter(({ event, level }) => event === 'traffic_downstream_outbound' && level === 'info');
+    const downstreamOutbound = logLinesFor(captured.lines, 'traffic_downstream_outbound', 'info');
     assert.ok(downstreamOutbound.length > 0, 'expected info-level traffic_downstream_outbound log entries');
-    for (const entry of downstreamOutbound) {
-      assert.equal(typeof entry.event_type, 'string');
-      assert.equal(Object.hasOwn(entry, 'sse_event'), false);
+    for (const line of downstreamOutbound) {
+      assert.match(line, /\bevent_type=[^\s]+/);
+      assert.equal(line.includes('sse_event='), false);
     }
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('secret response input'), false);
@@ -519,27 +514,25 @@ test('Traffic Log at debug level records upstream SSE chunks and downstream even
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({ stream: true, input: 'visible response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const upstreamDebug = entries.filter(({ event, level }) => event === 'traffic_upstream_inbound' && level === 'debug');
+    const upstreamDebug = logLinesFor(captured.lines, 'traffic_upstream_inbound', 'debug');
     assert.ok(upstreamDebug.length > 0, 'expected debug-level traffic_upstream_inbound entries');
-    const upstreamHeadersEntry = upstreamDebug.find((entry) => Object.hasOwn(entry, 'headers'));
+    const upstreamHeadersEntry = upstreamDebug.find((line) => line.includes('headers='));
     assert(upstreamHeadersEntry, 'expected upstream inbound debug entry with headers');
-    assert.equal(typeof (upstreamHeadersEntry!.headers as Record<string, unknown>)['content-type'], 'string');
-    const upstreamBodyEntries = upstreamDebug.filter((entry) => Object.hasOwn(entry, 'body'));
+    assert.match(upstreamHeadersEntry, /headers=\{.*"content-type":"[^"]+".*\}/);
+    const upstreamBodyEntries = upstreamDebug.filter((line) => line.includes('body='));
     assert.ok(upstreamBodyEntries.length >= 3, 'expected upstream inbound debug entries with SSE body chunks');
-    assert.ok(upstreamBodyEntries.some((entry) => typeof entry.body === 'string' && (entry.body as string).includes('Hello ')));
-    assert.ok(upstreamBodyEntries.some((entry) => typeof entry.body === 'string' && (entry.body as string).includes('world')));
-    assert.ok(upstreamBodyEntries.some((entry) => entry.body === '[DONE]'));
-    const downstreamDebug = entries.filter(({ event, level }) => event === 'traffic_downstream_outbound' && level === 'debug');
+    assert.ok(upstreamBodyEntries.some((line) => line.includes('Hello ')));
+    assert.ok(upstreamBodyEntries.some((line) => line.includes('world')));
+    assert.ok(upstreamBodyEntries.some((line) => line.includes('body="[DONE]"')));
+    const downstreamDebug = logLinesFor(captured.lines, 'traffic_downstream_outbound', 'debug');
     assert.ok(downstreamDebug.length >= 5, 'expected at least 5 debug-level traffic_downstream_outbound entries');
-    const downstreamEventTypes = downstreamDebug.map((entry) => entry.event_type);
-    assert.ok(downstreamEventTypes.includes('response.created'));
-    assert.ok(downstreamEventTypes.includes('response.output_text.delta'));
-    assert.ok(downstreamEventTypes.includes('response.output_item.done'));
-    assert.ok(downstreamEventTypes.includes('response.completed'));
-    for (const entry of downstreamDebug) {
-      assert.equal(typeof entry.event_type, 'string');
-      assert.equal(typeof entry.sse_event, 'object');
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.created')));
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.output_text.delta')));
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.output_item.done')));
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.completed')));
+    for (const line of downstreamDebug) {
+      assert.match(line, /\bevent_type=[^\s]+/);
+      assert.equal(line.includes('sse_event={'), true);
     }
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('bridge-key'), false);
@@ -585,15 +578,12 @@ test('Traffic Log records every Attempt during failover', async () => {
       }),
     });
     assert.equal((await second.text()).length > 0, true);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const outbound = entries.filter(({ event }) => event === 'traffic_upstream_outbound');
-    const inbound = entries.filter(({ event }) => event === 'traffic_upstream_inbound');
+    const outbound = logLinesFor(captured.lines, 'traffic_upstream_outbound');
+    const inbound = logLinesFor(captured.lines, 'traffic_upstream_inbound');
     assert.equal(outbound.length, 3, 'expected 3 outbound entries (1 + 2 failover)');
     assert.equal(inbound.length, 3, 'expected 3 inbound entries (1 + 2 failover)');
-    const attemptIndices = outbound.map((entry) => entry.attempt_index);
-    assert.deepEqual(attemptIndices, [1, 1, 2]);
-    const inboundStatuses = inbound.map((entry) => entry.status);
-    assert.deepEqual(inboundStatuses, [200, 429, 200]);
+    assert.deepEqual(outbound.map((line) => /\battempt_index=(\d+)\b/.exec(line)?.[1]), ['1', '1', '2']);
+    assert.deepEqual(inbound.map((line) => /\bstatus=(\d+)\b/.exec(line)?.[1]), ['200', '429', '200']);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('bridge-key'), false);
     assert.equal(serialized.includes('upstream-key'), false);
@@ -628,9 +618,10 @@ test('writes human-readable Traffic Log SSE events per line at debug level', asy
     const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
     assert.match(content, /traffic_upstream_inbound/);
     assert.match(content, /traffic_downstream_outbound/);
-    assert.match(content, /\n  "body": /);
-    assert.match(content, /\n  "sse_event": /);
-    assert.match(content, /\n  "event_type": /);
+    assert.match(content, /\bbody=/);
+    assert.match(content, /\bsse_event=\{/);
+    assert.match(content, /\bevent_type=/);
+    assert.equal(content.includes('\n  "'), false);
     assert.equal(content.includes('bridge-key'), false);
     assert.equal(content.includes('upstream-key'), false);
   } finally {
@@ -711,13 +702,12 @@ test('State Store startup cleanup removes only expired terminal Response Chains 
     assert.deepEqual(bridge.state.responses(), [{ status: 'in_progress', outputText: '' }]);
     assert.deepEqual(bridge.state.events(), []);
     assert.deepEqual(bridge.state.attempts(), [{ responseId: 'resp_active' }]);
-    const cleanupLog = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>)
-      .find(({ event, deleted_chains: deletedChains }) => event === 'state_store_cleanup' && deletedChains === 1);
+    const cleanupLog = logLinesFor(captured.lines, 'state_store_cleanup')
+      .find((line) => line.includes('deleted_chains=1'));
     assert(cleanupLog);
-    assert.equal(typeof cleanupLog.started_at, 'number');
-    assert.equal(typeof cleanupLog.ended_at, 'number');
-    assert.equal(typeof cleanupLog.reclaimed_bytes, 'number');
-    assert.equal(Number(cleanupLog.started_at) <= Number(cleanupLog.ended_at), true);
+    assert.match(cleanupLog, /\bstarted_at=\d+\b/);
+    assert.match(cleanupLog, /\bended_at=\d+\b/);
+    assert.match(cleanupLog, /\breclaimed_bytes=\d+\b/);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('retained input'), false);
     assert.equal(serialized.includes('bridge-key'), false);
@@ -2086,7 +2076,7 @@ test('client disconnect aborts the active Attempt and cancels the Response', asy
     assert.deepEqual(bridge.state.responses(), [{ status: 'cancelled', outputText: 'first ' }]);
     assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.cancelled']);
     assert.equal(bridge.state.attempts().length, 1);
-    assert.equal(captured.lines.some((line) => line.includes('"event":"http_request_completed"') && line.includes('"error_code":"client_disconnected"')), true);
+    assert.equal(captured.lines.some((line) => line.includes('http_request_completed') && line.includes('error_code=client_disconnected')), true);
   } finally {
     captured.restore();
     upstream.release();
