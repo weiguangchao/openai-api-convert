@@ -20,6 +20,7 @@
 - **Service Runtime**: Node.js + TypeScript。
 - **Bridge Configuration**: 部署方持有的单个 YAML 配置，声明 Bridge 认证、Upstream Pool 与运行策略；不从服务进程环境读取配置。
 - **Upstream Pool**: 由 Bridge 配置文件声明的有序 Chat Completions 上游；请求失败时按顺序切换。
+- **Failover Policy**: 单个 Attempt 失败时，决定按 Upstream Pool 顺序切换下一上游还是终结 Response 的策略。首个 Stream Event 发出前的失败可重试；此后任何失败为终态，不再切换，Response 终结为 failed；客户端断开终结为 cancelled，不重试。
 - **Upstream Capability Profile**: 启动配置显式声明的 Function Tool、双向 Custom Tool 与并行调用能力；Bridge 按请求筛选兼容上游。
 - **State Store**: SQLite；保存响应、会话、工具调用与重试所需状态。
 - **Idempotent Request**: 同一 Bridge Authentication 主体的 `POST /v1/responses`，以 `Idempotency-Key` 和规范化已接受请求的摘要识别；命中时复用同一 Response；摘要含合法 `reasoning.effort`。
