@@ -1,7 +1,8 @@
 import type { StateStore } from './state.js';
 
 export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
-export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile };
+export type UpstreamThinkingPolicy = { type: 'enabled' | 'disabled' };
+export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile; thinking?: UpstreamThinkingPolicy };
 export type StatePolicy = {
   responseRetentionDays?: number;
   attemptRetentionDays?: number;
@@ -14,6 +15,7 @@ export type LoggingPolicy = {
   path?: string;
   retentionDays?: number;
 };
+export type ReleasePreflightPolicy = { model: string };
 export type BridgeOptions = {
   apiKey: string;
   upstreams: Upstream[];
@@ -23,6 +25,7 @@ export type BridgeOptions = {
   outputIdleTimeoutMs?: number;
   statePolicy?: StatePolicy;
   logging?: LoggingPolicy;
+  releasePreflight?: ReleasePreflightPolicy;
 };
 export type LogFields = {
   requestId?: string | null;
@@ -41,8 +44,10 @@ export type NamespaceTool = { type: 'namespace'; name: string; description: stri
 export type Tool = FunctionTool | CustomTool | WebSearchTool | NamespaceTool;
 export type FunctionToolOutput = { type: 'function_call_output'; call_id: string; output: string };
 export type CustomToolOutput = { type: 'custom_tool_call_output'; call_id: string; output: string };
+export type InlineFunctionCall = { type: 'function_call'; call_id: string; name: string; arguments: string };
+export type InlineCustomToolCall = { type: 'custom_tool_call'; call_id: string; name: string; input: string };
 export type InputMessage = { type: 'message'; role: 'user' | 'developer'; content: string };
-export type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput;
+export type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput | InlineFunctionCall | InlineCustomToolCall;
 export type OutputItem =
   | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string; namespace?: string }

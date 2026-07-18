@@ -6,13 +6,35 @@ export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'w
 export const normalizeInput = (input: unknown): InputItem[] | undefined => {
   if (typeof input === 'string' && input.length > 0) return [{ type: 'message', role: 'user', content: input }];
   if (!Array.isArray(input) || input.length === 0) return undefined;
+  const inlineCallIndexes = new Set<number>();
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!item || typeof item !== 'object') continue;
+    const value = item as Record<string, unknown>;
+    if ((value.type !== 'function_call' && value.type !== 'custom_tool_call') || typeof value.call_id !== 'string') continue;
+    const outputType = value.type === 'function_call' ? 'function_call_output' : 'custom_tool_call_output';
+    if (input.slice(index + 1).some((next) => next && typeof next === 'object'
+      && (next as Record<string, unknown>).type === outputType && (next as Record<string, unknown>).call_id === value.call_id)) {
+      inlineCallIndexes.add(index);
+    }
+  }
   type Classified = { kind: 'echo' } | { kind: 'item'; item: InputItem };
   const classified: Classified[] = [];
-  for (const item of input) {
+  for (const [index, item] of input.entries()) {
     if (!item || typeof item !== 'object') return undefined;
     const value = item as Record<string, unknown>;
     if (value.type === 'message' && value.role === 'assistant') {
       classified.push({ kind: 'echo' });
+      continue;
+    }
+    if (value.type === 'function_call' && inlineCallIndexes.has(index)
+      && typeof value.call_id === 'string' && typeof value.name === 'string' && typeof value.arguments === 'string') {
+      classified.push({ kind: 'item', item: { type: 'function_call', call_id: value.call_id, name: value.name, arguments: value.arguments } });
+      continue;
+    }
+    if (value.type === 'custom_tool_call' && inlineCallIndexes.has(index)
+      && typeof value.call_id === 'string' && typeof value.name === 'string' && typeof value.input === 'string') {
+      classified.push({ kind: 'item', item: { type: 'custom_tool_call', call_id: value.call_id, name: value.name, input: value.input } });
       continue;
     }
     if (typeof value.type === 'string' && INPUT_ECHO_TYPES.has(value.type)) {
@@ -207,9 +229,16 @@ export const WEB_SEARCH_UNAVAILABLE_HINT = 'Hosted web search is unavailable on 
 
 export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   const { refToAlias } = buildNamespaceAliasMaps(response.tools);
-  const messages: ChatMessage[] = response.input.map((item) => item.type === 'message'
-    ? { role: item.role === 'developer' ? 'system' : 'user', content: item.content }
-    : { role: 'tool', tool_call_id: item.call_id, content: item.output });
+  const messages: ChatMessage[] = response.input.flatMap((item): ChatMessage[] => {
+    if (item.type === 'message') return [{ role: item.role === 'developer' ? 'system' : 'user', content: item.content }];
+    if (item.type === 'function_call') return [{
+      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }],
+    }];
+    if (item.type === 'custom_tool_call') return [{
+      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'custom', custom: { name: item.name, input: item.input } }],
+    }];
+    return [{ role: 'tool', tool_call_id: item.call_id, content: item.output }];
+  });
   const toolCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call');
   const text = response.output.find((item): item is Extract<OutputItem, { type: 'message' }> => item.type === 'message');
   if (text || toolCalls.length) {

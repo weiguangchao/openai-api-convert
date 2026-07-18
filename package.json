@@ -21,7 +21,7 @@
     "build": "tsc -p tsconfig.build.json && node scripts/copy-build-assets.mjs",
     "check": "tsc --noEmit",
     "dev": "tsx watch --include src/**/*.ts src/index.ts start --config config.dev.yaml",
-    "test": "npm run build && node dist/scripts/release-smoke.js config.test.yaml",
+    "test": "node scripts/release-gate.mjs",
     "test:unit": "npm run build && node --test dist/test/**/*.test.js",
     "test:codex-mixed-tools": "npm run build && node --test --test-name-pattern='Codex mixed-tools' dist/test/bridge.test.js",
     "prepack": "npm run build"

@@ -170,6 +170,7 @@ test('CLI rejects missing, mistyped, and unknown YAML configuration before start
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    wireApi: responses\n', 'Configuration.upstreams[0].wireApi'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    wireApi: chat\n', 'Configuration.upstreams[0].wireApi'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    capabilities:\n      webSearch: true\n', 'Configuration.upstreams[0].capabilities.webSearch'],
+    ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    thinking:\n      type: automatic\n', 'Configuration.upstreams[0].thinking.type'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\nlogging:\n  level: verbose\n', 'Configuration.logging.level'],
   ]) {
     const rejected = await runRejectedConfiguration(source);
@@ -208,6 +209,26 @@ test('loadBridgeConfiguration parses logging overrides for level, path, and rete
   }
 });
 
+test('loadBridgeConfiguration parses an explicit upstream Thinking policy', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
+  const configPath = join(dir, 'config.yaml');
+  try {
+    await writeFile(configPath, [
+      'apiKey: yaml-key',
+      'upstreams:',
+      '  - baseUrl: http://127.0.0.1:1',
+      '    apiKey: upstream-key',
+      '    thinking:',
+      '      type: disabled',
+      '',
+    ].join('\n'));
+    const configuration = await loadBridgeConfiguration(configPath);
+    assert.deepEqual(configuration.upstreams[0].thinking, { type: 'disabled' });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('loadBridgeConfiguration defaults logging to info, 7 days, and dirname(statePath)/logs/', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
   const configPath = join(dir, 'config.yaml');
@@ -227,6 +248,27 @@ test('loadBridgeConfiguration defaults logging to info, 7 days, and dirname(stat
       path: join(dir, 'logs'),
       retentionDays: 7,
     });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadBridgeConfiguration parses an explicit Release Preflight Model', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
+  const configPath = join(dir, 'config.yaml');
+  try {
+    await writeFile(configPath, [
+      'apiKey: yaml-key',
+      'upstreams:',
+      '  - baseUrl: http://127.0.0.1:1',
+      '    apiKey: upstream-key',
+      `statePath: ${join(dir, 'state.db')}`,
+      'releasePreflight:',
+      '  model: smoke-model',
+      '',
+    ].join('\n'));
+    const configuration = await loadBridgeConfiguration(configPath);
+    assert.equal(configuration.releasePreflight?.model, 'smoke-model');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

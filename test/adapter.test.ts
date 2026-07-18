@@ -116,6 +116,18 @@ test('normalizeInput: function_call_output and custom_tool_call_output kept with
   assert.deepEqual(normalizeInput([{ type: 'custom_tool_call_output', call_id: 'c2', output: 'r2' }]), [{ type: 'custom_tool_call_output', call_id: 'c2', output: 'r2' }]);
 });
 
+test('normalizeInput: paired inline function call and output are kept for store:false clients', () => {
+  assert.deepEqual(normalizeInput([
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Run pwd.' }] },
+    { type: 'function_call', call_id: 'call_pwd', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+    { type: 'function_call_output', call_id: 'call_pwd', output: '/private/tmp' },
+  ]), [
+    { type: 'message', role: 'user', content: 'Run pwd.' },
+    { type: 'function_call', call_id: 'call_pwd', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+    { type: 'function_call_output', call_id: 'call_pwd', output: '/private/tmp' },
+  ]);
+});
+
 test('normalizeInput: tool output with non-string call_id or output returns undefined', () => {
   assert.strictEqual(normalizeInput([{ type: 'function_call_output', call_id: 1, output: 'r' }]), undefined);
   assert.strictEqual(normalizeInput([{ type: 'custom_tool_call_output', call_id: 'c', output: 2 }]), undefined);
