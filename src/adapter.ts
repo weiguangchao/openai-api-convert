@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, StoredResponse, Tool } from './types.ts';
+import type { ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, Result, StoredResponse, Tool } from './types.ts';
 
 export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
 
@@ -239,4 +239,127 @@ export const parseReasoningEffort = (reasoning: unknown): string | undefined | n
   const effort = (reasoning as { effort?: unknown }).effort;
   if (effort === undefined) return undefined;
   return typeof effort === 'string' && REASONING_EFFORTS.has(effort) ? effort : null;
+};
+
+export type NamespaceAliases = ReturnType<typeof buildNamespaceAliasMaps>;
+type UpstreamToolCall = { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown }; custom?: { name?: unknown; input?: unknown } };
+type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] } }> };
+
+export class StreamTranslator {
+  outputStarted = false;
+  outputText = '';
+  output: OutputItem[] = [];
+  #nextOutputIndex = 0;
+  #textOutputIndex: number | undefined;
+  #calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
+  #id: string;
+  #aliases: NamespaceAliases;
+
+  constructor(id: string, aliases: NamespaceAliases) {
+    this.#id = id;
+    this.#aliases = aliases;
+  }
+
+  feed(data: string): ResponseEvent[] {
+    const chunk = JSON.parse(data) as UpstreamChunk;
+    const delta = chunk.choices?.[0]?.delta;
+    const events: ResponseEvent[] = [];
+    if (typeof delta?.content === 'string' && delta.content.length) {
+      if (this.#textOutputIndex === undefined) this.#textOutputIndex = this.#nextOutputIndex++;
+      this.outputStarted = true;
+      this.outputText += delta.content;
+      events.push({ type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta: delta.content });
+    }
+    for (const call of delta?.tool_calls ?? []) {
+      if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
+      if (call.type !== undefined && call.type !== 'function' && call.type !== 'custom') throw new Error('Invalid upstream Tool call');
+      const kind = call.type === 'custom' ? 'custom' : 'function';
+      const current = this.#calls.get(Number(call.index)) ?? {
+        kind, input: '', outputIndex: Number(call.index) + (this.#textOutputIndex === undefined ? 0 : 1),
+      };
+      if (current.kind !== kind) throw new Error('Inconsistent upstream Tool call');
+      this.#nextOutputIndex = Math.max(this.#nextOutputIndex, current.outputIndex + 1);
+      if (typeof call.id === 'string') current.id = call.id;
+      const name = current.kind === 'function' ? call.function?.name : call.custom?.name;
+      const inputDelta = current.kind === 'function' ? call.function?.arguments : call.custom?.input;
+      if (typeof name === 'string') current.name = name;
+      if (typeof inputDelta === 'string') {
+        this.outputStarted = true;
+        current.input += inputDelta;
+        events.push({
+          type: current.kind === 'function' ? 'response.function_call_arguments.delta' : 'response.custom_tool_call_input.delta',
+          item_id: current.id ?? `tc_${Number(call.index)}`, output_index: current.outputIndex, delta: inputDelta,
+        });
+      }
+      this.#calls.set(Number(call.index), current);
+    }
+    return events;
+  }
+
+  finalize(): ResponseEvent[] {
+    const events: ResponseEvent[] = [];
+    const orderedOutput: Array<{ index: number; item: OutputItem }> = [];
+    if (this.outputText && this.#textOutputIndex !== undefined) orderedOutput.push({
+      index: this.#textOutputIndex,
+      item: { id: `msg_${this.#id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: this.outputText }] },
+    });
+    for (const [index, call] of [...this.#calls.entries()].sort(([left], [right]) => left - right)) {
+      if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
+      const resolved = call.kind === 'function' ? this.#aliases.aliasToRef.get(call.name) : undefined;
+      orderedOutput.push({
+        index: call.outputIndex,
+        item: call.kind === 'function'
+          ? {
+            id: call.id, type: 'function_call', status: 'completed', call_id: call.id,
+            name: resolved?.name ?? call.name, arguments: call.input,
+            ...(resolved ? { namespace: resolved.namespace } : {}),
+          }
+          : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: call.input },
+      });
+      events.push(call.kind === 'function'
+        ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
+        : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input });
+    }
+    this.output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
+    for (const [index, item] of this.output.entries()) {
+      events.push({ type: 'response.output_item.done', output_index: index, item });
+    }
+    return events;
+  }
+}
+
+type BuiltRequest = { upstreamBody: Record<string, unknown>; namespaceAliases: NamespaceAliases; model: string };
+
+export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool[], ancestors: StoredResponse[], input: InputItem[], degradeWebSearch: boolean, reasoningEffort: string | undefined): Result<BuiltRequest> => {
+  let chatTools: ReturnType<typeof toChatTools>;
+  let namespaceAliases: ReturnType<typeof buildNamespaceAliasMaps>;
+  let chatToolChoice: ReturnType<typeof toChatToolChoice> | 'auto' | undefined;
+  try {
+    chatTools = toChatTools(effectiveTools);
+    namespaceAliases = buildNamespaceAliasMaps(effectiveTools);
+    const forcedWebSearchChoice = payload.tool_choice !== undefined && typeof payload.tool_choice === 'object' && payload.tool_choice !== null
+      && (payload.tool_choice as { type?: unknown }).type === 'web_search';
+    const mappedToolChoice = toChatToolChoice(payload.tool_choice, effectiveTools);
+    if (mappedToolChoice === null) {
+      return { ok: false, error: { status: 400, message: 'tool_choice targets an unknown Tool Namespace function', code: 'unsupported_tools' } };
+    }
+    chatToolChoice = degradeWebSearch && forcedWebSearchChoice ? 'auto' : mappedToolChoice;
+  } catch {
+    return { ok: false, error: { status: 400, message: 'Tool Namespace aliases conflict', code: 'unsupported_tools' } };
+  }
+  const messages: ChatMessage[] = [
+    ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
+    ...ancestors.flatMap(toChatMessages),
+    ...toChatMessages({ id: '', model: '', input, tools: [], parallelToolCalls: false, output: [] }),
+  ];
+  const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
+  const parallelToolCalls = payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls);
+  const upstreamBody: Record<string, unknown> = {
+    model, stream: true, stream_options: { include_usage: true }, messages,
+    ...(chatTools.length ? { tools: chatTools } : {}),
+    ...(parallelToolCalls ? { parallel_tool_calls: true } : {}),
+    ...(chatToolChoice === undefined ? {} : { tool_choice: chatToolChoice }),
+    ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
+  };
+  return { ok: true, value: { upstreamBody, namespaceAliases, model } };
 };
