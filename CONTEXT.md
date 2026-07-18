@@ -29,6 +29,11 @@
 - **Production CLI**: 公开 npm 包 `openai-api-convert` 提供的可执行入口；由全局安装后的部署用户直接调用。
 - **Production Tarball**: npm 发布物中仅包含运行所需的 `dist/`、配置模板、README、LICENSE 与 package 元数据；不包含源码、测试或构建工具。
 - **Production Runtime**: 运行 Production CLI 的 Node.js `>=24` 环境。
+- **Development Runtime**: 仓库开发时由 `tsx` 直接执行 TypeScript 源码的本地运行方式；不改变 Production CLI 或发布物。
+- **Source Restart**: Development Runtime 监测到 TypeScript 源码变更后重启 Bridge 进程；不是保留进程状态的 HMR。
+- **Source Watch Scope**: Development Runtime 仅监测 `src/` 中的 TypeScript 源码；配置文件变更不触发重启，须由开发者手动重启。
+- **Development Configuration**: 仓库根目录的本地 `config.dev.yaml`；仅供 Development Runtime 使用且不提交。
+- **Development Command**: `npm run dev`；默认执行 `start --config config.dev.yaml`。
 - **Supported Platform**: Production CLI 正式支持 Linux 与 macOS；Windows 仅尽力运行，不承诺 Configuration Home Permissions。
 - **Service Supervisor**: 管理 Production CLI 前台进程的外部系统组件；Bridge CLI 不实现 daemon、重启或进程守护。
 - **Supervisor Example**: README 中的 systemd 或 launchd 参考配置；不属于 npm 包的安装或管理范围。

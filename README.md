@@ -28,6 +28,16 @@ openai-api-convert start --config /srv/bridge/config.yaml
 
 默认端口为 `8417`，只监听 `127.0.0.1`。配置变更需重启；YAML 不会被自动改写。POSIX 上默认目录为 `0700`、配置文件为 `0600`，配置权限过宽会拒绝启动。
 
+## 开发
+
+在仓库中直接运行源码：
+
+```sh
+npm run dev
+```
+
+`dev` 使用本地 `config.dev.yaml`。先从 `config.example.yaml` 复制并填入配置；`tsx` 监测 `src/` 中的 TypeScript 变更并重启 Bridge。配置文件不受监测，修改后手动重启。
+
 ## 生产部署
 
 使用反向代理对外转发 `/v1/responses`。`/healthz` 仅用于本机探针；`/readyz` 与 `/metrics` 要求 Bearer 鉴权。
