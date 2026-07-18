@@ -13,12 +13,14 @@
 - **Search Citation**: Hosted Web Search 消息文本上的 URL 注释；Completion 降级路径不产生引用。
 - **Web Search Request Controls**: `web_search` 工具配置及关联的 `tool_choice`、`include`；降级路径移除 `web_search` 并将强制 `web_search` 选择降为 `auto`。
 - **Reasoning Effort**: 下游 Responses 的 `reasoning.effort` 或兼容标量；`null` 表示未设置。Completion 上游映射为顶层 `reasoning_effort`。其它对象字段忽略；未知值拒绝。
-- **Parallel Tool Calling**: 同一 Response 中并行产生多个工具调用的语义；不得串行化替代。
+- **Parallel Tool Calling**: 同一 Response 的同一工具轮次中并行产生多个工具调用的语义；不得串行化替代。真实预检要求两个调用以同一次双输出续接。
 - **Attempt**: 针对单个 Response 的一次上游调用记录；不参与会话重建。
 - **Stream Event**: 向客户端发出的、带单调序号的 Responses 语义 SSE 事件。
 - **Stream Event Sink**: Failover Policy Execution 使用的 Stream Event 输出 seam。生产 adapter 持久化 Output Item 并发送事件；测试 adapter 仅记录事件；Output Item 必须先于对应 `response.output_item.done` 记录；终态操作原子写入 Response 终态、终态 Stream Event 与最终 Attempt。
 - **Stream Translator**: Completion 上游 SSE chunk 流到 Responses Stream Event 的纯协议转换；产出有序下游事件与 Output Item，不持有 HTTP 响应或 State Store。与正向（Responses 请求 -> Chat Completions body）翻译对偶。
 - **Compatibility Fixture**: 可重复的脚本化上游交互，连同对 Bridge 可观察结果的预期，用于验证协议与故障契约。
+- **Direct Responses Probe**: 由发布预检测试 harness 直接发往 Bridge 的真实 Responses 请求；它控制工具声明与工具输出续接，用于验证真实 Completion 上游的工具协议，而非验证 Codex 的工具选择策略。
+- **Real Smoke Preflight**: 使用部署凭据、真实 Completion 上游和真实 Codex CLI 的环境相关发布阻塞预检；覆盖直连 Responses、Function Tool 单调用与并行调用及其续接，Hosted Web Search 仅验证降级语义。
 - **Codex Integration Gate**: 对已声明的 Codex 调用路径，Compatibility Fixture 与真实 Codex CLI smoke 均通过且每次产生语义 `response.completed`、无协议错误和无伪造 Hosted Web Search 调用的发布门禁；它不承诺外部模型或网络永不发生瞬态故障。
 - **Codex Native Tool Loop**: 真实 Codex CLI 在隔离临时工作目录中发起一次只读 `exec_command` 函数调用、提交工具结果并完成续接的调用路径；它验证 Codex 工具声明与结果回传的端到端协议。`apps` 与 `multi_agent` 保持禁用，不属于此路径或 Bridge 的支持承诺。
 - **Codex Smoke Evidence**: Codex Integration Gate 的稳定验收信号：函数调用与工具结果续接、每轮唯一的 `response.completed`、无 `response.failed` / `response.incomplete` 及无非 Responses SSE；不以模型生成正文或调用 ID 为验收依据。
