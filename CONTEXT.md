@@ -29,4 +29,6 @@
 - **State Capacity**: SQLite 状态库硬上限为 10 GiB；达到 8 GiB 时清理最旧的可删终态状态，无法回收时拒绝新请求。
 - **State Cleanup**: 启动时及每小时清理；仅整链删除超过保留窗口的终态状态，容量回收同样按最旧可删链进行，绝不删除进行中状态。
 - **State Capacity Rejection**: 状态库满 10 GiB 且同步清理无可回收状态时，新建请求以可重试的 `503 state_store_capacity_exceeded` 失败，且不得创建 Response、幂等记录或 Attempt；进行中请求继续完成。
-- **State Cleanup Observability**: 每次清理记录起止时间、删除链数、回收字节数与失败原因；暴露当前状态库字节数和容量拒绝计数，且不得记录 Response 内容或密钥。
+- **State Cleanup Observability**: 每次清理记录起止时间、删除链数、回收字节数与失败原因；暴露当前状态库字节数和容量拒绝计数，且不得记录 Response 内容或密钥。与 Traffic Log 分离：本轨始终不记交互正文。
+- **Traffic Log**: 上下游四跳交互的可观测记录（下游入、上游出、上游回、下游出），含 failover 的每次 Attempt；完整 body 与 SSE 仅在 `debug` 级别写入；密钥始终脱敏。
+- **Log Retention**: Traffic Log 文件保留策略，默认 7 天，由成熟日志框架执行轮转与删除；独立于 Retention Policy 与 State Cleanup。默认目录为 State Store 同级的 `logs/`。
