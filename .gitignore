@@ -68,6 +68,7 @@ out/
 .env.*.local
 config.yaml
 config.dev.yaml
+config.test.yaml
 
 # npm cache directory
 .npm
