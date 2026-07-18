@@ -88,14 +88,12 @@ test('CLI logs the actual loopback address and port after startup', async () => 
   });
   try {
     const startupLogs = output().split('\n')
-      .filter((line) => line.startsWith('{'))
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((entry) => entry.event === 'bridge_started');
+      .filter((line) => line.includes('INFO [bridge] bridge_started'));
     assert.equal(startupLogs.length, 1);
     const [startupLog] = startupLogs;
-    assert.equal(startupLog.level, 'info');
-    assert.equal(startupLog.address, '127.0.0.1');
-    assert.equal(startupLog.port, port);
+    assert.match(startupLog, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z INFO \[bridge\] bridge_started\b/);
+    assert.match(startupLog, /\baddress=127\.0\.0\.1\b/);
+    assert.match(startupLog, new RegExp(`\\bport=${port}\\b`));
     const ready = await fetch(`http://127.0.0.1:${port}/readyz`, { headers: { authorization: 'Bearer yaml-key' } });
     assert.equal(ready.status, 503);
   } finally {
