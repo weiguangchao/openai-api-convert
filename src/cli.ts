@@ -49,7 +49,6 @@ export const runCli = async (arguments_ = process.argv.slice(2)) => {
   const configPath = parseStartArguments(arguments_);
   if (await bootstrap(configPath, configPath === DEFAULT_CONFIGURATION_PATH)) return;
   const bridge = await startBridge(await loadBridgeConfiguration(configPath));
-  bridge.log('info', 'bridge_started');
   let stopping = false;
   const shutdown = () => {
     if (stopping) return;

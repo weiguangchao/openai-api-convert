@@ -39,7 +39,7 @@ const startConfiguredBridge = async (configPath: string, env?: NodeJS.ProcessEnv
       reject(new Error(`Bridge exited before startup (${code}): ${output}`));
     });
   });
-  return child;
+  return { child, output: () => output };
 };
 
 const runRejectedConfiguration = async (source: string) => {
@@ -67,7 +67,7 @@ const runRejectedConfiguration = async (source: string) => {
   }
 };
 
-test('CLI starts from config.yaml and ignores legacy environment configuration', async () => {
+test('CLI logs the actual loopback address and port after startup', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
   const port = await reservePort();
   await writeFile(join(dir, 'config.yaml'), [
@@ -80,13 +80,22 @@ test('CLI starts from config.yaml and ignores legacy environment configuration',
     '',
   ].join('\n'));
   await chmod(join(dir, 'config.yaml'), 0o600);
-  const child = await startConfiguredBridge(join(dir, 'config.yaml'), {
+  const { child, output } = await startConfiguredBridge(join(dir, 'config.yaml'), {
       ...process.env,
       BRIDGE_API_KEY: 'environment-key',
       UPSTREAM_POOL: '[]',
       STATE_STORE_PATH: join(dir, 'environment.db'),
   });
   try {
+    const startupLogs = output().split('\n')
+      .filter((line) => line.startsWith('{'))
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.event === 'bridge_started');
+    assert.equal(startupLogs.length, 1);
+    const [startupLog] = startupLogs;
+    assert.equal(startupLog.level, 'info');
+    assert.equal(startupLog.address, '127.0.0.1');
+    assert.equal(startupLog.port, port);
     const ready = await fetch(`http://127.0.0.1:${port}/readyz`, { headers: { authorization: 'Bearer yaml-key' } });
     assert.equal(ready.status, 503);
   } finally {
@@ -290,7 +299,7 @@ test('CLI writes Traffic Log files to the configured logging.path', async () => 
     '',
   ].join('\n'));
   await chmod(join(dir, 'config.yaml'), 0o600);
-  const child = await startConfiguredBridge(join(dir, 'config.yaml'));
+  const { child } = await startConfiguredBridge(join(dir, 'config.yaml'));
   try {
     const logFiles = await readdir(logPath);
     assert.ok(logFiles.length > 0, 'expected log files under configured logging.path');

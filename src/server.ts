@@ -98,6 +98,7 @@ export const startBridge = async (options: BridgeOptions): Promise<RunningBridge
     await new Promise<void>((resolve, reject) => server!.once('error', reject).listen(options.port ?? 0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('Bridge did not bind a TCP port');
+    logging.log('info', 'bridge_started', { address: address.address, port: address.port });
     return {
       url: `http://127.0.0.1:${address.port}`,
       state,
