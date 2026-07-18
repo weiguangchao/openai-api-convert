@@ -82,6 +82,17 @@ export type Metrics = {
   upstreamSwitches: number;
 };
 
+export type AppError = { status: number; message: string; code: string };
+export type Result<T> = { ok: true; value: T } | { ok: false; error: AppError };
+
+export type BridgeLogger = { log: BridgeLog; level: LogLevel; close: () => Promise<void> };
+export type RequestContext = { options: BridgeOptions; state: StateStore; logging: BridgeLogger; metrics: Metrics };
+export type ResponseScope = { responseId: string | undefined };
+export type ResponsesPayload = {
+  stream?: unknown; input?: unknown; model?: unknown; tools?: unknown; previous_response_id?: unknown; parallel_tool_calls?: unknown;
+  tool_choice?: unknown; include?: unknown; reasoning?: unknown;
+};
+
 export type RunningBridge = {
   url: string;
   state: Pick<StateStore, 'events' | 'responses' | 'attempts' | 'attemptDetails' | 'observability'>;

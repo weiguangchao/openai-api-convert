@@ -1,0 +1,33 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { StreamTranslator, buildNamespaceAliasMaps } from '../src/adapter.ts';
+
+const emptyAliases = () => buildNamespaceAliasMaps([]);
+const chunk = (delta: Record<string, unknown>) => JSON.stringify({ choices: [{ delta }] });
+
+test('StreamTranslator rejects a tool call with a non-integer index', () => {
+  const t = new StreamTranslator('resp_x', emptyAliases());
+  assert.throws(() => t.feed(chunk({ tool_calls: [{ index: 1.5, type: 'function' }] })), /Invalid upstream Tool call/);
+});
+
+test('StreamTranslator rejects a tool call with a negative index', () => {
+  const t = new StreamTranslator('resp_x', emptyAliases());
+  assert.throws(() => t.feed(chunk({ tool_calls: [{ index: -1, type: 'function' }] })), /Invalid upstream Tool call/);
+});
+
+test('StreamTranslator rejects a tool call with an invalid type', () => {
+  const t = new StreamTranslator('resp_x', emptyAliases());
+  assert.throws(() => t.feed(chunk({ tool_calls: [{ index: 0, type: 'other' }] })), /Invalid upstream Tool call/);
+});
+
+test('StreamTranslator rejects an inconsistent tool call kind within the same index', () => {
+  const t = new StreamTranslator('resp_x', emptyAliases());
+  t.feed(chunk({ tool_calls: [{ index: 0, type: 'function' }] }));
+  assert.throws(() => t.feed(chunk({ tool_calls: [{ index: 0, type: 'custom' }] })), /Inconsistent upstream Tool call/);
+});
+
+test('StreamTranslator rejects an incomplete tool call at finalize', () => {
+  const t = new StreamTranslator('resp_x', emptyAliases());
+  t.feed(chunk({ tool_calls: [{ index: 0, type: 'function', function: { arguments: '{}' } }] }));
+  assert.throws(() => t.finalize(), /Incomplete upstream Tool call/);
+});

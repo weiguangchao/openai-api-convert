@@ -16,6 +16,7 @@
 - **Parallel Tool Calling**: 同一 Response 中并行产生多个工具调用的语义；不得串行化替代。
 - **Attempt**: 针对单个 Response 的一次上游调用记录；不参与会话重建。
 - **Stream Event**: 向客户端发出的、带单调序号的 Responses 语义 SSE 事件。
+- **Stream Translator**: Completion 上游 SSE chunk 流到 Responses Stream Event 的纯协议转换；产出有序下游事件与 Output Item，不持有 HTTP 响应或 State Store。与正向（Responses 请求 -> Chat Completions body）翻译对偶。
 - **Compatibility Fixture**: 可重复的脚本化上游交互，连同对 Bridge 可观察结果的预期，用于验证协议与故障契约。
 - **Service Runtime**: Node.js + TypeScript。
 - **Bridge Configuration**: 部署方持有的单个 YAML 配置，声明 Bridge 认证、Upstream Pool 与运行策略；不从服务进程环境读取配置。
