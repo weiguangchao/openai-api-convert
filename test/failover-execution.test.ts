@@ -11,6 +11,7 @@ import {
 import type { AttemptCompletion, OutputItem, ResponseEvent, Upstream } from '../src/types.js';
 
 const upstream = (name: string): Upstream => ({ baseUrl: `https://${name}.example`, apiKey: `${name}-key` });
+const noCapabilities = { functionTools: false, customTools: false, parallelToolCalls: false };
 const textStream = (text: string) => async function* (): AsyncIterable<UpstreamStreamEvent> {
   yield {
     kind: 'event', outputStarted: true, outputText: text,
@@ -86,7 +87,7 @@ const run = (scripts: Script[], sink = new RecordingSink(), signal?: AbortSignal
   sink,
   result: executeFailover({
     responseId: 'resp_test', model: 'test-model', upstreamBody: { stream: true },
-    upstreams: [upstream('primary'), upstream('fallback')], firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
+    upstreams: [upstream('primary'), upstream('fallback')], needs: noCapabilities, firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
   }, new ScriptedUpstreamStream(scripts), sink, signal),
 });
 
@@ -117,7 +118,7 @@ test('Failover Policy Execution retries an unavailable Upstream before the first
 
   assert.deepEqual(await executeFailover({
     responseId: 'resp_test', model: 'test-model', upstreamBody: {},
-    upstreams: [upstream('primary'), upstream('fallback')], firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
+    upstreams: [upstream('primary'), upstream('fallback')], needs: noCapabilities, firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
   }, stream, sink), { kind: 'completed' });
   assert.deepEqual(stream.calls, ['https://primary.example', 'https://fallback.example']);
   assert.deepEqual(sink.attempts, [{ id: 1, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' }]);
@@ -131,6 +132,40 @@ test('Failover Policy Execution returns a pre-output rejection without Stream Ev
   assert.deepEqual(sink.events, []);
   assert.deepEqual(sink.attempts, [{ id: 1, result: 'failed', preOutputFailure: true, errorCode: 'upstream_rejected' }]);
   assert.equal(sink.terminalRecord, undefined);
+});
+
+test('Failover Policy Execution retries when a heartbeat arrives before any semantic Stream Event', async () => {
+  const stream = new ScriptedUpstreamStream([
+    { kind: 'stream', events: () => (async function* (): AsyncIterable<UpstreamStreamEvent> {
+      yield { kind: 'heartbeat' };
+      throw new Error('malformed upstream frame');
+    })() },
+    { kind: 'stream', events: () => textStream('fallback')() },
+  ]);
+  const sink = new RecordingSink();
+
+  assert.deepEqual(await executeFailover({
+    responseId: 'resp_test', model: 'test-model', upstreamBody: {},
+    upstreams: [upstream('primary'), upstream('fallback')], needs: noCapabilities, firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
+  }, stream, sink), { kind: 'completed' });
+  assert.deepEqual(stream.calls, ['https://primary.example', 'https://fallback.example']);
+  assert.deepEqual(sink.attempts, [{ id: 1, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' }]);
+  assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.output_item.done']);
+});
+
+test('Failover Policy Execution rejects incompatible pools without creating an Attempt', async () => {
+  const stream = new ScriptedUpstreamStream([]);
+  const sink = new RecordingSink();
+
+  assert.deepEqual(await executeFailover({
+    responseId: 'resp_test', model: 'test-model', upstreamBody: {},
+    upstreams: [upstream('primary')],
+    needs: { functionTools: true, customTools: false, parallelToolCalls: false },
+    firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
+  }, stream, sink), { kind: 'pre_output_failure', reason: 'unsupported_capabilities' });
+  assert.deepEqual(stream.calls, []);
+  assert.deepEqual(sink.attempts, []);
+  assert.deepEqual(sink.events, []);
 });
 
 test('Failover Policy Execution returns unavailable when every upstream fails before the first Stream Event', async () => {
@@ -159,7 +194,7 @@ test('Failover Policy Execution fails after the first Stream Event without switc
 
   assert.deepEqual(await executeFailover({
     responseId: 'resp_test', model: 'test-model', upstreamBody: {},
-    upstreams: [upstream('primary'), upstream('fallback')], firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
+    upstreams: [upstream('primary'), upstream('fallback')], needs: noCapabilities, firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
   }, stream, sink), { kind: 'failed' });
   assert.deepEqual(stream.calls, ['https://primary.example']);
   assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.output_text.delta']);
