@@ -423,17 +423,16 @@ test('toChatMessages: no text and no tool_calls yields no assistant message', ()
 // ---- parseReasoningEffort / REASONING_EFFORTS ----
 
 test('REASONING_EFFORTS contains the valid effort set', () => {
-  assert.deepEqual([...REASONING_EFFORTS].sort(), ['high', 'low', 'max', 'medium', 'minimal', 'none', 'xhigh']);
+  assert.deepEqual([...REASONING_EFFORTS].sort(), ['high', 'low', 'max', 'medium', 'minimal', 'none', 'ultra', 'xhigh']);
 });
 
-test('parseReasoningEffort: undefined returns undefined', () => {
+test('parseReasoningEffort: undefined and null return undefined', () => {
   assert.strictEqual(parseReasoningEffort(undefined), undefined);
+  assert.strictEqual(parseReasoningEffort(null), undefined);
 });
 
-test('parseReasoningEffort: null, array, and non-object return null', () => {
-  assert.strictEqual(parseReasoningEffort(null), null);
+test('parseReasoningEffort: array and non-string scalar return null', () => {
   assert.strictEqual(parseReasoningEffort([]), null);
-  assert.strictEqual(parseReasoningEffort('high'), null);
   assert.strictEqual(parseReasoningEffort(42), null);
 });
 
@@ -443,8 +442,14 @@ test('parseReasoningEffort: object without effort or effort undefined returns un
 });
 
 test('parseReasoningEffort: valid effort returns the effort', () => {
-  for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+  for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
     assert.strictEqual(parseReasoningEffort({ effort }), effort);
+  }
+});
+
+test('parseReasoningEffort: valid scalar effort returns the effort', () => {
+  for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
+    assert.strictEqual(parseReasoningEffort(effort), effort);
   }
 });
 

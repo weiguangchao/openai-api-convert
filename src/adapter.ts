@@ -232,10 +232,11 @@ export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   return messages;
 };
 
-export const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+export const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 export const parseReasoningEffort = (reasoning: unknown): string | undefined | null => {
-  if (reasoning === undefined) return undefined;
-  if (typeof reasoning !== 'object' || reasoning === null || Array.isArray(reasoning)) return null;
+  if (reasoning === undefined || reasoning === null) return undefined;
+  if (typeof reasoning === 'string') return REASONING_EFFORTS.has(reasoning) ? reasoning : null;
+  if (typeof reasoning !== 'object' || Array.isArray(reasoning)) return null;
   const effort = (reasoning as { effort?: unknown }).effort;
   if (effort === undefined) return undefined;
   return typeof effort === 'string' && REASONING_EFFORTS.has(effort) ? effort : null;

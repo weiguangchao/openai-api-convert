@@ -1441,6 +1441,20 @@ test('maps Reasoning Effort to upstream reasoning_effort', async () => {
     assert.equal(response.status, 200);
     assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
     assert.equal((upstream.requests[0] as { reasoning_effort?: string }).reasoning_effort, 'high');
+    const scalarResponse = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: 'max' }),
+    });
+    assert.equal(scalarResponse.status, 200);
+    assert.equal(sseTypes(await scalarResponse.text()).at(-1)?.type, 'response.completed');
+    assert.equal((upstream.requests[1] as { reasoning_effort?: string }).reasoning_effort, 'max');
+    const ultraResponse = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'ultra' } }),
+    });
+    assert.equal(ultraResponse.status, 200);
+    assert.equal(sseTypes(await ultraResponse.text()).at(-1)?.type, 'response.completed');
+    assert.equal((upstream.requests[2] as { reasoning_effort?: string }).reasoning_effort, 'ultra');
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -1470,8 +1484,15 @@ test('omits upstream reasoning_effort when Reasoning Effort is absent', async ()
     });
     assert.equal(ignoredFields.status, 200);
     await ignoredFields.text();
+    const nullReasoning = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: null }),
+    });
+    assert.equal(nullReasoning.status, 200);
+    await nullReasoning.text();
     assert.equal('reasoning_effort' in (upstream.requests[0] as object), false);
     assert.equal('reasoning_effort' in (upstream.requests[1] as object), false);
+    assert.equal('reasoning_effort' in (upstream.requests[2] as object), false);
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -1490,13 +1511,13 @@ test('rejects invalid Reasoning Effort before creating Response state', async ()
       statePath: join(dir, 'state.db'),
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'bad-effort' };
-    const nonObject = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: 'high' }),
+    const invalidScalar = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: 'invalid' }),
     });
-    assert.equal(nonObject.status, 400);
-    assert.equal((await nonObject.json() as { error: { code: string } }).error.code, 'invalid_reasoning');
+    assert.equal(invalidScalar.status, 400);
+    assert.equal((await invalidScalar.json() as { error: { code: string } }).error.code, 'invalid_reasoning');
     const badEffort = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'ultra' } }),
+      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'invalid' } }),
     });
     assert.equal(badEffort.status, 400);
     assert.equal((await badEffort.json() as { error: { code: string } }).error.code, 'invalid_reasoning');
