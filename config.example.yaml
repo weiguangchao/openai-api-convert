@@ -14,3 +14,7 @@ statePolicy:
   attemptRetentionDays: 7
   cleanupThresholdBytes: 8589934592
   hardLimitBytes: 10737418240
+logging:
+  level: info
+  # path defaults to dirname(statePath)/logs/
+  retentionDays: 7
