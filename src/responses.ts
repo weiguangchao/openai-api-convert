@@ -106,6 +106,9 @@ const parseAndValidateRequest = async (ctx: RequestContext, request: IncomingMes
   if (payload.stream !== undefined && payload.stream !== true && payload.stream !== false) {
     return { ok: false, error: { status: 400, message: 'stream must be a boolean', code: 'invalid_stream' } };
   }
+  if (typeof payload.model !== 'string' || !payload.model) {
+    return { ok: false, error: { status: 400, message: 'model must be a non-empty string', code: 'invalid_model' } };
+  }
   const reasoningEffort = parseReasoningEffort(payload.reasoning);
   if (reasoningEffort === null) {
     return { ok: false, error: { status: 400, message: 'Invalid reasoning', code: 'invalid_reasoning' } };
