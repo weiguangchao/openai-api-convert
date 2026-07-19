@@ -18,7 +18,7 @@ const textStream = (text: string) => async function* (): AsyncIterable<UpstreamS
     event: { type: 'response.output_text.delta', item_id: 'msg_resp_test', output_index: 0, content_index: 0, delta: text },
   };
   yield {
-    kind: 'completed', eventsBeforeOutputItems: [], outputText: text,
+    kind: 'completed', status: 'completed', usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } }, eventsBeforeOutputItems: [], outputText: text,
     output: [{ id: 'msg_resp_test', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text }] }],
   };
 };
@@ -95,14 +95,17 @@ test('Failover Policy Execution completes through scripted Upstream Stream and r
   const { sink, result } = run([{ kind: 'stream', events: () => textStream('Hello')() }]);
 
   assert.deepEqual(await result, { kind: 'completed' });
-  assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.output_item.done']);
+  assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_text.delta', 'response.output_item.done']);
   assert.deepEqual(sink.output, [{
     id: 'msg_resp_test', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'Hello' }],
   }]);
   assert.equal(sink.operations.indexOf('persist:msg_resp_test') < sink.operations.indexOf('emit:response.output_item.done'), true);
   assert.deepEqual(sink.terminalRecord, {
     status: 'completed',
-    event: { type: 'response.completed', response: { id: 'resp_test', object: 'response', status: 'completed', model: 'test-model', output: sink.output } },
+    event: { type: 'response.completed', response: {
+      id: 'resp_test', object: 'response', status: 'completed', model: 'test-model', output: sink.output,
+      usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+    } },
     attempt: { id: 1, result: 'completed', preOutputFailure: false },
   });
   assert.equal(sink.operations.includes('emit:response.completed'), false, 'terminal event and final Attempt are one atomic sink operation');
@@ -150,7 +153,7 @@ test('Failover Policy Execution retries when a heartbeat arrives before any sema
   }, stream, sink), { kind: 'completed' });
   assert.deepEqual(stream.calls, ['https://primary.example', 'https://fallback.example']);
   assert.deepEqual(sink.attempts, [{ id: 1, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' }]);
-  assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.output_item.done']);
+  assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_text.delta', 'response.output_item.done']);
 });
 
 test('Failover Policy Execution rejects incompatible pools without creating an Attempt', async () => {
@@ -197,9 +200,60 @@ test('Failover Policy Execution fails after the first Stream Event without switc
     upstreams: [upstream('primary'), upstream('fallback')], needs: noCapabilities, firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
   }, stream, sink), { kind: 'failed' });
   assert.deepEqual(stream.calls, ['https://primary.example']);
-  assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.output_text.delta']);
+  assert.deepEqual(sink.events.map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_text.delta']);
   assert.equal(sink.terminalRecord?.status, 'failed');
   assert.deepEqual(sink.terminalRecord?.attempt, { id: 1, result: 'failed', preOutputFailure: false, errorCode: 'upstream_stream_failed' });
+});
+
+test('Failover Policy Execution retains a normalized SSE error and terminal usage', async () => {
+  const stream = new ScriptedUpstreamStream([
+    { kind: 'stream', events: () => (async function* (): AsyncIterable<UpstreamStreamEvent> {
+      yield {
+        kind: 'event', outputStarted: true, outputText: 'partial',
+        usage: { input_tokens: 4, output_tokens: 1, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
+        event: { type: 'response.output_text.delta', item_id: 'msg_resp_test', output_index: 0, content_index: 0, delta: 'partial' },
+      };
+      yield {
+        kind: 'failed', outputText: 'partial', usage: { input_tokens: 4, output_tokens: 1, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
+        error: { status: 502, message: 'Bad upstream event', type: 'upstream_error', param: 'tools', code: 'bad_event' },
+      };
+    })() },
+  ]);
+  const sink = new RecordingSink();
+
+  assert.deepEqual(await executeFailover({
+    responseId: 'resp_test', model: 'test-model', upstreamBody: {},
+    upstreams: [upstream('primary')], needs: noCapabilities, firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
+  }, stream, sink), { kind: 'failed' });
+  assert.deepEqual((sink.terminalRecord?.event as unknown as { response: { error: unknown; usage: unknown } }).response, {
+    id: 'resp_test', object: 'response', status: 'failed',
+    usage: { input_tokens: 4, output_tokens: 1, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
+    error: { message: 'Bad upstream event', type: 'upstream_error', param: 'tools', code: 'bad_event' },
+  });
+  assert.deepEqual(sink.terminalRecord?.attempt, { id: 1, result: 'failed', preOutputFailure: false, errorCode: 'bad_event' });
+});
+
+test('Failover Policy Execution keeps a pre-output SSE error as a pre-output failure', async () => {
+  const stream = new ScriptedUpstreamStream([
+    { kind: 'stream', events: () => (async function* (): AsyncIterable<UpstreamStreamEvent> {
+      yield {
+        kind: 'failed', outputText: '', usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+        error: { status: 502, message: 'Bad upstream event', type: 'upstream_error', param: null, code: 'bad_event' },
+      };
+    })() },
+  ]);
+  const sink = new RecordingSink();
+
+  assert.deepEqual(await executeFailover({
+    responseId: 'resp_test', model: 'test-model', upstreamBody: {},
+    upstreams: [upstream('primary')], needs: noCapabilities, firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
+  }, stream, sink), {
+    kind: 'pre_output_failure', reason: 'rejected', status: 502,
+    error: { status: 502, message: 'Bad upstream event', type: 'upstream_error', param: null, code: 'bad_event' },
+  });
+  assert.deepEqual(sink.events, []);
+  assert.deepEqual(sink.attempts, [{ id: 1, result: 'failed', preOutputFailure: true, errorCode: 'bad_event' }]);
+  assert.equal(sink.terminalRecord, undefined);
 });
 
 test('Failover Policy Execution cancels the active upstream and terminates the Response as cancelled', async () => {

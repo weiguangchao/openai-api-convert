@@ -793,7 +793,7 @@ test('bridges a text stream into ordered Responses SSE', async () => {
     const body = await response.text();
     const events = sseTypes(body);
     assert.deepEqual(events.map(({ type }) => type), [
-      'response.created', 'response.output_text.delta', 'response.output_text.delta',
+      'response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_text.delta',
       'response.output_item.done', 'response.completed',
     ]);
     assert.equal(body.includes('chat.completion.chunk'), false);
@@ -848,6 +848,7 @@ test('bridges structured non-stream Responses input into a persisted JSON Respon
     assert.match(firstBody.id, /^resp_/);
     assert.deepEqual({ ...firstBody, id: '<local-response-id>' }, {
       id: '<local-response-id>', object: 'response', status: 'completed', model: 'o3',
+      usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
       output: [{
         id: `msg_${firstBody.id}`, type: 'message', status: 'completed', role: 'assistant',
         content: [{ type: 'output_text', text: 'Done.' }],
@@ -1973,7 +1974,7 @@ test('idempotency-in-progress replays persisted events then follows the Response
     const request = { stream: true, input: 'Hello' };
     const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
     for (let tries = 0; bridge.state.events().length < 2 && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta']);
+    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta']);
     const second = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
     upstream.release();
     const [firstBody, secondBody] = await Promise.all([first.text(), second.text()]);
@@ -2097,7 +2098,7 @@ test('failure-after-output Compatibility Fixture fails without another Attempt o
       body: JSON.stringify({ stream: true, input: 'Hello' }),
     });
     const events = sseTypes(await response.text());
-    assert.deepEqual(events.map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.failed']);
+    assert.deepEqual(events.map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.failed']);
     assert.equal(primary.requests.length, 1);
     assert.equal(fallback.requests.length, 0);
     assert.equal(bridge.state.attempts().length, 1);
@@ -2230,7 +2231,7 @@ test('client disconnect aborts the active Attempt and cancels the Response', asy
     await assert.rejects(() => response.text());
     for (let tries = 0; bridge.state.responses()[0]?.status !== 'cancelled' && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.deepEqual(bridge.state.responses(), [{ status: 'cancelled', outputText: 'first ' }]);
-    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.cancelled']);
+    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.cancelled']);
     assert.equal(bridge.state.attempts().length, 1);
     assert.equal(captured.lines.some((line) => line.includes('http_request_completed') && line.includes('error_code=client_disconnected')), true);
   } finally {
@@ -2677,6 +2678,102 @@ test('Codex mixed-tools Compatibility Fixture rejects illegal Tool Namespace bef
     assert.equal(response.status, 400);
     assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
     assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('terminal Compatibility Fixture maps multiline LF SSE length and usage to an incomplete Response', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{
+    frames: [
+      'event: message\ndata: {"choices":[\ndata: {"delta":{"content":"Hello"},"finish_reason":"length"}]}\n\n',
+      'data: {"usage":{"prompt_tokens":2,"completion_tokens":3}}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ stream: true, input: 'hello' }),
+    });
+    assert.equal(response.status, 200);
+    const events = sseTypes(await response.text()) as Array<{ type: string; response?: { status?: string; usage?: unknown; incomplete_details?: unknown } }>;
+    assert.deepEqual(events.map(({ type }) => type), [
+      'response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_item.done', 'response.incomplete',
+    ]);
+    const terminal = events.at(-1)?.response;
+    assert.equal(terminal?.status, 'incomplete');
+    assert.deepEqual(terminal?.usage, { input_tokens: 2, output_tokens: 3, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } });
+    assert.deepEqual(terminal?.incomplete_details, { reason: 'max_output_tokens' });
+    assert.deepEqual(bridge.state.responses(), [{ status: 'incomplete', outputText: 'Hello' }]);
+    assert.deepEqual(upstream.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'hello' }],
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Completion length persists default usage and does not reuse its Idempotency-Key as SSE', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ choices: [{ message: { content: 'Cut short' }, finish_reason: 'length' }] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'separate-delivery' };
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ stream: false, input: 'hello' }) });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { id: string; status: string; incomplete_details?: unknown; usage?: unknown; output: unknown[] };
+    assert.deepEqual({ ...body, id: '<local-response-id>' }, {
+      id: '<local-response-id>', object: 'response', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
+      usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+      model: 'gpt-4.1', output: [{
+        id: `msg_${body.id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'Cut short' }],
+      }],
+    });
+    const stream = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'hello' }) });
+    assert.equal(stream.status, 409);
+    assert.equal((await stream.json() as { error: { code: string } }).error.code, 'idempotency_key_conflict');
+    assert.equal(upstream.requests.length, 1);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('SSE Compatibility Fixture preserves normalized errors before and after semantic output', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([
+    { frames: ['event: error\ndata: {"error":{"message":"Invalid tool","type":"upstream_error","param":"tools","code":"invalid_tool"}}\n\n'] },
+    { frames: ['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', 'event: error\ndata: {"error":{"message":"Interrupted","type":"upstream_error","param":null,"code":"stream_interrupted"}}\n\n'] },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const beforeOutput = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'first' }) });
+    assert.equal(beforeOutput.status, 502);
+    assert.deepEqual(await beforeOutput.json(), {
+      error: { message: 'Invalid tool', type: 'upstream_error', param: 'tools', code: 'invalid_tool' },
+    });
+    const afterOutput = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'second' }) });
+    assert.equal(afterOutput.status, 200);
+    const terminal = sseTypes(await afterOutput.text()).at(-1) as unknown as { type: string; response: { error: unknown } };
+    assert.equal(terminal.type, 'response.failed');
+    assert.deepEqual(terminal.response.error, { message: 'Interrupted', type: 'upstream_error', param: null, code: 'stream_interrupted' });
   } finally {
     await bridge?.close();
     await upstream.close();

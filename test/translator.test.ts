@@ -31,3 +31,15 @@ test('StreamTranslator rejects an incomplete tool call at finalize', () => {
   t.feed(chunk({ tool_calls: [{ index: 0, type: 'function', function: { arguments: '{}' } }] }));
   assert.throws(() => t.finalize(), /Incomplete upstream Tool call/);
 });
+
+test('StreamTranslator emits an added item before text delta and retains a later usage frame', () => {
+  const t = new StreamTranslator('resp_x', emptyAliases());
+  assert.deepEqual(t.feed(JSON.stringify({
+    choices: [{ delta: { content: 'Hello' }, finish_reason: 'length' }],
+  })).map(({ type }) => type), ['response.output_item.added', 'response.output_text.delta']);
+  t.feed(JSON.stringify({ usage: { prompt_tokens: 2, completion_tokens: 3, cache_creation_input_tokens: 1 } }));
+  assert.equal(t.finishReason, 'incomplete');
+  assert.deepEqual(t.usage, {
+    input_tokens: 2, output_tokens: 3, input_tokens_details: { cached_tokens: 0, cache_creation_tokens: 1 }, output_tokens_details: { reasoning_tokens: 0 },
+  });
+});
