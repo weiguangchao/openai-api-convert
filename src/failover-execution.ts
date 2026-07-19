@@ -82,7 +82,7 @@ export const executeFailover = async (
   let streamStarted = false;
   let attemptIndex = 0;
   let failedOutputText = '';
-  let failedUsage: ResponsesUsage = { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
+  let failedUsage: ResponsesUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
   let retryAttempt: AttemptCompletion | undefined;
 
   const cancel = (attempt: AttemptCompletion | undefined, outputText: string) => {

@@ -1,3 +1,3 @@
-# 固定 Codex 兼容版本
+# Codex 兼容版本
 
-真实 Codex 预检只支持 `codex-cli 0.144.5`，并在运行前校验版本。Codex 工具声明是 Bridge 的客户端协议边界；因此升级必须显式更新兼容样本并通过完整门禁，而非静默跟随任意已安装版本。
+真实 Codex 预检使用本地已安装的 `codex-cli`，运行前只校验它能报告版本，不再固定某个兼容版本。Codex 工具声明是 Bridge 的客户端协议边界；预检仍要求语义 `response.completed`、无协议错误且不伪造 Hosted Web Search 调用，但不以特定 CLI 版本作为门禁。

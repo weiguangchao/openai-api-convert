@@ -30,18 +30,6 @@ test('release smoke requires an explicit Release Preflight Model', async () => {
   }), /Release Preflight Model is required/);
 });
 
-test('release smoke rejects a Codex CLI version outside the pinned compatibility version', async () => {
-  await assert.rejects(() => runReleaseSmoke({
-    apiKey: 'smoke-bridge-key', model: 'smoke-model',
-    upstreams: [{
-      baseUrl: 'http://127.0.0.1:1', apiKey: 'smoke-upstream-key',
-      capabilities: { functionTools: true, parallelToolCalls: true },
-    }],
-    getCodexVersion: async () => 'codex-cli 0.145.0',
-    runCodex: async () => {},
-  }), /requires codex-cli 0\.144\.5/);
-});
-
 test('release smoke fails before opening a live connection when the complete preflight deadline has elapsed', async () => {
   await assert.rejects(() => runReleaseSmoke({
     apiKey: 'smoke-bridge-key', model: 'smoke-model', deadlineAt: Date.now() - 1,
@@ -57,7 +45,7 @@ test('release smoke fails before opening a live connection when the complete pre
 test('Codex Protocol Fixture completes a native exec_command loop through the Bridge', async () => {
   await runCodexProtocolFixture({
     model: 'smoke-model',
-    getCodexVersion: async () => 'codex-cli 0.144.5',
+    getCodexVersion: async () => 'codex-cli 0.144.6',
     runCodex: async (args, env, timeoutMs) => {
       assert.equal(timeoutMs, 180_000);
       const baseUrl = JSON.parse(args.find((argument) => argument.startsWith('model_providers.response-bridge-protocol-fixture.base_url='))!.split('=').slice(1).join('=')) as string;

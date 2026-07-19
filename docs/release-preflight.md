@@ -17,9 +17,9 @@
 
 | Layer | Required paths |
 | --- | --- |
-| Codex Protocol Fixture | Fixed `codex-cli 0.144.5`, a scripted Completion upstream, and a real `exec_command` call plus tool-result continuation |
+| Codex Protocol Fixture | The locally installed `codex-cli`, a scripted Completion upstream, and a real `exec_command` call plus tool-result continuation |
 | Live Direct Responses Probe | Text, Hosted Web Search degradation, single Function Tool continuation, and a parallel Function Tool continuation with both outputs |
-| Live Codex Smoke | Fixed `codex-cli 0.144.5` through the deployed Completion upstream: a baseline request and a request with built-in Web Search enabled |
+| Live Codex Smoke | The locally installed `codex-cli` through the deployed Completion upstream: a baseline request and a request with built-in Web Search enabled |
 
 The Protocol Fixture is deterministic and proves Codex's client-side tool protocol. The live paths prove the configured deployment integration, but do not require the model to choose a tool. All successful paths require the structural Codex Smoke Evidence; generated text and call IDs are not assertions.
 

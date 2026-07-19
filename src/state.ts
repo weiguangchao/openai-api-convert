@@ -18,7 +18,7 @@ export const GIB = 1024 ** 3;
 export const HOUR = 60 * 60 * 1000;
 export const DAY = 24 * HOUR;
 export const zeroResponsesUsage: ResponsesUsage = {
-  input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
+  input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
 };
 export const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
 export const defaultStatePolicy: ResolvedStatePolicy = {

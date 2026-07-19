@@ -371,9 +371,12 @@ export const toResponsesUsage = (usage: unknown): ResponsesUsage => {
   const inputDetails = source.prompt_tokens_details && typeof source.prompt_tokens_details === 'object' ? source.prompt_tokens_details as Record<string, unknown> : {};
   const outputDetails = source.completion_tokens_details && typeof source.completion_tokens_details === 'object' ? source.completion_tokens_details as Record<string, unknown> : {};
   const cacheCreationTokens = usageNumber(inputDetails.cache_creation_tokens ?? source.cache_creation_input_tokens);
+  const inputTokens = usageNumber(source.prompt_tokens ?? source.input_tokens);
+  const outputTokens = usageNumber(source.completion_tokens ?? source.output_tokens);
   return {
-    input_tokens: usageNumber(source.prompt_tokens ?? source.input_tokens),
-    output_tokens: usageNumber(source.completion_tokens ?? source.output_tokens),
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: usageNumber(source.total_tokens) || (inputTokens + outputTokens),
     input_tokens_details: {
       cached_tokens: usageNumber(inputDetails.cached_tokens ?? source.cache_read_input_tokens),
       ...(cacheCreationTokens ? { cache_creation_tokens: cacheCreationTokens } : {}),
