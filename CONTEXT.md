@@ -5,17 +5,35 @@
 - **MVP**: 可实施的首版设计，不含本次编码交付。
 - **Response Bridge**: 将 OpenAI Responses API 请求转换并转发为 Chat Completions 请求的服务。
 - **Response**: 一次已接受的规范请求及其不可变输入、输出项和终态。
+- **Response Identity**: Bridge 预先生成的本地不可变 `response.id`，是 Response Chain、幂等与重放的主键；上游 Chat completion id 不进入客户端协议或续接。
 - **Response Chain**: 由 `previous_response_id` 连接的 Response 链；MVP 的唯一会话模型。
-- **Output Item**: Response 输出中的有序规范项，包含 assistant 内容或工具调用。
-- **Custom Tool**: `type=custom` 的 Responses 工具；其自由格式输入与工具输出回传语义必须由上游原生保留。
-- **Tool Namespace**: `type=namespace` 的 Responses 工具分组；MVP 仅接受 Function 子工具。Completion 上游以可逆、合法、最长 64 字符的可读哈希别名扁平转发；客户端始终看到原始 namespace 与子工具 name。
-- **Hosted Web Search**: `type=web_search` 的 Responses 托管工具；上游仅为 Completion，一律降级：移除 `web_search`、注入不可用提示、强制选择降为 `auto`，且不伪造搜索调用、引用或结果。
+- **Model Forwarding**: 下游 Responses 的 `model` 原样传给每个候选 Completion 上游；Bridge 不维护模型映射、默认模型或静默替换。
+- **Structured Input**: Response Chain 中可重建的规范消息内容；支持 user、assistant、system、developer 的文本/refusal、图片、文件与音频。Completion 映射必须保留其结构，未知内容 part 明确以 `unsupported_input` 拒绝，绝不静默丢弃；显式 assistant 消息不是可猜测性删除的 echo。
+- **Instructions Prefix**: `instructions` 先于 Structured Input 转为 Chat 的 system 指令；developer 消息同样为 system，所有连续 system 指令折叠在消息头，避免系统约束混入 user、assistant 或 tool 历史。
+- **Token Ceiling Mapping**: `max_output_tokens` 在下游模型为 o 系列时映射为 `max_completion_tokens`，其他模型映射为 `max_tokens`；请求显式给出的 `max_tokens` 或 `max_completion_tokens` 原样透传并覆盖该映射。
+- **Non-streaming Response**: `stream:false` 时，Bridge 将 Chat 的普通完成结果转换为单个 Responses JSON Response，并持久化 Response、Output Item、终态与 Attempt；幂等命中返回同一 JSON，不向客户端伪造或重放 SSE。
+- **Request Control Passthrough**: 除模型、输入、工具和 Token Ceiling Mapping 外，Bridge 仅透传 CC Switch 允许的 Chat 控制字段；仅流式请求的 `stream_options` 与强制的 `include_usage: true` 合并，客户端不得关闭 usage；非流式请求省略 `stream_options`；未列入允许集的顶层字段不转发。
+- **Output Item**: Response 输出中的有序规范项，包含 assistant 内容或工具调用。混合 Reasoning Output、文本与并行工具调用时，在首次可观察时分配连续 slot；后续分片复用该 slot，终态按 slot 顺序完成。
+- **Custom Tool**: `type=custom` 的 Responses 工具；Completion 上游以带唯一必填字符串 `input` 的 Function proxy 表达，description 嵌入原始工具定义。反向转换优先读取 `{input:string}`；空、非 JSON、缺少或非字符串 input 时保留原始 arguments，绝不丢失自由格式输入。
+- **Tool Namespace**: `type=namespace` 的 Responses 工具分组；MVP 仅接受 Function 子工具。Completion 上游以 CC Switch 的 `namespace__name` 别名扁平转发，仅超出 64 字符时截断并附短哈希；Tool Context 校验碰撞，客户端始终看到原始 namespace 与子工具 name。
+- **Tool Search**: `type=tool_search` 的客户端执行工具发现协议；Completion 上游以固定 `tool_search` Function 代理。其 `tool_search_call` 与 `tool_search_output` 必须可逆映射，且 output 中加载的工具立即进入后续 Chat tool 集；它不等同于 Hosted Web Search。
+- **Tool Context**: 每个 Response 实际发送至 Completion 上游的可逆工具规格，记录 Chat function 名到原始 Function、Custom、Namespace 或 Tool Search 语义的映射；它与 Response Chain 一同持久化，续接不得根据当前请求的 tools 重新推导。
+- **Function Tool Schema Normalization**: Function Tool 接受嵌套 `function` 与直接字段两种 Responses 形态；仅在 Chat 代理载荷中将缺失、`null` 或非 object 的 `parameters` 规范为 object schema，原始下游定义与 Tool Context 不变。
+- **Direct Tool Continuation**: 工具输出仅可引用 `previous_response_id` 指向的直接前驱中未处理调用；无此前驱时仅接受同一 input 内调用与输出 `call_id` 成对的 Inline Tool Replay，不按全局 call_id 回退。
+- **Hosted Web Search**: `type=web_search` 的 Responses 托管工具；上游仅为 Completion，一律降级：移除 `web_search`、注入不可用提示，且不伪造搜索调用、引用或结果。若其强制选择降级后仍有 Chat tools，选择改为 `auto`；若已无 Chat tools，省略 `tool_choice` 与 `parallel_tool_calls`。
 - **Search Citation**: Hosted Web Search 消息文本上的 URL 注释；Completion 降级路径不产生引用。
-- **Web Search Request Controls**: `web_search` 工具配置及关联的 `tool_choice`、`include`；降级路径移除 `web_search` 并将强制 `web_search` 选择降为 `auto`。
-- **Reasoning Effort**: 下游 Responses 的 `reasoning.effort` 或兼容标量；`null` 表示未设置。Completion 上游映射为顶层 `reasoning_effort`。其它对象字段忽略；未知值拒绝。
+- **Web Search Request Controls**: `web_search` 工具配置及关联的 `tool_choice`、`include`；降级路径移除 `web_search`，并仅在仍有 Chat tools 时将强制 `web_search` 选择降为 `auto`，否则省略 `tool_choice` 与 `parallel_tool_calls`。
+- **Reasoning Effort**: 下游 Responses 的 `reasoning.effort` 或兼容标量；`null` 表示未设置。Completion 上游映射为顶层 `reasoning_effort`。Bridge 不配置 reasoning 方言或厂商推断；其它对象字段忽略；未知值拒绝。
+- **Reasoning Output**: Completion 的 `reasoning_content`、`reasoning`、`reasoning_details` 或正文开头 `<think>…</think>` 还原出的持久化 Responses `reasoning` Output Item；若 reasoning 服务于工具调用，保留为该调用的 `reasoning_content` 并在续接时附回 Chat assistant message。
 - **Parallel Tool Calling**: 同一 Response 的同一工具轮次中并行产生多个工具调用的语义；不得串行化替代。真实预检要求两个调用以同一次双输出续接。
 - **Attempt**: 针对单个 Response 的一次上游调用记录；不参与会话重建。
 - **Stream Event**: 向客户端发出的、带单调序号的 Responses 语义 SSE 事件。
+- **Semantic SSE Lifecycle**: 流式 Response 依次产生 `response.created`、`response.in_progress`，并为文本、Reasoning Output 与工具项产生 added、delta、局部 done 和 `response.output_item.done`；终态为 `response.completed` 或 `response.incomplete`。每个事件持久化，且 Output Item 必须先于其 done 事件写入。
+- **Chat Stream Terminal**: Chat SSE 收到 `[DONE]` 或任一 choice 的 `finish_reason` 即可正常终结；`length` 映射为带 `incomplete_details.reason=max_output_tokens` 的 incomplete，其余 finish reason 映射为 completed。无两种结束信号的 EOF 或 SSE error 必须为 failed。
+- **Failed Stream Terminal**: 流已开始后的 `response.failed` 保留此前已完成的有序 Output Item、本地 Response id、模型和规整 error；未完成文本或工具项不得伪装为 completed，并与最终 Attempt 原子持久化。
+- **Chat SSE Frame Parsing**: 上游 SSE 接受 LF/CRLF、named event 和多行 data；`event:error` 或 data 中实质 error 终结为 failed，空或占位 error 字段不得误杀成功流。
+- **Responses Usage**: 终态 Response 的持久化用量；`prompt_tokens`/`input_tokens` 映射为 `input_tokens`，`completion_tokens`/`output_tokens` 映射为 `output_tokens`，保留 cache read/write 与 `reasoning_tokens`。上游缺失 usage 时使用零值结构，保证重放一致。
+- **Responses Error Envelope**: 首个语义输出前的不可重试上游非 2xx 保留 HTTP status，并规整为含 `message`、`type`、`code`、`param` 的 Responses error。可重试状态仍按 Failover Policy 处理；流已开始后，同一规整错误进入 `response.failed`。
 - **Stream Event Sink**: Failover Policy Execution 使用的 Stream Event 输出 seam。生产 adapter 持久化 Output Item 并发送事件；测试 adapter 仅记录事件；Output Item 必须先于对应 `response.output_item.done` 记录；终态操作原子写入 Response 终态、终态 Stream Event 与最终 Attempt。
 - **Stream Translator**: Completion 上游 SSE chunk 流到 Responses Stream Event 的纯协议转换；产出有序下游事件与 Output Item，不持有 HTTP 响应或 State Store。与正向（Responses 请求 -> Chat Completions body）翻译对偶。
 - **Compatibility Fixture**: 可重复的脚本化上游交互，连同对 Bridge 可观察结果的预期，用于验证协议与故障契约。
