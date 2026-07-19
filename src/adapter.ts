@@ -101,15 +101,33 @@ export const TOOL_NAME_MAX = 64;
 export const ALIAS_HASH_LEN = 8;
 
 export const normalizeFunctionTool = (value: Record<string, unknown>): FunctionTool | undefined => {
-  if (typeof value.name !== 'string' || value.name.length === 0) return undefined;
-  if (value.description !== undefined && typeof value.description !== 'string') return undefined;
-  if (value.strict !== undefined && typeof value.strict !== 'boolean') return undefined;
+  const nested = value.function;
+  const fn = nested && typeof nested === 'object' && !Array.isArray(nested) ? nested as Record<string, unknown> : undefined;
+  const name = fn && typeof fn.name === 'string' ? fn.name : (typeof value.name === 'string' ? value.name : undefined);
+  if (typeof name !== 'string' || name.length === 0) return undefined;
+  const description = fn ? fn.description : value.description;
+  const parameters = fn ? fn.parameters : value.parameters;
+  const strict = fn && fn.strict !== undefined ? fn.strict : value.strict;
+  if (description !== undefined && typeof description !== 'string') return undefined;
+  if (strict !== undefined && typeof strict !== 'boolean') return undefined;
   return {
-    type: 'function', name: value.name,
-    ...(typeof value.description === 'string' ? { description: value.description } : {}),
-    ...(value.parameters !== undefined ? { parameters: value.parameters } : {}),
-    ...(typeof value.strict === 'boolean' ? { strict: value.strict } : {}),
+    type: 'function', name,
+    ...(typeof description === 'string' ? { description } : {}),
+    ...(parameters !== undefined ? { parameters } : {}),
+    ...(typeof strict === 'boolean' ? { strict } : {}),
   };
+};
+
+// Function Tool Schema Normalization: the persisted Tool Context keeps the original
+// downstream `parameters` untouched, but the Chat proxy payload must always carry an
+// object JSON Schema so strict OpenAI-compatible upstreams accept the tool.
+export const normalizeChatFunctionParameters = (parameters: unknown): Record<string, unknown> => {
+  if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) {
+    return { type: 'object', properties: {} };
+  }
+  const normalized: Record<string, unknown> = { ...(parameters as Record<string, unknown>) };
+  if (normalized.type !== 'object') normalized.type = 'object';
+  return normalized;
 };
 
 export const normalizeTools = (tools: unknown): Tool[] | undefined => {
@@ -142,19 +160,23 @@ export const normalizeTools = (tools: unknown): Tool[] | undefined => {
       normalized.push({ type: 'namespace', name: value.name, description: value.description, tools: children });
       continue;
     }
-    if ((value.type !== 'function' && value.type !== 'custom') || typeof value.name !== 'string' || value.name.length === 0) return undefined;
-    if (value.description !== undefined && typeof value.description !== 'string') return undefined;
     if (value.type === 'function') {
       const normalizedFunction = normalizeFunctionTool(value);
       if (!normalizedFunction) return undefined;
       normalized.push(normalizedFunction);
-    } else {
+      continue;
+    }
+    if (value.type === 'custom') {
+      if (typeof value.name !== 'string' || value.name.length === 0) return undefined;
+      if (value.description !== undefined && typeof value.description !== 'string') return undefined;
       normalized.push({
         type: 'custom', name: value.name,
         ...(typeof value.description === 'string' ? { description: value.description } : {}),
         ...(value.format === undefined ? {} : { format: value.format }),
       });
+      continue;
     }
+    return undefined;
   }
   return normalized;
 };
@@ -216,7 +238,7 @@ export const toChatTools = (tools: Tool[]) => {
           function: {
             name: alias,
             ...(child.description === undefined ? {} : { description: child.description }),
-            ...(child.parameters === undefined ? {} : { parameters: child.parameters }),
+            parameters: normalizeChatFunctionParameters(child.parameters),
             ...(child.strict === undefined ? {} : { strict: child.strict }),
           },
         });
@@ -229,7 +251,7 @@ export const toChatTools = (tools: Tool[]) => {
         function: {
           name: tool.name,
           ...(tool.description === undefined ? {} : { description: tool.description }),
-          ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
+          parameters: normalizeChatFunctionParameters(tool.parameters),
           ...(tool.strict === undefined ? {} : { strict: tool.strict }),
         },
       });
@@ -434,7 +456,7 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
   let chatTools: ReturnType<typeof toChatTools>;
   let namespaceAliases: ReturnType<typeof buildNamespaceAliasMaps>;
   let chatToolChoice: ReturnType<typeof toChatToolChoice> | 'auto' | undefined;
-  let forcedWebSearchWithoutChatTools = false;
+  let hasChatTools = false;
   try {
     chatTools = toChatTools(effectiveTools);
     namespaceAliases = buildNamespaceAliasMaps(effectiveTools);
@@ -444,10 +466,13 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
     if (mappedToolChoice === null) {
       return { ok: false, error: { status: 400, message: 'tool_choice targets an unknown Tool Namespace function', code: 'unsupported_tools' } };
     }
-    const hasChatTools = chatTools.length > 0;
+    hasChatTools = chatTools.length > 0;
     const forcedWebSearchDegrade = degradeWebSearch && forcedWebSearchChoice;
-    forcedWebSearchWithoutChatTools = forcedWebSearchDegrade && !hasChatTools;
-    chatToolChoice = forcedWebSearchDegrade && hasChatTools ? 'auto' : mappedToolChoice;
+    // Without Chat tools, tool_choice and parallel_tool_calls are no longer valid
+    // and strict upstreams reject them; drop both regardless of the client request.
+    chatToolChoice = !hasChatTools ? undefined
+      : forcedWebSearchDegrade ? 'auto'
+      : mappedToolChoice;
   } catch {
     return { ok: false, error: { status: 400, message: 'Tool Namespace aliases conflict', code: 'unsupported_tools' } };
   }
@@ -463,7 +488,7 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
     ...rawMessages.filter((message) => message.role !== 'system'),
   ];
   const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
-  const parallelToolCalls = !forcedWebSearchWithoutChatTools
+  const parallelToolCalls = hasChatTools
     && (payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls));
   const stream = payload.stream === true;
   const explicitCeiling = payload.max_completion_tokens ?? payload.max_tokens;

@@ -1358,6 +1358,200 @@ test('rejects a delayed Function Tool result from an earlier Response', async ()
   }
 });
 
+test('accepts nested and direct Function declarations and normalizes parameters for the Chat proxy', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const tools = [
+      { type: 'function', name: 'direct', description: 'direct form', parameters: null },
+      { type: 'function', function: { name: 'nested', parameters: { type: 'string' } } },
+    ];
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi', tools }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    assert.deepEqual((upstream.requests[0] as { tools: unknown[] }).tools, [
+      { type: 'function', function: { name: 'direct', description: 'direct form', parameters: { type: 'object', properties: {} } } },
+      { type: 'function', function: { name: 'nested', parameters: { type: 'object' } } },
+    ]);
+    const database = new DatabaseSync(join(dir, 'state.db'));
+    const row = database.prepare('SELECT tools_json FROM responses ORDER BY created_at DESC LIMIT 1').get() as { tools_json: string };
+    database.close();
+    // Tool Context persists the original downstream definitions; only the Chat proxy normalized them.
+    assert.deepEqual(JSON.parse(row.tools_json), [
+      { type: 'function', name: 'direct', description: 'direct form', parameters: null },
+      { type: 'function', name: 'nested', parameters: { type: 'string' } },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Function Tool Context is persisted and reused for continuation without re-deriving tools', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startFunctionFixture();
+  let bridge: RunningBridge | undefined;
+  const tool = { type: 'function', name: 'weather', parameters: null };
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Weather?', tools: [tool] }),
+    });
+    const firstEvents = sseTypes(await first.text());
+    const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
+    assert.deepEqual((upstream.requests[0] as { tools: unknown[] }).tools, [
+      { type: 'function', function: { name: 'weather', parameters: { type: 'object', properties: {} } } },
+    ]);
+    const database = new DatabaseSync(join(dir, 'state.db'));
+    const row = database.prepare('SELECT tools_json FROM responses WHERE id = ?').get(firstResponse.response.id) as { tools_json: string };
+    database.close();
+    assert.deepEqual(JSON.parse(row.tools_json), [{ type: 'function', name: 'weather', parameters: null }]);
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, previous_response_id: firstResponse.response.id,
+        input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
+      }),
+    });
+    const secondBody = await second.text();
+    assert.equal(second.status, 200, secondBody);
+    // Continuation sends no tools, so the Chat tools are rebuilt from the persisted Tool Context and re-normalized.
+    assert.deepEqual((upstream.requests[1] as { tools: unknown[] }).tools, [
+      { type: 'function', function: { name: 'weather', parameters: { type: 'object', properties: {} } } },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Inline Tool Replay accepts a paired call and output without previous_response_id', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather in Paris?' }] },
+          { type: 'function_call', call_id: 'call_weather', name: 'weather', arguments: '{"city":"Paris"}' },
+          { type: 'function_call_output', call_id: 'call_weather', output: 'sunny' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Thanks, what next?' }] },
+        ],
+        tools: [{ type: 'function', name: 'weather', parameters: { type: 'object' } }],
+      }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    assert.deepEqual((upstream.requests[0] as { messages: unknown[] }).messages, [
+      { role: 'user', content: 'Weather in Paris?' },
+      { role: 'assistant', tool_calls: [{ id: 'call_weather', type: 'function', function: { name: 'weather', arguments: '{"city":"Paris"}' } }] },
+      { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
+      { role: 'user', content: 'Thanks, what next?' },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects a Function Tool output without previous_response_id or a paired inline call', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather?' }] },
+          { type: 'function_call_output', call_id: 'call_weather', output: 'sunny' },
+        ],
+        tools: [{ type: 'function', name: 'weather', parameters: { type: 'object' } }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: {
+        message: 'Tool output requires previous_response_id', type: 'invalid_request_error', param: null,
+        code: 'missing_previous_response_id',
+      },
+    });
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('drops tool_choice and parallel_tool_calls when no Chat tools remain', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, input: 'hi',
+        tools: [], parallel_tool_calls: true, tool_choice: { type: 'function', name: 'weather' },
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    const request = upstream.requests[0] as { tools?: unknown; tool_choice?: unknown; parallel_tool_calls?: unknown };
+    assert.equal(request.tools, undefined);
+    assert.equal(request.tool_choice, undefined);
+    assert.equal(request.parallel_tool_calls, undefined);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('custom-supported Compatibility Fixture selects a native Custom Tool upstream', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const incompatible = await startCompatibilityFixture();
