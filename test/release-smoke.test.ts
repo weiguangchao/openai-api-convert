@@ -195,11 +195,16 @@ test('release smoke validates semantic SSE and invokes Codex with an isolated Br
     assert.equal(invocations[0].args.includes('model_provider="response-bridge-smoke"'), true);
     assert.equal(invocations[0].args.some((argument) => argument.includes('smoke-upstream-key')), false);
     assert.equal(invocations[0].args.some((argument) => argument.includes('smoke-bridge-key')), false);
-    const directRequest = requests.find(({ body }) => (body as { tool_choice?: unknown }).tool_choice === 'auto');
-    assert.equal(directRequest?.url, '/v1/chat/completions');
-    assert.equal((directRequest?.body as { tool_choice?: unknown }).tool_choice, 'auto');
+    const degradedWebSearchRequest = requests.find(({ body }) => {
+      const messages = (body as { messages?: Array<{ role?: string; content?: string }> }).messages ?? [];
+      return messages.some(({ role, content }) => role === 'system' && typeof content === 'string' && content.includes('web search is unavailable'));
+    });
+    assert.equal(degradedWebSearchRequest?.url, '/v1/chat/completions');
+    assert.equal((degradedWebSearchRequest?.body as { tool_choice?: unknown }).tool_choice, undefined);
+    assert.equal((degradedWebSearchRequest?.body as { parallel_tool_calls?: unknown }).parallel_tool_calls, undefined);
+    assert.equal((degradedWebSearchRequest?.body as { tools?: unknown[] }).tools, undefined);
     assert.equal(
-      ((directRequest?.body as { messages: Array<{ role: string; content: string }> }).messages)
+      ((degradedWebSearchRequest?.body as { messages: Array<{ role: string; content: string }> }).messages)
         .some(({ role, content }) => role === 'system' && content.includes('web search is unavailable')),
       true,
     );

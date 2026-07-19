@@ -434,6 +434,7 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
   let chatTools: ReturnType<typeof toChatTools>;
   let namespaceAliases: ReturnType<typeof buildNamespaceAliasMaps>;
   let chatToolChoice: ReturnType<typeof toChatToolChoice> | 'auto' | undefined;
+  let forcedWebSearchWithoutChatTools = false;
   try {
     chatTools = toChatTools(effectiveTools);
     namespaceAliases = buildNamespaceAliasMaps(effectiveTools);
@@ -443,7 +444,10 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
     if (mappedToolChoice === null) {
       return { ok: false, error: { status: 400, message: 'tool_choice targets an unknown Tool Namespace function', code: 'unsupported_tools' } };
     }
-    chatToolChoice = degradeWebSearch && forcedWebSearchChoice ? 'auto' : mappedToolChoice;
+    const hasChatTools = chatTools.length > 0;
+    const forcedWebSearchDegrade = degradeWebSearch && forcedWebSearchChoice;
+    forcedWebSearchWithoutChatTools = forcedWebSearchDegrade && !hasChatTools;
+    chatToolChoice = forcedWebSearchDegrade && hasChatTools ? 'auto' : mappedToolChoice;
   } catch {
     return { ok: false, error: { status: 400, message: 'Tool Namespace aliases conflict', code: 'unsupported_tools' } };
   }
@@ -459,7 +463,8 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
     ...rawMessages.filter((message) => message.role !== 'system'),
   ];
   const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
-  const parallelToolCalls = payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls);
+  const parallelToolCalls = !forcedWebSearchWithoutChatTools
+    && (payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls));
   const stream = payload.stream === true;
   const explicitCeiling = payload.max_completion_tokens ?? payload.max_tokens;
   const maxOutputTokens = explicitCeiling ?? payload.max_output_tokens;
