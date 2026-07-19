@@ -71,3 +71,39 @@ test('StreamTranslator keeps a plain Function call distinct from a Custom proxy'
     id: 'call_w', type: 'function_call', status: 'completed', call_id: 'call_w', name: 'weather', arguments: '{"city":"sf"}',
   }]);
 });
+
+const toolSearchContext = () => buildToolContext([{ type: 'tool_search', description: 'Discover tools' }]);
+
+test('StreamTranslator restores a tool_search_call from the fixed tool_search proxy', () => {
+  const t = new StreamTranslator('resp_x', toolSearchContext());
+  t.feed(chunk({ tool_calls: [{ index: 0, id: 'call_ts', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] }));
+  const events = t.finalize();
+  assert.deepEqual(t.output, [{
+    id: 'call_ts', type: 'tool_search_call', status: 'completed', call_id: 'call_ts', execution: 'client', arguments: '{}',
+  }]);
+  // No dedicated tool_search argument delta/done event exists; only output_item.done is emitted.
+  assert.equal(events.some(({ type }) => type === 'response.function_call_arguments.done'), false);
+  assert.equal(events.some(({ type }) => type === 'response.output_item.done'), true);
+});
+
+test('StreamTranslator emits an added tool_search_call item before finalizing', () => {
+  const t = new StreamTranslator('resp_x', toolSearchContext());
+  const added = t.feed(chunk({ tool_calls: [{ index: 0, id: 'call_ts', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] }));
+  assert.deepEqual(
+    added.map(({ type }) => type),
+    ['response.output_item.added'],
+  );
+  assert.deepEqual(added[0], {
+    type: 'response.output_item.added', output_index: 0,
+    item: { id: 'call_ts', type: 'tool_search_call', status: 'in_progress' },
+  });
+});
+
+test('StreamTranslator keeps tool_search distinct from a plain function named otherwise', () => {
+  const t = new StreamTranslator('resp_x', buildToolContext([{ type: 'tool_search' }, { type: 'function', name: 'weather' }]));
+  t.feed(chunk({ tool_calls: [{ index: 0, id: 'call_w', type: 'function', function: { name: 'weather', arguments: '{"city":"sf"}' } }] }));
+  t.finalize();
+  assert.deepEqual(t.output, [{
+    id: 'call_w', type: 'function_call', status: 'completed', call_id: 'call_w', name: 'weather', arguments: '{"city":"sf"}',
+  }]);
+});
