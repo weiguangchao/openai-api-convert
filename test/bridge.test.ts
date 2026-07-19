@@ -3227,3 +3227,275 @@ test('SSE Compatibility Fixture preserves normalized errors before and after sem
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('streaming reasoning_content produces a reasoning Output Item and restores it on continuation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([
+    { frames: [
+      'data: {"choices":[{"delta":{"reasoning_content":"Let me think."}}]}\r\n\r\n',
+      'data: {"choices":[{"delta":{"content":"Hi there."}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+    { frames: [
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const firstEvents = sseTypes(await first.text());
+    const completed = firstEvents.find((event) => event.type === 'response.completed') as unknown as { response: { id: string; output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> } };
+    assert.deepEqual(completed.response.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(completed.response.output[0]!.summary![0]!.text, 'Let me think.');
+    assert.equal(completed.response.output[1]!.content![0]!.text, 'Hi there.');
+    assert.deepEqual(firstEvents.filter((event) => event.type === 'response.reasoning_summary_text.delta').map((event) => (event as unknown as { output_index: number }).output_index), [0]);
+    const second = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: completed.response.id, input: 'more' }) });
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual((upstream.requests[1] as { messages: Array<{ role: string; reasoning_content?: string; content?: string }> }).messages, [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', reasoning_content: 'Let me think.', content: 'Hi there.' },
+      { role: 'user', content: 'more' },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming preserves reasoning, text and sharded tool call Output Item order', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"reasoning_content":"Planning."}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"Checking "}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\""}}]}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris\\"}"}}]}}]}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Check weather.', tools: [{ type: 'function', name: 'weather' }] }) });
+    const events = sseTypes(await response.text()) as unknown as Array<{ type: string; output_index?: number; item?: { type: string }; response?: { output: Array<{ type: string }> } }>;
+    assert.deepEqual(events.find((event) => event.type === 'response.completed')?.response?.output.map((item) => item.type), ['reasoning', 'message', 'function_call']);
+    assert.deepEqual(events.filter((event) => event.type === 'response.output_item.done').map((event) => event.item!.type), ['reasoning', 'message', 'function_call']);
+    assert.deepEqual(events.filter((event) => event.type === 'response.reasoning_summary_text.delta').map((event) => event.output_index), [0]);
+    assert.deepEqual(events.filter((event) => event.type === 'response.output_text.delta').map((event) => event.output_index), [1]);
+    assert.deepEqual(events.filter((event) => event.type === 'response.function_call_arguments.delta').map((event) => event.output_index), [2, 2]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response reconstructs reasoning from reasoning_content', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ id: 'chatcmpl_x', model: 'gpt-test', choices: [{ message: { role: 'assistant', content: 'Answer.', reasoning_content: 'Because.' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> };
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'Because.');
+    assert.equal(body.output[1]!.content![0]!.text, 'Answer.');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response reconstructs reasoning from a leading think block', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ id: 'chatcmpl_y', model: 'gpt-test', choices: [{ message: { role: 'assistant', content: '<think>hidden reasoning</think>visible answer' }, finish_reason: 'stop' }] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> };
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'hidden reasoning');
+    assert.equal(body.output[1]!.content![0]!.text, 'visible answer');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response keeps a reasoning-only Output Item when content is null', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({
+    id: 'chatcmpl_r', model: 'gpt-test',
+    choices: [{ message: { role: 'assistant', content: null, reasoning_content: 'solo plan', reasoning_details: [{ text: ' detail' }] }, finish_reason: 'stop' }],
+  });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }> }> };
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'solo plan detail');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response omits an empty message when content is only a think block', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({
+    id: 'chatcmpl_t', model: 'gpt-test',
+    choices: [{ message: { role: 'assistant', content: '<think>only reasoning</think>' }, finish_reason: 'stop' }],
+  });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }> }> };
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'only reasoning');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming leading think shards into a reasoning Output Item then text', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"content":"<thin"}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"k>plan"}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"</thi"}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"nk>answer"}}]}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const events = sseTypes(await response.text()) as unknown as Array<{ type: string; response?: { output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> } }>;
+    const completed = events.find((event) => event.type === 'response.completed')!;
+    assert.deepEqual(completed.response!.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(completed.response!.output[0]!.summary![0]!.text, 'plan');
+    assert.equal(completed.response!.output[1]!.content![0]!.text, 'answer');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming restores reasoning alongside a Function Tool call on continuation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([
+    { frames: [
+      'data: {"choices":[{"delta":{"reasoning_content":"Need weather."}}]}\r\n\r\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Paris\\"}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+    { frames: [
+      'data: {"choices":[{"delta":{"content":"sunny"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const tool = { type: 'function', name: 'weather', parameters: { type: 'object', properties: { city: { type: 'string' } } } };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'weather?', tools: [tool] }) });
+    const firstEvents = sseTypes(await first.text()) as unknown as Array<{ type: string; response?: { id: string; output: Array<{ type: string }> } }>;
+    const firstCompleted = firstEvents.find((event) => event.type === 'response.completed')!;
+    assert.deepEqual(firstCompleted.response!.output.map((item) => item.type), ['reasoning', 'function_call']);
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, previous_response_id: firstCompleted.response!.id, tools: [tool],
+        input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
+      }),
+    });
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual((upstream.requests[1] as { messages: Array<{ role: string; reasoning_content?: string; tool_calls?: unknown[]; content?: string }> }).messages, [
+      { role: 'user', content: 'weather?' },
+      { role: 'assistant', reasoning_content: 'Need weather.', tool_calls: [{ id: 'call_weather', type: 'function', function: { name: 'weather', arguments: '{"city":"Paris"}' } }] },
+      { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming does not fabricate a completed reasoning item when the upstream truncates mid-reasoning', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"reasoning_content":"partial plan"}}]}\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const events = sseTypes(await response.text());
+    assert.equal(events.at(-1)?.type, 'response.failed');
+    assert.equal(events.some((event) => event.type === 'response.output_item.done'), false);
+    assert.equal(events.some((event) => event.type === 'response.reasoning_summary_text.done'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming does not fabricate a completed tool call when the upstream truncates mid-call', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{"}}]}}]}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Check weather.', tools: [{ type: 'function', name: 'weather' }] }) });
+    const events = sseTypes(await response.text());
+    // The tool call was announced in_progress but never received an id/name; the Response
+    // fails and no output_item.done is fabricated for the unfinished call.
+    assert.equal(events.at(-1)?.type, 'response.failed');
+    assert.equal(events.some((event) => event.type === 'response.output_item.done'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming does not fabricate a completed message when the upstream truncates mid-text', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"content":"partial answer"}}]}\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const events = sseTypes(await response.text());
+    // The text item was announced in_progress but the stream ended without [DONE]; the
+    // Response fails and no output_item.done is fabricated for the unfinished message.
+    assert.equal(events.at(-1)?.type, 'response.failed');
+    assert.equal(events.some((event) => event.type === 'response.output_item.done'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -13,6 +13,9 @@ import {
   buildCustomProxyDescription,
   buildToolContext,
   extractCustomInput,
+  extractReasoningText,
+  LeadingThinkParser,
+  splitLeadingThink,
   namespaceToolAlias,
   normalizeFunctionTool,
   normalizeInput,
@@ -747,4 +750,103 @@ test('parseReasoningEffort: valid scalar effort returns the effort', () => {
 test('parseReasoningEffort: invalid or non-string effort returns null', () => {
   assert.strictEqual(parseReasoningEffort({ effort: 'invalid' }), null);
   assert.strictEqual(parseReasoningEffort({ effort: 5 }), null);
+});
+
+
+// ---- reasoning extraction helpers ----
+
+test('extractReasoningText concatenates reasoning_content, reasoning and reasoning_details text', () => {
+  assert.equal(extractReasoningText({}), '');
+  assert.equal(extractReasoningText({ reasoning_content: 'a' }), 'a');
+  assert.equal(extractReasoningText({ reasoning: 'b' }), 'b');
+  assert.equal(extractReasoningText({ reasoning_content: 'a', reasoning: 'b' }), 'ab');
+  assert.equal(extractReasoningText({ reasoning_details: [{ type: 'reasoning_text', text: 'c' }, { text: 'd' }, { noise: 1 }] }), 'cd');
+  assert.equal(extractReasoningText({ reasoning_content: 'a', reasoning_details: [{ text: 'b' }] }), 'ab');
+});
+
+test('splitLeadingThink: no leading think returns content untouched', () => {
+  assert.deepEqual(splitLeadingThink('hello'), { reasoning: '', text: 'hello' });
+  assert.deepEqual(splitLeadingThink(''), { reasoning: '', text: '' });
+});
+
+test('splitLeadingThink: leading think block splits reasoning and text', () => {
+  assert.deepEqual(splitLeadingThink('<think>reasoning</think>answer'), { reasoning: 'reasoning', text: 'answer' });
+  assert.deepEqual(splitLeadingThink('<think>reasoning</think>'), { reasoning: 'reasoning', text: '' });
+});
+
+test('splitLeadingThink: unclosed leading think consumes the remainder as reasoning', () => {
+  assert.deepEqual(splitLeadingThink('<think>ongoing'), { reasoning: 'ongoing', text: '' });
+});
+
+test('LeadingThinkParser: non-think content streams as text', () => {
+  const parser = new LeadingThinkParser();
+  assert.deepEqual(parser.feed('hello world'), { reasoning: '', text: 'hello world' });
+  assert.deepEqual(parser.feed(' more'), { reasoning: '', text: ' more' });
+  assert.deepEqual(parser.flush(), { reasoning: '', text: '' });
+});
+
+test('LeadingThinkParser classifies a leading think block and trailing text across chunks', () => {
+  const parser = new LeadingThinkParser();
+  const out: Array<{ reasoning: string; text: string }> = [];
+  for (const c of ['<think>', 'reasoning', ' here', '</think>', 'answer']) out.push(parser.feed(c));
+  out.push(parser.flush());
+  assert.equal(out.map((part) => part.reasoning).join(''), 'reasoning here');
+  assert.equal(out.map((part) => part.text).join(''), 'answer');
+});
+
+test('LeadingThinkParser flushes a partial tag prefix as text when it is not a think block', () => {
+  const parser = new LeadingThinkParser();
+  assert.deepEqual(parser.feed('<'), { reasoning: '', text: '' });
+  assert.deepEqual(parser.feed('hello'), { reasoning: '', text: '<hello' });
+  assert.deepEqual(parser.flush(), { reasoning: '', text: '' });
+});
+
+test('LeadingThinkParser treats an unclosed leading think as reasoning at flush', () => {
+  const parser = new LeadingThinkParser();
+  assert.deepEqual(parser.feed('<think>still'), { reasoning: '', text: '' });
+  assert.deepEqual(parser.flush(), { reasoning: 'still', text: '' });
+});
+
+// ---- toChatMessages reasoning restoration ----
+
+test('toChatMessages restores reasoning_content on the assistant message', () => {
+  const messages = toChatMessages(baseResponse({
+    input: [{ type: 'message', role: 'user', content: 'hi' }],
+    output: [
+      { id: 'rs_r1', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: 'plan' }] },
+      { id: 'msg_r1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
+    ],
+  }));
+  assert.deepEqual(messages, [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', reasoning_content: 'plan', content: 'answer' },
+  ]);
+});
+
+test('toChatMessages restores reasoning alongside tool calls in one assistant message', () => {
+  const messages = toChatMessages(baseResponse({
+    input: [{ type: 'message', role: 'user', content: 'hi' }],
+    tools: [{ type: 'function', name: 'weather', parameters: { type: 'object' } }],
+    output: [
+      { id: 'rs_r1', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: 'plan' }] },
+      { id: 'call_w', type: 'function_call', status: 'completed', call_id: 'call_w', name: 'weather', arguments: '{"city":"Paris"}' },
+    ],
+  }));
+  assert.deepEqual(messages, [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', reasoning_content: 'plan', tool_calls: [{ id: 'call_w', type: 'function', function: { name: 'weather', arguments: '{"city":"Paris"}' } }] },
+  ]);
+});
+
+test('toChatMessages omits reasoning_content when the ancestor produced no reasoning', () => {
+  const messages = toChatMessages(baseResponse({
+    input: [{ type: 'message', role: 'user', content: 'hi' }],
+    output: [
+      { id: 'msg_r1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
+    ],
+  }));
+  assert.deepEqual(messages, [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'answer' },
+  ]);
 });

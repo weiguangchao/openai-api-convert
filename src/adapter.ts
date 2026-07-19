@@ -392,11 +392,17 @@ export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
     }];
     return [{ role: 'tool', tool_call_id: item.call_id, content: item.output }];
   });
+  const reasoning = response.output.filter((item): item is Extract<OutputItem, { type: 'reasoning' }> => item.type === 'reasoning');
+  // A single Chat assistant turn carries reasoning, text and tool calls together, so the
+  // reasoning Output Items of this Response are reattached as the assistant message
+  // reasoning_content; this preserves the reasoning<->tool-call association reversibly.
+  const reasoningContent = reasoning.map((item) => item.summary.map((part) => part.text).join('')).join('');
   const toolCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' | 'tool_search_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call' || item.type === 'tool_search_call');
   const text = response.output.find((item): item is Extract<OutputItem, { type: 'message' }> => item.type === 'message');
-  if (text || toolCalls.length) {
+  if (reasoningContent || text || toolCalls.length) {
     messages.push({
       role: 'assistant',
+      ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
       ...(text ? { content: text.content.map((part) => part.text).join('') } : {}),
       ...(toolCalls.length ? { tool_calls: toolCalls.map((item): ChatToolCall => {
         if (item.type === 'custom_tool_call') {
@@ -429,7 +435,8 @@ export const parseReasoningEffort = (reasoning: unknown): string | undefined | n
 
 export type ToolContext = ReturnType<typeof buildToolContext>;
 type UpstreamToolCall = { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } };
-type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] }; finish_reason?: unknown }>; usage?: unknown };
+export type ReasoningSources = { reasoning_content?: unknown; reasoning?: unknown; reasoning_details?: unknown };
+type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] } & ReasoningSources; finish_reason?: unknown }>; usage?: unknown };
 
 const usageNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : 0;
 export const toResponsesUsage = (usage: unknown): ResponsesUsage => {
@@ -451,15 +458,122 @@ export const toResponsesUsage = (usage: unknown): ResponsesUsage => {
   };
 };
 
+// Reasoning sources carried by a Chat delta or message object, distinct from content.
+// Leading <think> blocks inside content are parsed separately by LeadingThinkParser.
+export const extractReasoningText = (value: ReasoningSources): string => {
+  let reasoning = '';
+  if (typeof value.reasoning_content === 'string') reasoning += value.reasoning_content;
+  if (typeof value.reasoning === 'string') reasoning += value.reasoning;
+  if (Array.isArray(value.reasoning_details)) {
+    for (const detail of value.reasoning_details) {
+      if (detail && typeof detail === 'object' && typeof (detail as Record<string, unknown>).text === 'string') {
+        reasoning += (detail as Record<string, unknown>).text as string;
+      }
+    }
+  }
+  return reasoning;
+};
+
+export const THINK_OPEN = '<think>';
+export const THINK_CLOSE = '</think>';
+
+// One-shot split of a leading <think>...</think> block from content (non-stream path).
+// An unclosed leading <think> consumes the remainder as reasoning; content without a
+// leading <think> is returned untouched.
+export const splitLeadingThink = (content: string): { reasoning: string; text: string } => {
+  if (!content.startsWith(THINK_OPEN)) return { reasoning: '', text: content };
+  const after = content.slice(THINK_OPEN.length);
+  const close = after.indexOf(THINK_CLOSE);
+  if (close === -1) return { reasoning: after, text: '' };
+  return { reasoning: after.slice(0, close), text: after.slice(close + THINK_CLOSE.length) };
+};
+
+// Streaming leading-<think> parser. Each content delta is classified into reasoning
+// (inside the leading <think> block) and text (everything after, or all of it when no
+// leading <think> is present). Partial tags spanning chunk boundaries are buffered so a
+// tag is never split across reasoning/text output. Only the leading block is treated as
+// reasoning; any later <think> is ordinary text.
+export class LeadingThinkParser {
+  #phase: 'probing' | 'in_think' | 'after' = 'probing';
+  #buffer = '';
+
+  feed(chunk: string): { reasoning: string; text: string } {
+    if (this.#phase === 'after') return { reasoning: '', text: chunk };
+    if (this.#phase === 'probing') {
+      this.#buffer += chunk;
+      if (this.#buffer.startsWith(THINK_OPEN)) {
+        this.#phase = 'in_think';
+        const rest = this.#buffer.slice(THINK_OPEN.length);
+        this.#buffer = '';
+        return this.#drainInThink(rest);
+      }
+      if (this.#buffer.length < THINK_OPEN.length && THINK_OPEN.startsWith(this.#buffer)) {
+        return { reasoning: '', text: '' };
+      }
+      const text = this.#buffer;
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning: '', text };
+    }
+    return this.#drainInThink(chunk);
+  }
+
+  #drainInThink(chunk: string): { reasoning: string; text: string } {
+    this.#buffer += chunk;
+    const close = this.#buffer.indexOf(THINK_CLOSE);
+    if (close !== -1) {
+      const reasoning = this.#buffer.slice(0, close);
+      const text = this.#buffer.slice(close + THINK_CLOSE.length);
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning, text };
+    }
+    // Keep the tail that could still be a partial </think>; emit the rest as reasoning.
+    const safe = Math.max(0, this.#buffer.length - (THINK_CLOSE.length - 1));
+    const reasoning = this.#buffer.slice(0, safe);
+    this.#buffer = this.#buffer.slice(safe);
+    return { reasoning, text: '' };
+  }
+
+  flush(): { reasoning: string; text: string } {
+    if (this.#phase === 'probing') {
+      const text = this.#buffer;
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning: '', text };
+    }
+    if (this.#phase === 'in_think') {
+      // An unclosed leading <think> consumes the buffered remainder as reasoning.
+      const reasoning = this.#buffer;
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning, text: '' };
+    }
+    return { reasoning: '', text: '' };
+  }
+}
+
+type TrackedCall = { id?: string; name?: string; kind: 'function' | 'custom' | 'tool_search'; input: string; outputIndex: number };
+
+// Chat-to-Responses streaming state machine. Reasoning, text and every tool-call kind
+// share one Output Item slot allocator: each item is assigned the next consecutive slot
+// the first time it is observable, later shards reuse that slot, and the terminal output
+// is finalized in slot order. Tool calls keep their Chat call index within the tool-call
+// range so parallel and out-of-order chunks retain a stable order. No completed item is
+// ever fabricated for output that did not finish.
 export class StreamTranslator {
   outputStarted = false;
   outputText = '';
+  reasoningText = '';
   output: OutputItem[] = [];
   usage: ResponsesUsage = toResponsesUsage(undefined);
   finishReason: 'completed' | 'incomplete' | undefined;
   #nextOutputIndex = 0;
+  #reasoningOutputIndex: number | undefined;
   #textOutputIndex: number | undefined;
-  #calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom' | 'tool_search'; input: string; outputIndex: number }>();
+  #toolBaseOffset: number | undefined;
+  #calls = new Map<number, TrackedCall>();
+  #think = new LeadingThinkParser();
   #id: string;
   #toolContext: ToolContext;
 
@@ -476,17 +590,12 @@ export class StreamTranslator {
     if (chunk.choices?.some((choice) => choice.finish_reason !== undefined && choice.finish_reason !== null)) {
       this.finishReason = chunk.choices.some((choice) => choice.finish_reason === 'length') ? 'incomplete' : 'completed';
     }
+    const reasoningDelta = delta ? extractReasoningText(delta) : '';
+    if (reasoningDelta) events.push(...this.#appendReasoning(reasoningDelta));
     if (typeof delta?.content === 'string' && delta.content.length) {
-      if (this.#textOutputIndex === undefined) {
-        this.#textOutputIndex = this.#nextOutputIndex++;
-        events.push({
-          type: 'response.output_item.added', output_index: this.#textOutputIndex,
-          item: { id: `msg_${this.#id}`, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
-        });
-      }
-      this.outputStarted = true;
-      this.outputText += delta.content;
-      events.push({ type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta: delta.content });
+      const { reasoning, text } = this.#think.feed(delta.content);
+      if (reasoning) events.push(...this.#appendReasoning(reasoning));
+      if (text) events.push(...this.#appendText(text));
     }
     for (const call of delta?.tool_calls ?? []) {
       if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
@@ -496,14 +605,18 @@ export class StreamTranslator {
       const index = Number(call.index);
       const isNew = !this.#calls.has(index);
       if (isNew) {
+        // Tool calls occupy a contiguous range starting at the slot reached when the first
+        // call is observed; the Chat call index orders parallel and out-of-order calls.
+        if (this.#toolBaseOffset === undefined) this.#toolBaseOffset = this.#nextOutputIndex;
         const initialName = typeof call.function?.name === 'string' ? call.function.name : undefined;
         const kind = initialName && this.#toolContext.toolSearchNames.has(initialName) ? 'tool_search'
           : initialName && this.#toolContext.customNames.has(initialName) ? 'custom'
           : 'function';
-        this.#calls.set(index, { kind, input: '', outputIndex: index + (this.#textOutputIndex === undefined ? 0 : 1) });
+        const outputIndex = this.#toolBaseOffset + index;
+        this.#calls.set(index, { kind, input: '', outputIndex });
+        this.#nextOutputIndex = Math.max(this.#nextOutputIndex, outputIndex + 1);
       }
       const current = this.#calls.get(index)!;
-      this.#nextOutputIndex = Math.max(this.#nextOutputIndex, current.outputIndex + 1);
       if (typeof call.id === 'string') current.id = call.id;
       if (typeof call.function?.name === 'string') current.name = call.function.name;
       if (isNew) {
@@ -529,9 +642,44 @@ export class StreamTranslator {
     return events;
   }
 
+  #appendReasoning(delta: string): ResponseEvent[] {
+    this.outputStarted = true;
+    this.reasoningText += delta;
+    if (this.#reasoningOutputIndex === undefined) {
+      this.#reasoningOutputIndex = this.#nextOutputIndex++;
+      return [
+        { type: 'response.output_item.added', output_index: this.#reasoningOutputIndex, item: { id: `rs_${this.#id}`, type: 'reasoning', status: 'in_progress', summary: [] } },
+        { type: 'response.reasoning_summary_text.delta', item_id: `rs_${this.#id}`, output_index: this.#reasoningOutputIndex, summary_index: 0, delta },
+      ];
+    }
+    return [{ type: 'response.reasoning_summary_text.delta', item_id: `rs_${this.#id}`, output_index: this.#reasoningOutputIndex, summary_index: 0, delta }];
+  }
+
+  #appendText(delta: string): ResponseEvent[] {
+    this.outputStarted = true;
+    this.outputText += delta;
+    if (this.#textOutputIndex === undefined) {
+      this.#textOutputIndex = this.#nextOutputIndex++;
+      return [
+        { type: 'response.output_item.added', output_index: this.#textOutputIndex, item: { id: `msg_${this.#id}`, type: 'message', status: 'in_progress', role: 'assistant', content: [] } },
+        { type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta },
+      ];
+    }
+    return [{ type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta }];
+  }
+
   finalize(): ResponseEvent[] {
     const events: ResponseEvent[] = [];
+    // Flush any buffered <think> classification so an unclosed leading tag still produces
+    // reasoning and a deferred non-think prefix reaches the text item.
+    const flushed = this.#think.flush();
+    if (flushed.reasoning) events.push(...this.#appendReasoning(flushed.reasoning));
+    else if (flushed.text) events.push(...this.#appendText(flushed.text));
     const orderedOutput: Array<{ index: number; item: OutputItem }> = [];
+    if (this.reasoningText && this.#reasoningOutputIndex !== undefined) orderedOutput.push({
+      index: this.#reasoningOutputIndex,
+      item: { id: `rs_${this.#id}`, type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: this.reasoningText }] },
+    });
     if (this.outputText && this.#textOutputIndex !== undefined) orderedOutput.push({
       index: this.#textOutputIndex,
       item: { id: `msg_${this.#id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: this.outputText }] },
@@ -561,6 +709,9 @@ export class StreamTranslator {
       events.push(call.kind === 'function'
         ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
         : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: extractCustomInput(call.input) });
+    }
+    if (this.reasoningText && this.#reasoningOutputIndex !== undefined) {
+      events.push({ type: 'response.reasoning_summary_text.done', item_id: `rs_${this.#id}`, output_index: this.#reasoningOutputIndex, summary_index: 0, text: this.reasoningText });
     }
     this.output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
     for (const [index, item] of this.output.entries()) {
