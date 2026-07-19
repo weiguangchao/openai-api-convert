@@ -12,6 +12,7 @@
 | `idempotency-in-progress`, `idempotency-terminal`, `idempotency-failed` | Replay, atomic terminal state and conflict safety |
 | `failover-before-output`, `failure-after-output`, `all-upstreams-fail` | Retry boundary and terminal failure |
 | Retention, capacity and operations | Cleanup safety, capacity-before-write, auth, readiness, logs and disconnect |
+| `forward-only-state-migration` | Pre-protocol DB upgrade keeps Output Items / Stream Events / usage backfill, Tool Context writes, incomplete/error terminals, SSE replay, retention and capacity |
 
 `npm test` is the complete release gate: it runs every Compatibility Fixture before the real-Codex preflight. The preflight has three deliberately separate layers:
 

@@ -8,6 +8,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startBridge, type RunningBridge } from '../src/server.js';
 import { namespaceToolAlias, toolSearchOutputContent } from '../src/adapter.js';
+import { digest, zeroResponsesUsage } from '../src/state.js';
 import type { Tool } from '../src/types.js';
 
 const captureStdoutLines = () => {
@@ -1321,6 +1322,242 @@ test('rejects a legacy Response Chain ancestor without saved context', async () 
       },
     });
     assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('forward-only State Store migration Compatibility Fixture preserves Tool Context, terminal facts, Output Items, Stream Events, and replay', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const statePath = join(dir, 'state.db');
+  const responseId = 'resp_pre_protocol';
+  const outputItem = {
+    id: `msg_${responseId}`, type: 'message', status: 'completed', role: 'assistant',
+    content: [{ type: 'output_text', text: 'Hello world' }],
+  };
+  const completedWithoutUsage = {
+    type: 'response.completed',
+    response: { id: responseId, object: 'response', status: 'completed', model: 'gpt-4.1', output: [outputItem] },
+  };
+  const controlKeys = [
+    'temperature', 'top_p', 'presence_penalty', 'frequency_penalty', 'logit_bias', 'logprobs', 'top_logprobs',
+    'seed', 'stop', 'response_format', 'n', 'user',
+  ];
+  const requestHash = digest({
+    model: 'gpt-4.1',
+    input: [{ type: 'message', role: 'user', content: 'Hello' }],
+    tools: [],
+    previousResponseId: null,
+    parallelToolCalls: false,
+    toolChoice: undefined,
+    include: undefined,
+    reasoningEffort: null,
+    deliveryMode: 'stream',
+    instructions: null,
+    maxOutputTokens: null,
+    maxTokens: null,
+    maxCompletionTokens: null,
+    controls: Object.fromEntries(controlKeys.map((key) => [key, { present: false }])),
+  });
+  const legacy = new DatabaseSync(statePath);
+  legacy.exec(`
+    CREATE TABLE responses (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      output_text TEXT NOT NULL DEFAULT ''
+    ) STRICT;
+    CREATE TABLE output_items (
+      response_id TEXT NOT NULL,
+      output_index INTEGER NOT NULL,
+      item_json TEXT NOT NULL,
+      PRIMARY KEY (response_id, output_index)
+    ) STRICT;
+    CREATE TABLE stream_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      response_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE idempotency_records (
+      auth_subject TEXT NOT NULL,
+      key TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      response_id TEXT NOT NULL UNIQUE,
+      PRIMARY KEY (auth_subject, key)
+    ) STRICT;
+  `);
+  legacy.prepare('INSERT INTO responses (id, status, output_text) VALUES (?, ?, ?)').run(responseId, 'completed', 'Hello world');
+  legacy.prepare('INSERT INTO output_items (response_id, output_index, item_json) VALUES (?, ?, ?)').run(responseId, 0, JSON.stringify(outputItem));
+  for (const event of [
+    { type: 'response.created', response: { id: responseId, object: 'response', status: 'queued', model: 'gpt-4.1', output: [] } },
+    { type: 'response.in_progress', response: { id: responseId, object: 'response', status: 'in_progress', model: 'gpt-4.1', output: [] } },
+    { type: 'response.output_item.added', output_index: 0, item: outputItem },
+    { type: 'response.output_text.delta', output_index: 0, delta: 'Hello world' },
+    { type: 'response.output_item.done', output_index: 0, item: outputItem },
+    completedWithoutUsage,
+  ]) {
+    legacy.prepare('INSERT INTO stream_events (response_id, type, payload) VALUES (?, ?, ?)')
+      .run(responseId, event.type, JSON.stringify(event));
+  }
+  legacy.prepare('INSERT INTO idempotency_records (auth_subject, key, request_hash, response_id) VALUES (?, ?, ?, ?)')
+    .run(digest('Bearer bridge-key'), 'pre-protocol', requestHash, responseId);
+  legacy.close();
+
+  const upstream = await startScriptedFixture([
+    { frames: functionSingleStreams[0] },
+    {
+      frames: [
+        'event: message\ndata: {"choices":[\ndata: {"delta":{"content":"Cut"},"finish_reason":"length"}]}\n\n',
+        'data: {"usage":{"prompt_tokens":2,"completion_tokens":1}}\r\n\r\n',
+        'data: [DONE]\r\n\r\n',
+      ],
+    },
+    {
+      frames: [
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        'event: error\ndata: {"error":{"message":"Interrupted","type":"upstream_error","param":null,"code":"stream_interrupted"}}\n\n',
+      ],
+    },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1_000_000, hardLimitBytes: 2_000_000, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+
+    const database = new DatabaseSync(statePath);
+    const columns = new Set(database.prepare('PRAGMA table_info(responses)').all().map((row) => String(row.name)));
+    for (const column of ['tools_json', 'usage_json', 'incomplete_reason', 'context_complete', 'created_at', 'terminal_at']) {
+      assert.equal(columns.has(column), true, `missing migrated column ${column}`);
+    }
+    const migrated = database.prepare('SELECT usage_json, incomplete_reason, context_complete, tools_json FROM responses WHERE id = ?')
+      .get(responseId) as { usage_json: string; incomplete_reason: string | null; context_complete: number; tools_json: string };
+    assert.deepEqual(JSON.parse(migrated.usage_json), zeroResponsesUsage);
+    assert.equal(migrated.incomplete_reason, null);
+    assert.equal(migrated.context_complete, 0);
+    assert.deepEqual(JSON.parse(migrated.tools_json), []);
+    assert.deepEqual(
+      database.prepare('SELECT item_json FROM output_items WHERE response_id = ? ORDER BY output_index').all(responseId)
+        .map((row) => JSON.parse(String(row.item_json))),
+      [outputItem],
+    );
+    assert.deepEqual(
+      database.prepare('SELECT type FROM stream_events WHERE response_id = ? ORDER BY sequence').all(responseId)
+        .map((row) => String(row.type)),
+      ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_item.done', 'response.completed'],
+    );
+    database.close();
+
+    const replay = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'pre-protocol' },
+      body: JSON.stringify({ stream: true, input: 'Hello' }),
+    });
+    assert.equal(replay.status, 200);
+    const replayEvents = sseTypes(await replay.text()) as Array<{ type: string; response?: { usage?: unknown } }>;
+    assert.deepEqual(replayEvents.map(({ type }) => type), [
+      'response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_item.done', 'response.completed',
+    ]);
+    assert.deepEqual(replayEvents.at(-1)?.response?.usage, zeroResponsesUsage);
+    assert.equal(upstream.requests.length, 0);
+
+    const tool = { type: 'function', name: 'weather', parameters: null };
+    const toolResponse = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Weather?', tools: [tool] }),
+    });
+    const toolEvents = sseTypes(await toolResponse.text()) as Array<{ type: string; response?: { id?: string } }>;
+    const toolResponseId = toolEvents.find(({ type }) => type === 'response.completed')?.response?.id;
+    assert(typeof toolResponseId === 'string' && toolResponseId.length > 0);
+    const afterTools = new DatabaseSync(statePath);
+    assert.deepEqual(
+      JSON.parse(String((afterTools.prepare('SELECT tools_json FROM responses WHERE id = ?').get(toolResponseId) as { tools_json: string }).tools_json)),
+      [tool],
+    );
+    afterTools.close();
+
+    const incomplete = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'truncate' }),
+    });
+    const incompleteUsage = {
+      input_tokens: 2, output_tokens: 1, total_tokens: 3, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
+    };
+    const incompleteEvents = sseTypes(await incomplete.text()) as Array<{ type: string; response?: { status?: string; incomplete_details?: unknown; usage?: unknown } }>;
+    assert.equal(incompleteEvents.at(-1)?.type, 'response.incomplete');
+    assert.deepEqual(incompleteEvents.at(-1)?.response?.incomplete_details, { reason: 'max_output_tokens' });
+    assert.deepEqual(incompleteEvents.at(-1)?.response?.usage, incompleteUsage);
+    const afterIncomplete = new DatabaseSync(statePath);
+    const incompleteRow = afterIncomplete.prepare("SELECT incomplete_reason, usage_json FROM responses WHERE status = 'incomplete' ORDER BY rowid DESC LIMIT 1")
+      .get() as { incomplete_reason: string; usage_json: string };
+    assert.equal(incompleteRow.incomplete_reason, 'max_output_tokens');
+    assert.deepEqual(JSON.parse(incompleteRow.usage_json), incompleteUsage);
+    afterIncomplete.close();
+
+    const failed = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'fail after output' }),
+    });
+    const failedEvents = sseTypes(await failed.text()) as Array<{ type: string; response?: { error?: unknown } }>;
+    assert.equal(failedEvents.at(-1)?.type, 'response.failed');
+    assert.deepEqual(failedEvents.at(-1)?.response?.error, {
+      message: 'Interrupted', type: 'upstream_error', param: null, code: 'stream_interrupted',
+    });
+    const afterFailed = new DatabaseSync(statePath);
+    const failedPayload = JSON.parse(String(
+      (afterFailed.prepare("SELECT payload FROM stream_events WHERE type = 'response.failed' ORDER BY sequence DESC LIMIT 1").get() as { payload: string }).payload,
+    )) as { response?: { error?: unknown } };
+    assert.deepEqual(failedPayload.response?.error, {
+      message: 'Interrupted', type: 'upstream_error', param: null, code: 'stream_interrupted',
+    });
+    assert.equal(
+      (afterFailed.prepare("SELECT status, output_text FROM responses WHERE status = 'failed' ORDER BY rowid DESC LIMIT 1").get() as { status: string; output_text: string }).output_text,
+      'partial',
+    );
+    afterFailed.close();
+
+    await bridge.close();
+    bridge = undefined;
+    const expiredStore = new DatabaseSync(statePath);
+    expiredStore.prepare('UPDATE responses SET terminal_at = 0 WHERE id = ?').run(responseId);
+    expiredStore.exec("INSERT INTO responses (id, status, model, input_json, tools_json, parallel_tool_calls, context_complete, output_text, created_at) VALUES ('resp_active', 'in_progress', 'gpt-test', '[]', '[]', 0, 1, '', 0)");
+    expiredStore.close();
+
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1, hardLimitBytes: 1_000_000, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+    assert.equal(bridge.state.responses().some((row) => row.status === 'in_progress' && row.outputText === ''), true);
+    assert.equal(bridge.state.responses().some((row) => row.outputText === 'Hello world'), false);
+    const retainedAfterCleanup = bridge.state.responses().length;
+    await bridge.close();
+    bridge = undefined;
+
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1, hardLimitBytes: 2, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+    const capacity = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, input: 'must not be stored' }),
+    });
+    assert.equal(capacity.status, 503);
+    assert.equal((await capacity.json() as { error: { code: string } }).error.code, 'state_store_capacity_exceeded');
+    assert.equal(bridge.state.responses().length, retainedAfterCleanup);
+    assert.equal(upstream.requests.length, 3);
   } finally {
     await bridge?.close();
     await upstream.close();
