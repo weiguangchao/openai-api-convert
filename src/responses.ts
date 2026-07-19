@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AppError, InputItem, OutputItem, RequestContext, ResponseScope, ResponsesUsage, Result, ResponsesPayload, StoredResponse, Tool } from './types.js';
 import { digest } from './state.js';
-import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort, toResponsesUsage } from './adapter.js';
+import { buildChatRequest, extractReasoningText, normalizeInput, normalizeTools, parseReasoningEffort, splitLeadingThink, toResponsesUsage, type ReasoningSources } from './adapter.js';
 import { HttpStreamEventSink, replaySse } from './sse.js';
 import { redactHeaders, requireBridgeAuthentication, sendError, setErrorCode } from './http.js';
 import { executeFailover, executeJsonFailover, type ExecutionNeeds } from './failover-execution.js';
@@ -11,7 +11,8 @@ import { FetchUpstreamJson, FetchUpstreamStream } from './upstream-stream.js';
 type ParsedRequest = { payload: ResponsesPayload; rawBody: string; idempotencyKey: string | undefined; reasoningEffort: string | undefined; input: InputItem[]; tools: Tool[] | undefined };
 type ResolvedChain = { ancestors: StoredResponse[]; input: InputItem[]; effectiveTools: Tool[]; degradeWebSearch: boolean; needs: ExecutionNeeds };
 type ClaimResult = { kind: 'reused'; responseId: string } | { kind: 'created'; responseId: string };
-type ChatCompletionJson = { choices?: Array<{ message?: { content?: unknown }; finish_reason?: unknown }>; usage?: unknown };
+type ChatCompletionMessage = { content?: unknown } & ReasoningSources;
+type ChatCompletionJson = { choices?: Array<{ message?: ChatCompletionMessage; finish_reason?: unknown }>; usage?: unknown };
 
 export const handleResponsesRequest = async (ctx: RequestContext, request: IncomingMessage, response: ServerResponse, requestId: string, scope: ResponseScope) => {
   if (!requireBridgeAuthentication(request, response, ctx.options.apiKey)) return;
@@ -230,17 +231,33 @@ const completeJsonResponse = async (
         : { status: 503, message: 'Upstream unavailable', code: 'upstream_unavailable' } };
   }
   const completion = outcome.completion as ChatCompletionJson | undefined;
-  const text = completion?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string') {
-      ctx.state.finishAttempt({ ...outcome.attempt, result: 'failed', preOutputFailure: true, errorCode: 'upstream_invalid_json' });
-      return { ok: false, error: { status: 502, message: 'Upstream returned an unsupported JSON completion', code: 'upstream_invalid_json' } };
-    }
-    const output: OutputItem[] = [{
-      id: `msg_${responseId}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text }],
-    }];
-    const status = completion?.choices?.some((choice) => choice.finish_reason === 'length') ? 'incomplete' : 'completed';
-    ctx.state.completeJson(responseId, status, text, output, outcome.attempt, toResponsesUsage(completion?.usage));
-    const completed = ctx.state.jsonResponse(responseId);
-    if (!completed) return { ok: false, error: { status: 500, message: 'Completed Response was not persisted', code: 'state_store_error' } };
-    return { ok: true, value: completed };
+  const message = completion?.choices?.[0]?.message;
+  const rawContent = message?.content;
+  // content may be null/absent when the upstream only emits reasoning fields; treat that as
+  // empty text so reasoning_content/reasoning/reasoning_details can still form Output Items.
+  if (rawContent !== undefined && rawContent !== null && typeof rawContent !== 'string') {
+    ctx.state.finishAttempt({ ...outcome.attempt, result: 'failed', preOutputFailure: true, errorCode: 'upstream_invalid_json' });
+    return { ok: false, error: { status: 502, message: 'Upstream returned an unsupported JSON completion', code: 'upstream_invalid_json' } };
+  }
+  // Reasoning is reconstructed from reasoning_content/reasoning/reasoning_details and a
+  // leading <think> block in content; the remainder of content becomes the message text.
+  const thinkSplit = splitLeadingThink(typeof rawContent === 'string' ? rawContent : '');
+  const reasoningText = extractReasoningText(message ?? {}) + thinkSplit.reasoning;
+  const text = thinkSplit.text;
+  const output: OutputItem[] = [];
+  if (reasoningText) output.push({ id: `rs_${responseId}`, type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: reasoningText }] });
+  // Keep a completed empty message when the upstream returned string content with no
+  // reasoning; omit an empty message when reasoning alone (or a think-only body) is the output.
+  if (text || (!reasoningText && typeof rawContent === 'string')) {
+    output.push({ id: `msg_${responseId}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text }] });
+  }
+  if (!output.length) {
+    ctx.state.finishAttempt({ ...outcome.attempt, result: 'failed', preOutputFailure: true, errorCode: 'upstream_invalid_json' });
+    return { ok: false, error: { status: 502, message: 'Upstream returned an unsupported JSON completion', code: 'upstream_invalid_json' } };
+  }
+  const status = completion?.choices?.some((choice) => choice.finish_reason === 'length') ? 'incomplete' : 'completed';
+  ctx.state.completeJson(responseId, status, text, output, outcome.attempt, toResponsesUsage(completion?.usage));
+  const completed = ctx.state.jsonResponse(responseId);
+  if (!completed) return { ok: false, error: { status: 500, message: 'Completed Response was not persisted', code: 'state_store_error' } };
+  return { ok: true, value: completed };
 };

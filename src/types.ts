@@ -57,7 +57,9 @@ export type ChatContentPart =
   | { type: 'input_audio'; input_audio: { data: string; format: string } };
 export type InputMessage = { type: 'message'; id?: string; role: 'user' | 'assistant' | 'system' | 'developer'; content: string | ChatContentPart[] };
 export type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput | ToolSearchOutput | InlineFunctionCall | InlineCustomToolCall | InlineToolSearchCall;
+export type ReasoningSummaryPart = { type: 'summary_text'; text: string };
 export type OutputItem =
+  | { id: string; type: 'reasoning'; status: 'completed'; summary: ReasoningSummaryPart[] }
   | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string; namespace?: string }
   | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string }
@@ -77,7 +79,7 @@ export type ChatToolCall = { id: string; type: 'function'; function: { name: str
 export type ChatMessage =
   | { role: 'user' | 'system'; content: string | ChatContentPart[] }
   | { role: 'tool'; tool_call_id: string; content: string }
-  | { role: 'assistant'; content?: string | ChatContentPart[]; tool_calls?: ChatToolCall[] };
+  | { role: 'assistant'; content?: string | ChatContentPart[]; tool_calls?: ChatToolCall[]; reasoning_content?: string };
 
 export type ResolvedStatePolicy = Required<StatePolicy>;
 export type AppError = { status: number; message: string; code: string; type?: string; param?: string | null };
