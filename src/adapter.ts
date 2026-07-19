@@ -24,8 +24,15 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
     if (!item || typeof item !== 'object') return undefined;
     const value = item as Record<string, unknown>;
     if (value.type === 'function_call' && inlineCallIndexes.has(index)
-      && typeof value.call_id === 'string' && typeof value.name === 'string' && typeof value.arguments === 'string') {
-      classified.push({ kind: 'item', item: { type: 'function_call', call_id: value.call_id, name: value.name, arguments: value.arguments } });
+      && typeof value.call_id === 'string' && typeof value.name === 'string' && typeof value.arguments === 'string'
+      && (value.namespace === undefined || typeof value.namespace === 'string')) {
+      classified.push({
+        kind: 'item',
+        item: {
+          type: 'function_call', call_id: value.call_id, name: value.name, arguments: value.arguments,
+          ...(typeof value.namespace === 'string' ? { namespace: value.namespace } : {}),
+        },
+      });
       continue;
     }
     if (value.type === 'custom_tool_call' && inlineCallIndexes.has(index)
@@ -223,10 +230,11 @@ export const namespaceToolAlias = (namespace: string, name: string) => {
 };
 
 // Tool Context: the reversible mapping from the Chat function names actually sent to
-// the Completion upstream back to the original Function, Custom or Namespace semantics.
-// Custom Tools proxy as plain Chat functions carrying their own name, so the context only
-// needs to remember which function names are Custom proxies; it is rebuilt from the
-// persisted Response tools during continuation rather than from the current request.
+// the Completion upstream back to the original Function, Custom, Namespace, or Tool Search
+// semantics. Custom Tools proxy as plain Chat functions carrying their own name, so the
+// context only needs to remember which function names are Custom proxies; Tool Search is
+// the fixed `tool_search` proxy name. It is rebuilt from the persisted Response tools
+// during continuation rather than from the current request.
 export const buildToolContext = (tools: Tool[]) => {
   const reserved = new Set<string>();
   const customNames = new Set<string>();
@@ -275,7 +283,7 @@ export const buildCustomProxyDescription = (tool: CustomTool): string => {
 export const CUSTOM_PROXY_PARAMETERS = { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] };
 
 // Tool Search proxies as a fixed Chat function named `tool_search` with an empty object
-// parameter schema (the Responses client-executed tool_search carries EmptyModelParam).
+// parameter schema so generic Chat upstreams can host the client-executed discovery loop.
 export const TOOL_SEARCH_PROXY_NAME = 'tool_search';
 export const TOOL_SEARCH_PROXY_PARAMETERS = { type: 'object', properties: {} };
 
@@ -378,9 +386,14 @@ export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   const { refToAlias } = buildToolContext([...response.tools, ...loadedTools]);
   const messages: ChatMessage[] = response.input.flatMap((item): ChatMessage[] => {
     if (item.type === 'message') return [{ role: item.role === 'developer' || item.role === 'system' ? 'system' : item.role, content: item.content }];
-    if (item.type === 'function_call') return [{
-      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }],
-    }];
+    if (item.type === 'function_call') {
+      const alias = item.namespace ? refToAlias.get(`${item.namespace}\0${item.name}`) : undefined;
+      if (item.namespace && !alias) throw new Error('Tool Namespace alias missing');
+      return [{
+        role: 'assistant',
+        tool_calls: [{ id: item.call_id, type: 'function', function: { name: alias ?? item.name, arguments: item.arguments } }],
+      }];
+    }
     if (item.type === 'custom_tool_call') return [{
       role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: JSON.stringify({ input: item.input }) } }],
     }];
@@ -747,18 +760,33 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
   } catch (error) {
     return { ok: false, error: { status: 400, message: error instanceof Error ? error.message : 'Tool name conflict', code: 'unsupported_tools' } };
   }
-  const rawMessages: ChatMessage[] = [
-    ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
-    ...ancestors.flatMap(toChatMessages),
-    ...toChatMessages({ id: '', model: '', input, tools: [], parallelToolCalls: false, output: [] }),
-  ];
+  if (typeof payload.model !== 'string' || !payload.model) {
+    return { ok: false, error: { status: 400, message: 'model must be a non-empty string', code: 'invalid_model' } };
+  }
+  const model = payload.model;
+  // toChatMessages rebuilds Tool Context from response.tools plus tool_search_output in
+  // that response's own input; strip loaded tools already folded into effectiveTools so
+  // Inline Namespace aliases still resolve without duplicating Tool Search loads.
+  const loadedFromInput = input
+    .filter((item): item is Extract<InputItem, { type: 'tool_search_output' }> => item.type === 'tool_search_output')
+    .flatMap((item) => item.tools);
+  const toolsForCurrentInput = effectiveTools.filter((tool) => !loadedFromInput.includes(tool));
+  let rawMessages: ChatMessage[];
+  try {
+    rawMessages = [
+      ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
+      ...ancestors.flatMap(toChatMessages),
+      ...toChatMessages({ id: '', model, input, tools: toolsForCurrentInput, parallelToolCalls: false, output: [] }),
+    ];
+  } catch (error) {
+    return { ok: false, error: { status: 400, message: error instanceof Error ? error.message : 'Tool Namespace alias missing', code: 'unsupported_tools' } };
+  }
   const instructions = typeof payload.instructions === 'string' && payload.instructions.length ? payload.instructions : undefined;
   const systemPrefix = rawMessages.filter((message): message is Extract<ChatMessage, { role: 'system' }> => message.role === 'system');
   const messages: ChatMessage[] = [
     ...(instructions || systemPrefix.length ? [{ role: 'system' as const, content: [instructions, ...systemPrefix.map(({ content }) => typeof content === 'string' ? content : '')].filter(Boolean).join('\n') }] : []),
     ...rawMessages.filter((message) => message.role !== 'system'),
   ];
-  const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
   const parallelToolCalls = hasChatTools
     && (payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls));
   const stream = payload.stream === true;

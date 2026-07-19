@@ -37,7 +37,7 @@ test('release smoke fails before opening a live connection when the complete pre
       baseUrl: 'http://127.0.0.1:1', apiKey: 'smoke-upstream-key',
       capabilities: { functionTools: true, parallelToolCalls: true },
     }],
-    getCodexVersion: async () => 'codex-cli 0.144.5',
+    getCodexVersion: async () => 'codex-cli 0.144.6',
     runCodex: async () => {},
   }), /Release preflight timed out/);
 });
@@ -91,7 +91,7 @@ test('release smoke completes Hosted Web Search degradation then requires Codex'
         baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'smoke-upstream-key',
         capabilities: { functionTools: true, parallelToolCalls: true },
       }],
-      getCodexVersion: async () => 'codex-cli 0.144.5',
+      getCodexVersion: async () => 'codex-cli 0.144.6',
       runCodex: async () => {},
   }), /Bridge single Function Direct Probe .*did not return the declared Function Tools/);
   } finally {
@@ -139,21 +139,21 @@ test('release smoke validates semantic SSE and invokes Codex with an isolated Br
     await assert.rejects(() => runReleaseSmoke({
       apiKey: 'smoke-bridge-key', model: 'smoke-model',
       upstreams: [{ baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'smoke-upstream-key' }],
-      getCodexVersion: async () => 'codex-cli 0.144.5',
+      getCodexVersion: async () => 'codex-cli 0.144.6',
       runCodex: async () => {},
     }), /requires Function Tool and parallel Tool Calling/);
     await assert.rejects(() => runReleaseSmoke({
       apiKey: 'smoke-bridge-key',
       model: 'smoke-model',
       upstreams,
-      getCodexVersion: async () => 'codex-cli 0.144.5',
+      getCodexVersion: async () => 'codex-cli 0.144.6',
       runCodex: async () => {},
     }), /Codex CLI .*did not complete a Bridge Response/);
     await runReleaseSmoke({
       apiKey: 'smoke-bridge-key',
       model: 'smoke-model',
       upstreams,
-      getCodexVersion: async () => 'codex-cli 0.144.5',
+      getCodexVersion: async () => 'codex-cli 0.144.6',
       runCodex: async (args, env) => {
         invocations.push({ args, env });
         const baseUrl = JSON.parse(args.find((argument) => argument.startsWith('model_providers.response-bridge-smoke.base_url='))!.split('=').slice(1).join('=')) as string;
