@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ChatContentPart, ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, ResponsesUsage, Result, StoredResponse, Tool } from './types.js';
+import type { ChatContentPart, ChatMessage, ChatToolCall, CustomTool, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, ResponsesUsage, Result, StoredResponse, Tool } from './types.js';
 
 export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
 
@@ -202,10 +202,19 @@ export const namespaceToolAlias = (namespace: string, name: string) => {
   return `${prefix}${suffix}`;
 };
 
-export const buildNamespaceAliasMaps = (tools: Tool[]) => {
+// Tool Context: the reversible mapping from the Chat function names actually sent to
+// the Completion upstream back to the original Function, Custom or Namespace semantics.
+// Custom Tools proxy as plain Chat functions carrying their own name, so the context only
+// needs to remember which function names are Custom proxies; it is rebuilt from the
+// persisted Response tools during continuation rather than from the current request.
+export const buildToolContext = (tools: Tool[]) => {
   const reserved = new Set<string>();
+  const customNames = new Set<string>();
   for (const tool of tools) {
-    if (tool.type === 'function' || tool.type === 'custom') reserved.add(tool.name);
+    if (tool.type !== 'function' && tool.type !== 'custom') continue;
+    if (reserved.has(tool.name) || customNames.has(tool.name)) throw new Error('Tool name conflict');
+    if (tool.type === 'custom') customNames.add(tool.name);
+    else reserved.add(tool.name);
   }
   const aliasToRef = new Map<string, { name: string; namespace: string }>();
   const refToAlias = new Map<string, string>();
@@ -215,21 +224,41 @@ export const buildNamespaceAliasMaps = (tools: Tool[]) => {
       const key = `${tool.name}\0${child.name}`;
       if (refToAlias.has(key)) throw new Error('Tool Namespace alias conflict');
       const alias = namespaceToolAlias(tool.name, child.name);
-      if (reserved.has(alias)) throw new Error('Tool Namespace alias conflict');
+      if (reserved.has(alias) || customNames.has(alias)) throw new Error('Tool Namespace alias conflict');
       reserved.add(alias);
       aliasToRef.set(alias, { name: child.name, namespace: tool.name });
       refToAlias.set(key, alias);
     }
   }
-  return { aliasToRef, refToAlias };
+  return { aliasToRef, refToAlias, customNames };
+};
+
+// Custom Tool proxy description embeds the original Custom tool definition so the model
+// observes the original semantics while the upstream only sees a Function tool.
+export const buildCustomProxyDescription = (tool: CustomTool): string => {
+  const original: Record<string, unknown> = { type: 'custom', name: tool.name };
+  if (tool.description !== undefined) original.description = tool.description;
+  if (tool.format !== undefined) original.format = tool.format;
+  return JSON.stringify(original);
+};
+
+// Custom Tool proxy parameters: a single required string `input` carrying the free-form
+// Custom input. The schema is fixed regardless of the original `format`.
+export const CUSTOM_PROXY_PARAMETERS = { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] };
+
+// Reverse conversion prefers `{ input: string }`; empty, non-JSON, non-object, missing
+// or non-string input falls back to the raw arguments so free-form input is never lost.
+export const extractCustomInput = (args: string): string => {
+  let parsed: unknown;
+  try { parsed = JSON.parse(args); } catch { return args; }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return args;
+  const input = (parsed as Record<string, unknown>).input;
+  return typeof input === 'string' ? input : args;
 };
 
 export const toChatTools = (tools: Tool[]) => {
-  const { refToAlias } = buildNamespaceAliasMaps(tools);
-  const chatTools: Array<
-    | { type: 'function'; function: { name: string; description?: string; parameters?: unknown; strict?: boolean } }
-    | { type: 'custom'; custom: { name: string; description?: string; format?: unknown } }
-  > = [];
+  const { refToAlias } = buildToolContext(tools);
+  const chatTools: Array<{ type: 'function'; function: { name: string; description?: string; parameters?: unknown; strict?: boolean } }> = [];
   for (const tool of tools) {
     if (tool.type === 'web_search') continue;
     if (tool.type === 'namespace') {
@@ -259,12 +288,14 @@ export const toChatTools = (tools: Tool[]) => {
         },
       });
     } else {
+      // Custom Tool proxied as a Function with a single required string `input`;
+      // the original Custom definition is embedded in the description.
       chatTools.push({
-        type: 'custom',
-        custom: {
+        type: 'function',
+        function: {
           name: tool.name,
-          ...(tool.description === undefined ? {} : { description: tool.description }),
-          ...(tool.format === undefined ? {} : { format: tool.format }),
+          description: buildCustomProxyDescription(tool),
+          parameters: CUSTOM_PROXY_PARAMETERS,
         },
       });
     }
@@ -277,7 +308,7 @@ export const toChatToolChoice = (toolChoice: unknown, tools: Tool[]) => {
   const value = toolChoice as Record<string, unknown>;
   if (value.type !== 'function' || typeof value.name !== 'string') return undefined;
   if (typeof value.namespace === 'string') {
-    const alias = buildNamespaceAliasMaps(tools).refToAlias.get(`${value.namespace}\0${value.name}`);
+    const alias = buildToolContext(tools).refToAlias.get(`${value.namespace}\0${value.name}`);
     if (!alias) return null;
     return { type: 'function' as const, function: { name: alias } };
   }
@@ -287,14 +318,14 @@ export const toChatToolChoice = (toolChoice: unknown, tools: Tool[]) => {
 export const WEB_SEARCH_UNAVAILABLE_HINT = 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.';
 
 export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
-  const { refToAlias } = buildNamespaceAliasMaps(response.tools);
+  const { refToAlias } = buildToolContext(response.tools);
   const messages: ChatMessage[] = response.input.flatMap((item): ChatMessage[] => {
     if (item.type === 'message') return [{ role: item.role === 'developer' || item.role === 'system' ? 'system' : item.role, content: item.content }];
     if (item.type === 'function_call') return [{
       role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }],
     }];
     if (item.type === 'custom_tool_call') return [{
-      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'custom', custom: { name: item.name, input: item.input } }],
+      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: JSON.stringify({ input: item.input }) } }],
     }];
     return [{ role: 'tool', tool_call_id: item.call_id, content: item.output }];
   });
@@ -306,7 +337,7 @@ export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
       ...(text ? { content: text.content.map((part) => part.text).join('') } : {}),
       ...(toolCalls.length ? { tool_calls: toolCalls.map((item): ChatToolCall => {
         if (item.type !== 'function_call') {
-          return { id: item.call_id, type: 'custom', custom: { name: item.name, input: item.input } };
+          return { id: item.call_id, type: 'function', function: { name: item.name, arguments: JSON.stringify({ input: item.input }) } };
         }
         const alias = item.namespace ? refToAlias.get(`${item.namespace}\0${item.name}`) : undefined;
         if (item.namespace && !alias) throw new Error('Tool Namespace alias missing');
@@ -330,8 +361,8 @@ export const parseReasoningEffort = (reasoning: unknown): string | undefined | n
   return typeof effort === 'string' && REASONING_EFFORTS.has(effort) ? effort : null;
 };
 
-export type NamespaceAliases = ReturnType<typeof buildNamespaceAliasMaps>;
-type UpstreamToolCall = { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown }; custom?: { name?: unknown; input?: unknown } };
+export type ToolContext = ReturnType<typeof buildToolContext>;
+type UpstreamToolCall = { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } };
 type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] }; finish_reason?: unknown }>; usage?: unknown };
 
 const usageNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : 0;
@@ -361,11 +392,11 @@ export class StreamTranslator {
   #textOutputIndex: number | undefined;
   #calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
   #id: string;
-  #aliases: NamespaceAliases;
+  #toolContext: ToolContext;
 
-  constructor(id: string, aliases: NamespaceAliases) {
+  constructor(id: string, toolContext: ToolContext) {
     this.#id = id;
-    this.#aliases = aliases;
+    this.#toolContext = toolContext;
   }
 
   feed(data: string): ResponseEvent[] {
@@ -390,33 +421,39 @@ export class StreamTranslator {
     }
     for (const call of delta?.tool_calls ?? []) {
       if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
-      if (call.type !== undefined && call.type !== 'function' && call.type !== 'custom') throw new Error('Invalid upstream Tool call');
-      const kind = call.type === 'custom' ? 'custom' : 'function';
-      const isNew = !this.#calls.has(Number(call.index));
-      const current = this.#calls.get(Number(call.index)) ?? {
-        kind, input: '', outputIndex: Number(call.index) + (this.#textOutputIndex === undefined ? 0 : 1),
-      };
-      if (current.kind !== kind) throw new Error('Inconsistent upstream Tool call');
+      // Custom Tools proxy as Chat functions, so the upstream only emits function calls;
+      // the Tool Context (customNames) restores Custom semantics on the reverse path.
+      if (call.type !== undefined && call.type !== 'function') throw new Error('Invalid upstream Tool call');
+      const index = Number(call.index);
+      const isNew = !this.#calls.has(index);
+      if (isNew) {
+        const initialName = typeof call.function?.name === 'string' ? call.function.name : undefined;
+        const kind = initialName && this.#toolContext.customNames.has(initialName) ? 'custom' : 'function';
+        this.#calls.set(index, { kind, input: '', outputIndex: index + (this.#textOutputIndex === undefined ? 0 : 1) });
+      }
+      const current = this.#calls.get(index)!;
       this.#nextOutputIndex = Math.max(this.#nextOutputIndex, current.outputIndex + 1);
       if (typeof call.id === 'string') current.id = call.id;
-      const name = current.kind === 'function' ? call.function?.name : call.custom?.name;
-      const inputDelta = current.kind === 'function' ? call.function?.arguments : call.custom?.input;
-      if (typeof name === 'string') current.name = name;
+      if (typeof call.function?.name === 'string') current.name = call.function.name;
       if (isNew) {
         events.push({
           type: 'response.output_item.added', output_index: current.outputIndex,
-          item: { id: current.id ?? `tc_${Number(call.index)}`, type: current.kind === 'function' ? 'function_call' : 'custom_tool_call', status: 'in_progress' },
+          item: { id: current.id ?? `tc_${index}`, type: current.kind === 'function' ? 'function_call' : 'custom_tool_call', status: 'in_progress' },
         });
       }
+      const inputDelta = call.function?.arguments;
       if (typeof inputDelta === 'string') {
         this.outputStarted = true;
         current.input += inputDelta;
-        events.push({
-          type: current.kind === 'function' ? 'response.function_call_arguments.delta' : 'response.custom_tool_call_input.delta',
-          item_id: current.id ?? `tc_${Number(call.index)}`, output_index: current.outputIndex, delta: inputDelta,
-        });
+        // Custom proxy arguments are the `{ input: string }` transport envelope; only the
+        // final extracted input is exposed, so no input delta is streamed for Custom calls.
+        if (current.kind === 'function') {
+          events.push({
+            type: 'response.function_call_arguments.delta',
+            item_id: current.id ?? `tc_${index}`, output_index: current.outputIndex, delta: inputDelta,
+          });
+        }
       }
-      this.#calls.set(Number(call.index), current);
     }
     return events;
   }
@@ -430,7 +467,7 @@ export class StreamTranslator {
     });
     for (const [index, call] of [...this.#calls.entries()].sort(([left], [right]) => left - right)) {
       if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
-      const resolved = call.kind === 'function' ? this.#aliases.aliasToRef.get(call.name) : undefined;
+      const resolved = call.kind === 'function' ? this.#toolContext.aliasToRef.get(call.name) : undefined;
       orderedOutput.push({
         index: call.outputIndex,
         item: call.kind === 'function'
@@ -439,11 +476,11 @@ export class StreamTranslator {
             name: resolved?.name ?? call.name, arguments: call.input,
             ...(resolved ? { namespace: resolved.namespace } : {}),
           }
-          : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: call.input },
+          : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: extractCustomInput(call.input) },
       });
       events.push(call.kind === 'function'
         ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
-        : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input });
+        : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: extractCustomInput(call.input) });
     }
     this.output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
     for (const [index, item] of this.output.entries()) {
@@ -453,16 +490,16 @@ export class StreamTranslator {
   }
 }
 
-type BuiltRequest = { upstreamBody: Record<string, unknown>; namespaceAliases: NamespaceAliases; model: string };
+type BuiltRequest = { upstreamBody: Record<string, unknown>; toolContext: ToolContext; model: string };
 
 export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool[], ancestors: StoredResponse[], input: InputItem[], degradeWebSearch: boolean, reasoningEffort: string | undefined): Result<BuiltRequest> => {
   let chatTools: ReturnType<typeof toChatTools>;
-  let namespaceAliases: ReturnType<typeof buildNamespaceAliasMaps>;
+  let toolContext: ReturnType<typeof buildToolContext>;
   let chatToolChoice: ReturnType<typeof toChatToolChoice> | 'auto' | undefined;
   let hasChatTools = false;
   try {
     chatTools = toChatTools(effectiveTools);
-    namespaceAliases = buildNamespaceAliasMaps(effectiveTools);
+    toolContext = buildToolContext(effectiveTools);
     const forcedWebSearchChoice = payload.tool_choice !== undefined && typeof payload.tool_choice === 'object' && payload.tool_choice !== null
       && (payload.tool_choice as { type?: unknown }).type === 'web_search';
     const mappedToolChoice = toChatToolChoice(payload.tool_choice, effectiveTools);
@@ -476,8 +513,8 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
     chatToolChoice = !hasChatTools ? undefined
       : forcedWebSearchDegrade ? 'auto'
       : mappedToolChoice;
-  } catch {
-    return { ok: false, error: { status: 400, message: 'Tool Namespace aliases conflict', code: 'unsupported_tools' } };
+  } catch (error) {
+    return { ok: false, error: { status: 400, message: error instanceof Error ? error.message : 'Tool name conflict', code: 'unsupported_tools' } };
   }
   const rawMessages: ChatMessage[] = [
     ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
@@ -512,5 +549,5 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
     ...(chatToolChoice === undefined ? {} : { tool_choice: chatToolChoice }),
     ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
   };
-  return { ok: true, value: { upstreamBody, namespaceAliases, model } };
+  return { ok: true, value: { upstreamBody, toolContext, model } };
 };

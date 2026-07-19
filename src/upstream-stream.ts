@@ -1,17 +1,17 @@
 import { redactHeaders } from './http.js';
 import type { AppError, BridgeLogger } from './types.js';
-import { StreamTranslator, type NamespaceAliases } from './adapter.js';
+import { StreamTranslator, type ToolContext } from './adapter.js';
 import type { UpstreamJson, UpstreamJsonOutcome, UpstreamStream, UpstreamStreamEvent, UpstreamStreamOutcome, UpstreamStreamRequest } from './failover-execution.js';
 
 export class FetchUpstreamStream implements UpstreamStream {
   #logging: BridgeLogger;
   #requestId: string;
-  #namespaceAliases: NamespaceAliases;
+  #toolContext: ToolContext;
 
-  constructor(logging: BridgeLogger, requestId: string, namespaceAliases: NamespaceAliases) {
+  constructor(logging: BridgeLogger, requestId: string, toolContext: ToolContext) {
     this.#logging = logging;
     this.#requestId = requestId;
-    this.#namespaceAliases = namespaceAliases;
+    this.#toolContext = toolContext;
   }
 
   async open(request: UpstreamStreamRequest, signal: AbortSignal): Promise<UpstreamStreamOutcome> {
@@ -60,7 +60,7 @@ export class FetchUpstreamStream implements UpstreamStream {
     if (response.status >= 400) {
       return { kind: 'rejected', status: response.status, error: await upstreamError(response) };
     }
-    return { kind: 'stream', events: this.#events(request, response.body, this.#namespaceAliases) };
+    return { kind: 'stream', events: this.#events(request, response.body, this.#toolContext) };
   }
 
   async #logBody(request: UpstreamStreamRequest, response: Response) {
@@ -70,8 +70,8 @@ export class FetchUpstreamStream implements UpstreamStream {
     });
   }
 
-  async *#events(request: UpstreamStreamRequest, body: ReadableStream<Uint8Array>, namespaceAliases: NamespaceAliases): AsyncIterable<UpstreamStreamEvent> {
-    const translator = new StreamTranslator(request.responseId, namespaceAliases);
+  async *#events(request: UpstreamStreamRequest, body: ReadableStream<Uint8Array>, toolContext: ToolContext): AsyncIterable<UpstreamStreamEvent> {
+    const translator = new StreamTranslator(request.responseId, toolContext);
     for await (const frame of parseUpstream(body)) {
       if (this.#logging.level === 'debug') {
         this.#logging.log('debug', 'traffic_upstream_inbound', {

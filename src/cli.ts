@@ -7,7 +7,7 @@ import { startBridge } from './server.js';
 export const CONFIGURATION_HOME = join(homedir(), '.openai-api-convert');
 export const DEFAULT_CONFIGURATION_PATH = join(CONFIGURATION_HOME, 'config.yaml');
 
-const template = `# Fill every empty value before starting the Bridge.\napiKey: \"\"\nupstreams:\n  - baseUrl: \"\"\n    apiKey: \"\"\n    capabilities:\n      functionTools: true\n      customTools: true\n      parallelToolCalls: true\nport: 8417\nfirstEventTimeoutMs: 30000\noutputIdleTimeoutMs: 60000\nstatePolicy:\n  responseRetentionDays: 30\n  attemptRetentionDays: 7\n  cleanupThresholdBytes: 8589934592\n  hardLimitBytes: 10737418240\nlogging:\n  level: info\n  retentionDays: 7\n`;
+const template = `# Fill every empty value before starting the Bridge.\napiKey: \"\"\nupstreams:\n  - baseUrl: \"\"\n    apiKey: \"\"\n    capabilities:\n      functionTools: true\n      parallelToolCalls: true\nport: 8417\nfirstEventTimeoutMs: 30000\noutputIdleTimeoutMs: 60000\nstatePolicy:\n  responseRetentionDays: 30\n  attemptRetentionDays: 7\n  cleanupThresholdBytes: 8589934592\n  hardLimitBytes: 10737418240\nlogging:\n  level: info\n  retentionDays: 7\n`;
 
 const isPosix = () => platform() !== 'win32';
 

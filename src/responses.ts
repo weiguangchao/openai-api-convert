@@ -65,7 +65,7 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
       responseId: claimed.value.responseId, model: built.value.model, upstreamBody: built.value.upstreamBody,
       upstreams: ctx.options.upstreams, needs: resolved.value.needs,
       firstEventTimeoutMs: ctx.options.firstEventTimeoutMs ?? 30_000, outputIdleTimeoutMs: ctx.options.outputIdleTimeoutMs ?? 60_000,
-    }, new FetchUpstreamStream(ctx.logging, requestId, built.value.namespaceAliases), new HttpStreamEventSink(response, ctx.state, claimed.value.responseId, ctx.logging, requestId), cancelled.signal);
+    }, new FetchUpstreamStream(ctx.logging, requestId, built.value.toolContext), new HttpStreamEventSink(response, ctx.state, claimed.value.responseId, ctx.logging, requestId), cancelled.signal);
     if (outcome.kind === 'pre_output_failure') {
       ctx.state.discardRejectedResponse(claimed.value.responseId);
       if (outcome.reason === 'rejected') sendError(response, outcome.status ?? 400, outcome.error?.message ?? 'Upstream rejected request', outcome.error?.code ?? 'upstream_rejected', outcome.error);
@@ -155,8 +155,7 @@ const resolveChainAndCapabilities = (ctx: RequestContext, payload: ResponsesPayl
   const effectiveTools = tools ?? [...ancestors].reverse().find((item) => item.tools.length > 0)?.tools ?? [];
   const chainTools = [...ancestors.flatMap((item) => item.tools), ...effectiveTools];
   const needs: ExecutionNeeds = {
-    functionTools: chainTools.some((tool) => tool.type === 'function' || tool.type === 'namespace'),
-    customTools: chainTools.some((tool) => tool.type === 'custom'),
+    functionTools: chainTools.some((tool) => tool.type === 'function' || tool.type === 'namespace' || tool.type === 'custom'),
     parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
   };
   const degradeWebSearch = chainTools.some((tool) => tool.type === 'web_search');

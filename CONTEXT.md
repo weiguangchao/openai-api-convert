@@ -75,7 +75,7 @@
 - **Failover Policy**: 单个 Attempt 失败时，决定按 Upstream Pool 顺序切换下一上游还是终结 Response 的策略。首个 Stream Event 发出前的失败可重试；此后任何失败为终态，不再切换，Response 终结为 failed；客户端断开终结为 cancelled，不重试。
 - **Failover Policy Execution**: 持有单个 Response 的上游执行生命周期：兼容上游选择、Attempt、重试、取消与终态；不持有 Stream Translator 的协议翻译。
 - **Pre-output Outcome**: 首个 Stream Event 前的上游拒绝或全部不可用结果；Failover Policy Execution 返回该结果，由响应 module 发送 HTTP error 并丢弃未开始的 Response。客户端断开例外，Response 终结为 cancelled。
-- **Upstream Capability Profile**: 启动配置显式声明的 Function Tool、双向 Custom Tool 与并行调用能力；Bridge 按请求筛选兼容上游。
+- **Upstream Capability Profile**: 启动配置显式声明的 Function Tool 与并行调用能力；Bridge 按请求筛选兼容上游。Custom Tool 经 Function proxy 表达，仅要求上游 Function Tool 兼容性。
 - **Upstream Thinking Policy**: 可选的上游原生 `thinking.type` 请求策略；仅在已配置的上游请求中透传，值为 `enabled` 或 `disabled`，不改变下游 Responses 的 `reasoning.effort` 语义。
 - **Upstream Selection**: Failover Policy Execution 按请求所需能力从有序 Upstream Pool 选出兼容上游；零匹配不得创建 Attempt。
 - **State Store**: SQLite；保存响应、会话、工具调用与重试所需状态。

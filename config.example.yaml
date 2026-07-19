@@ -4,7 +4,6 @@ upstreams:
     apiKey: ""
     capabilities:
       functionTools: true
-      customTools: true
       parallelToolCalls: true
     # Provider-native request option, needed for a DeepSeek V4 forced Function probe:
     # thinking:

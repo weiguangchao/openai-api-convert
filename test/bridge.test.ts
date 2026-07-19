@@ -172,13 +172,13 @@ const startFunctionFixture = async (streams = functionSingleStreams) => {
   };
 };
 
-const supportedCapabilities = { functionTools: true, customTools: true, parallelToolCalls: true };
+const supportedCapabilities = { functionTools: true, parallelToolCalls: true };
 
 const startCustomFixture = async () => {
   const requests: unknown[] = [];
   const streams = [
     [
-      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell","type":"custom","custom":{"name":"shell","input":"ls"}}]}}]}\r\n\r\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell","type":"function","function":{"name":"shell","arguments":"{\\"input\\":\\"ls\\"}"}}]}}]}\r\n\r\n',
       'data: [DONE]\r\n\r\n',
     ],
     [
@@ -1553,18 +1553,24 @@ test('drops tool_choice and parallel_tool_calls when no Chat tools remain', asyn
   }
 });
 
-test('custom-supported Compatibility Fixture selects a native Custom Tool upstream', async () => {
+test('Custom Tool proxies through a Chat function and round-trips with continuation', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const incompatible = await startCompatibilityFixture();
-  const compatible = await startCustomFixture();
+  // Custom Tools only require upstream Function Tool compatibility: a function-only upstream
+  // (no native Custom support) is selected and receives a Function proxy.
+  const upstream = await startCustomFixture();
+  const shellProxy = {
+    type: 'function',
+    function: {
+      name: 'shell',
+      description: '{"type":"custom","name":"shell","description":"Runs shell"}',
+      parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] },
+    },
+  };
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: incompatible.url, apiKey: 'upstream-key', capabilities: { functionTools: true } },
-        { baseUrl: compatible.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
-      ],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
       statePath: join(dir, 'state.db'),
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
@@ -1575,10 +1581,9 @@ test('custom-supported Compatibility Fixture selects a native Custom Tool upstre
     const firstEvents = sseTypes(await first.text()) as unknown as Array<{ type: string; item?: { type: string; call_id: string; input: string }; response?: { id: string } }>;
     const call = firstEvents.find((event) => event.type === 'response.output_item.done')?.item;
     assert.deepEqual(call, { id: 'call_shell', type: 'custom_tool_call', status: 'completed', call_id: 'call_shell', name: 'shell', input: 'ls' });
-    assert.equal(incompatible.requests.length, 0);
-    assert.deepEqual(compatible.requests[0], {
+    assert.deepEqual(upstream.requests[0], {
       model: 'gpt-4.1', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'List files.' }],
-      tools: [{ type: 'custom', custom: { name: 'shell', description: 'Runs shell' } }],
+      tools: [shellProxy],
     });
 
     const responseId = firstEvents.find((event) => event.type === 'response.completed')?.response?.id;
@@ -1591,24 +1596,23 @@ test('custom-supported Compatibility Fixture selects a native Custom Tool upstre
     });
     assert.equal(second.status, 200);
     assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
-    assert.deepEqual(compatible.requests[1], {
+    assert.deepEqual(upstream.requests[1], {
       model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
       messages: [
         { role: 'user', content: 'List files.' },
-        { role: 'assistant', tool_calls: [{ id: 'call_shell', type: 'custom', custom: { name: 'shell', input: 'ls' } }] },
+        { role: 'assistant', tool_calls: [{ id: 'call_shell', type: 'function', function: { name: 'shell', arguments: '{"input":"ls"}' } }] },
         { role: 'tool', tool_call_id: 'call_shell', content: 'file.txt' },
       ],
-      tools: [{ type: 'custom', custom: { name: 'shell', description: 'Runs shell' } }],
+      tools: [shellProxy],
     });
   } finally {
     await bridge?.close();
-    await incompatible.close();
-    await compatible.close();
+    await upstream.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('custom-incompatible Compatibility Fixture rejects before contacting an upstream', async () => {
+test('Custom Tool runs on a Function-only upstream without native Custom support', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
@@ -1622,12 +1626,12 @@ test('custom-incompatible Compatibility Fixture rejects before contacting an ups
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({ stream: true, input: 'List files.', tools: [{ type: 'custom', name: 'shell' }] }),
     });
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), {
-      error: { message: 'No upstream supports the requested capabilities', type: 'invalid_request_error', param: null, code: 'unsupported_capabilities' },
-    });
-    assert.deepEqual(upstream.requests, []);
-    assert.deepEqual(bridge.state.responses(), []);
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    const request = upstream.requests[0] as { tools: Array<{ type: string; function?: { name: string } }> };
+    assert.equal(request.tools.length, 1);
+    assert.equal(request.tools[0].type, 'function');
+    assert.equal(request.tools[0].function?.name, 'shell');
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -1719,7 +1723,7 @@ test('Hosted Web Search Response Chain continues via Chat messages without upstr
   }
 });
 
-test('mixed tools with web_search select a Chat Completions upstream that covers remaining capabilities', async () => {
+test('mixed tools with web_search select a Function-only upstream that proxies Custom Tools', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const functionOnly = await startCompatibilityFixture();
   const fullyCapable = await startCustomFixture();
@@ -1746,12 +1750,13 @@ test('mixed tools with web_search select a Chat Completions upstream that covers
     });
     assert.equal(response.status, 200);
     assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
-    assert.deepEqual(functionOnly.requests, []);
-    assert.equal(fullyCapable.requests.length, 1);
-    const request = fullyCapable.requests[0] as { tools: unknown[] };
+    // Custom Tools only need Function Tool compatibility, so the first Function-only upstream wins.
+    assert.equal(functionOnly.requests.length, 1);
+    assert.deepEqual(fullyCapable.requests, []);
+    const request = functionOnly.requests[0] as { tools: unknown[] };
     assert.deepEqual(request.tools, [
       { type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } },
-      { type: 'custom', custom: { name: 'shell', description: 'Runs shell' } },
+      { type: 'function', function: { name: 'shell', description: '{"type":"custom","name":"shell","description":"Runs shell"}', parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } } },
     ]);
   } finally {
     await bridge?.close();
@@ -1761,14 +1766,14 @@ test('mixed tools with web_search select a Chat Completions upstream that covers
   }
 });
 
-test('mixed-tools rejects partial capability coverage before contacting an upstream', async () => {
+test('mixed-tools reject when no upstream provides Function Tool compatibility', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const functionOnly = await startCompatibilityFixture();
+  const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: functionOnly.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { parallelToolCalls: true } }],
       statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
@@ -1780,11 +1785,11 @@ test('mixed-tools rejects partial capability coverage before contacting an upstr
     });
     assert.equal(response.status, 400);
     assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
-    assert.deepEqual(functionOnly.requests, []);
+    assert.deepEqual(upstream.requests, []);
     assert.deepEqual(bridge.state.responses(), []);
   } finally {
     await bridge?.close();
-    await functionOnly.close();
+    await upstream.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -2071,7 +2076,7 @@ test('mixed tools keep Function and Custom after web_search degradation', async 
     assert.equal(String(request.messages[0]?.content).includes('web search is unavailable'), true);
     assert.deepEqual(request.tools, [
       { type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } },
-      { type: 'custom', custom: { name: 'shell', description: 'Runs shell' } },
+      { type: 'function', function: { name: 'shell', description: '{"type":"custom","name":"shell","description":"Runs shell"}', parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } } },
     ]);
   } finally {
     await bridge?.close();
@@ -2111,7 +2116,7 @@ test('parallel-incompatible Compatibility Fixture rejects before contacting an u
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, customTools: true, parallelToolCalls: false } }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, parallelToolCalls: false } }],
       statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
@@ -2758,7 +2763,7 @@ test('Tool Namespace requests require functionTools capability', async () => {
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { customTools: true } }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { parallelToolCalls: true } }],
       statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
