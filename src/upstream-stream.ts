@@ -1,5 +1,5 @@
 import { redactHeaders } from './http.js';
-import type { BridgeLogger } from './types.js';
+import type { AppError, BridgeLogger } from './types.js';
 import { StreamTranslator, type NamespaceAliases } from './adapter.js';
 import type { UpstreamJson, UpstreamJsonOutcome, UpstreamStream, UpstreamStreamEvent, UpstreamStreamOutcome, UpstreamStreamRequest } from './failover-execution.js';
 
@@ -58,8 +58,7 @@ export class FetchUpstreamStream implements UpstreamStream {
       return { kind: 'unavailable' };
     }
     if (response.status >= 400) {
-      await this.#logBody(request, response);
-      return { kind: 'rejected' };
+      return { kind: 'rejected', status: response.status, error: await upstreamError(response) };
     }
     return { kind: 'stream', events: this.#events(request, response.body, this.#namespaceAliases) };
   }
@@ -73,21 +72,29 @@ export class FetchUpstreamStream implements UpstreamStream {
 
   async *#events(request: UpstreamStreamRequest, body: ReadableStream<Uint8Array>, namespaceAliases: NamespaceAliases): AsyncIterable<UpstreamStreamEvent> {
     const translator = new StreamTranslator(request.responseId, namespaceAliases);
-    for await (const data of parseUpstream(body)) {
+    for await (const frame of parseUpstream(body)) {
       if (this.#logging.level === 'debug') {
         this.#logging.log('debug', 'traffic_upstream_inbound', {
-          requestId: this.#requestId, responseId: request.responseId, attempt_index: request.attemptIndex, body: data,
+          requestId: this.#requestId, responseId: request.responseId, attempt_index: request.attemptIndex, body: frame.data,
         });
       }
-      if (data === '[DONE]') {
-        const events = translator.finalize().filter((event) => event.type !== 'response.output_item.done');
-        yield { kind: 'completed', eventsBeforeOutputItems: events, output: translator.output, outputText: translator.outputText };
+      if (frame.event === 'error' || hasSubstantiveError(frame.data)) {
+        yield { kind: 'failed', error: upstreamErrorFromPayload(frame.data, 502), outputText: translator.outputText, usage: translator.usage };
         return;
       }
-      yield { kind: 'heartbeat' };
-      for (const event of translator.feed(data)) {
-        yield { kind: 'event', event, outputStarted: translator.outputStarted, outputText: translator.outputText };
+      if (frame.data === '[DONE]') {
+        const events = translator.finalize().filter((event) => event.type !== 'response.output_item.done');
+        yield { kind: 'completed', status: translator.finishReason ?? 'completed', eventsBeforeOutputItems: events, output: translator.output, outputText: translator.outputText, usage: translator.usage };
+        return;
       }
+      yield { kind: 'heartbeat', usage: translator.usage };
+      for (const event of translator.feed(frame.data)) {
+        yield { kind: 'event', event, outputStarted: translator.outputStarted, outputText: translator.outputText, usage: translator.usage };
+      }
+    }
+    if (translator.finishReason) {
+      const events = translator.finalize().filter((event) => event.type !== 'response.output_item.done');
+      yield { kind: 'completed', status: translator.finishReason, eventsBeforeOutputItems: events, output: translator.output, outputText: translator.outputText, usage: translator.usage };
     }
   }
 }
@@ -118,13 +125,15 @@ export class FetchUpstreamJson implements UpstreamJson {
     }
     this.#logging.log('info', 'traffic_upstream_inbound', { requestId: this.#requestId, responseId: request.responseId, attempt_index: request.attemptIndex, status: response.status });
     if (!response.ok) return response.status === 408 || response.status === 429 || response.status >= 500
-      ? { kind: 'unavailable' } : { kind: 'rejected', status: response.status };
+      ? { kind: 'unavailable' } : { kind: 'rejected', status: response.status, error: await upstreamError(response) };
     try { return { kind: 'completion', completion: await response.json() }; }
     catch { return { kind: 'completion', completion: undefined }; }
   }
 }
 
-export const parseUpstream = async function* (body: ReadableStream<Uint8Array>) {
+export type ParsedSseFrame = { event?: string; data: string };
+
+export const parseUpstream = async function* (body: ReadableStream<Uint8Array>): AsyncIterable<ParsedSseFrame> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -135,9 +144,47 @@ export const parseUpstream = async function* (body: ReadableStream<Uint8Array>) 
     while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
       const frame = buffer.slice(0, boundary.index).replace(/\r/g, '');
       buffer = buffer.slice(boundary.index + boundary[0].length);
-      const data = frame.split('\n').find((line) => line.startsWith('data: '))?.slice(6);
-      if (data) yield data;
+      const lines = frame.split('\n');
+      const data = lines.filter((line) => line.startsWith('data:')).map((line) => line.slice(5).replace(/^ /, '')).join('\n');
+      const event = lines.find((line) => line.startsWith('event:'))?.slice(6).trim();
+      if (data) yield { ...(event ? { event } : {}), data };
     }
     if (done) break;
+  }
+};
+
+const hasSubstantiveError = (data: string) => {
+  try {
+    const parsed = JSON.parse(data) as { error?: unknown };
+    const error = parsed.error;
+    if (typeof error === 'string') return error.length > 0;
+    return !!error && typeof error === 'object' && Object.values(error as Record<string, unknown>).some((value) => value !== null && value !== undefined && value !== '');
+  } catch {
+    return false;
+  }
+};
+
+const upstreamError = async (response: Response): Promise<AppError> => {
+  try {
+    return upstreamErrorFromPayload(await response.text(), response.status);
+  } catch {
+    return { status: response.status, message: 'Upstream rejected request', code: 'upstream_rejected' };
+  }
+};
+
+const upstreamErrorFromPayload = (payload: string, status: number): AppError => {
+  try {
+    const parsed = JSON.parse(payload) as { error?: unknown };
+    const raw = parsed.error;
+    const value = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    return {
+      status,
+      message: typeof value.message === 'string' ? value.message : typeof raw === 'string' ? raw : 'Upstream rejected request',
+      code: typeof value.code === 'string' ? value.code : 'upstream_rejected',
+      ...(typeof value.type === 'string' ? { type: value.type } : {}),
+      ...(typeof value.param === 'string' || value.param === null ? { param: value.param } : {}),
+    };
+  } catch {
+    return { status, message: 'Upstream rejected request', code: 'upstream_rejected' };
   }
 };

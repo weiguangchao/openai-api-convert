@@ -8,6 +8,7 @@ import type {
   OutputItem,
   ResolvedStatePolicy,
   ResponseEvent,
+  ResponsesUsage,
   StoredEvent,
   StoredResponse,
   Tool,
@@ -16,6 +17,9 @@ import type {
 export const GIB = 1024 ** 3;
 export const HOUR = 60 * 60 * 1000;
 export const DAY = 24 * HOUR;
+export const zeroResponsesUsage: ResponsesUsage = {
+  input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
+};
 export const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
 export const defaultStatePolicy: ResolvedStatePolicy = {
   responseRetentionDays: 30,
@@ -55,6 +59,8 @@ export class StateStore {
           parallel_tool_calls INTEGER NOT NULL DEFAULT 0,
           context_complete INTEGER NOT NULL DEFAULT 1,
           output_text TEXT NOT NULL DEFAULT '',
+          usage_json TEXT NOT NULL DEFAULT '',
+          incomplete_reason TEXT,
           created_at INTEGER NOT NULL DEFAULT 0,
           terminal_at INTEGER
         ) STRICT;
@@ -94,6 +100,8 @@ export class StateStore {
       this.#addColumn("tools_json TEXT NOT NULL DEFAULT '[]'");
       this.#addColumn('parallel_tool_calls INTEGER NOT NULL DEFAULT 0');
       this.#addColumn('context_complete INTEGER NOT NULL DEFAULT 0');
+      this.#addColumn("usage_json TEXT NOT NULL DEFAULT ''");
+      this.#addColumn('incomplete_reason TEXT');
       const responseCreatedAtAdded = this.#addColumn('created_at INTEGER NOT NULL DEFAULT 0');
       const terminalAtAdded = this.#addColumn('terminal_at INTEGER');
       const attemptCreatedAtAdded = this.#addAttemptColumn('created_at INTEGER NOT NULL DEFAULT 0');
@@ -105,6 +113,7 @@ export class StateStore {
       const now = Date.now();
       if (responseCreatedAtAdded) this.#db.prepare('UPDATE responses SET created_at = ? WHERE created_at = 0').run(now);
       if (terminalAtAdded) this.#db.prepare("UPDATE responses SET terminal_at = ? WHERE status IN ('completed', 'failed', 'cancelled', 'incomplete')").run(now);
+      this.#db.prepare("UPDATE responses SET usage_json = ? WHERE usage_json = ''").run(JSON.stringify(zeroResponsesUsage));
       if (attemptCreatedAtAdded) this.#db.prepare('UPDATE attempts SET created_at = ? WHERE created_at = 0').run(now);
       this.cleanup();
       this.#cleanupTimer = setInterval(() => this.cleanup(), HOUR);
@@ -268,14 +277,14 @@ export class StateStore {
       .run(responseId, outputIndex, JSON.stringify(item));
   }
 
-  completeJson(id: string, outputText: string, output: OutputItem[], attempt: AttemptCompletion) {
+  completeJson(id: string, status: 'completed' | 'incomplete', outputText: string, output: OutputItem[], attempt: AttemptCompletion, usage: ResponsesUsage) {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       for (const [outputIndex, item] of output.entries()) this.appendOutputItem(id, outputIndex, item);
       this.#db.prepare('UPDATE attempts SET finished_at = ?, result = ?, pre_output_failure = ?, error_code = ? WHERE id = ?')
         .run(Date.now(), attempt.result, Number(attempt.preOutputFailure), attempt.errorCode ?? null, attempt.id);
-      this.#db.prepare("UPDATE responses SET status = 'completed', output_text = ?, terminal_at = COALESCE(terminal_at, ?) WHERE id = ?")
-        .run(outputText, Date.now(), id);
+      this.#db.prepare('UPDATE responses SET status = ?, output_text = ?, usage_json = ?, incomplete_reason = ?, terminal_at = COALESCE(terminal_at, ?) WHERE id = ?')
+        .run(status, outputText, JSON.stringify(usage), status === 'incomplete' ? 'max_output_tokens' : null, Date.now(), id);
       this.#db.exec('COMMIT');
     } catch (error) {
       this.#db.exec('ROLLBACK');
@@ -289,11 +298,15 @@ export class StateStore {
   }
 
   jsonResponse(id: string) {
-    const row = this.#db.prepare('SELECT id, status, model FROM responses WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-    if (!row || row.status !== 'completed') return undefined;
+    const row = this.#db.prepare('SELECT id, status, model, usage_json, incomplete_reason FROM responses WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row || (row.status !== 'completed' && row.status !== 'incomplete')) return undefined;
     const output = this.#db.prepare('SELECT item_json FROM output_items WHERE response_id = ? ORDER BY output_index')
       .all(id).map((item) => JSON.parse(String(item.item_json)) as OutputItem);
-    return { id: String(row.id), object: 'response', status: 'completed', model: String(row.model), output };
+    return {
+      id: String(row.id), object: 'response', status: String(row.status), model: String(row.model), output,
+      usage: row.usage_json ? JSON.parse(String(row.usage_json)) as ResponsesUsage : zeroResponsesUsage,
+      ...(row.status === 'incomplete' ? { incomplete_details: { reason: String(row.incomplete_reason ?? 'max_output_tokens') } } : {}),
+    };
   }
 
   startAttempt(responseId: string) {
@@ -323,7 +336,7 @@ export class StateStore {
     return { sequence: Number(result.lastInsertRowid), type: event.type };
   }
 
-  terminal(id: string, status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt?: AttemptCompletion): StoredEvent {
+  terminal(id: string, status: 'completed' | 'failed' | 'cancelled' | 'incomplete', outputText: string, event: ResponseEvent, attempt?: AttemptCompletion, usage?: ResponsesUsage): StoredEvent {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       if (attempt) {
@@ -331,8 +344,8 @@ export class StateStore {
           'UPDATE attempts SET finished_at = ?, result = ?, pre_output_failure = ?, error_code = ? WHERE id = ?',
         ).run(Date.now(), attempt.result, Number(attempt.preOutputFailure), attempt.errorCode ?? null, attempt.id);
       }
-      this.#db.prepare('UPDATE responses SET status = ?, output_text = ?, terminal_at = COALESCE(terminal_at, ?) WHERE id = ?')
-        .run(status, outputText, Date.now(), id);
+      this.#db.prepare('UPDATE responses SET status = ?, output_text = ?, usage_json = COALESCE(?, usage_json), incomplete_reason = ?, terminal_at = COALESCE(terminal_at, ?) WHERE id = ?')
+        .run(status, outputText, usage ? JSON.stringify(usage) : null, status === 'incomplete' ? 'max_output_tokens' : null, Date.now(), id);
       const stored = this.appendEvent(id, event);
       this.#db.exec('COMMIT');
       return stored;
@@ -380,7 +393,20 @@ export class StateStore {
   eventsForResponse(id: string, after: number) {
     return this.#db.prepare(
       'SELECT sequence, payload FROM stream_events WHERE response_id = ? AND sequence > ? ORDER BY sequence',
-    ).all(id, after).map((row) => ({ sequence: Number(row.sequence), event: JSON.parse(String(row.payload)) as ResponseEvent }));
+    ).all(id, after).map((row) => {
+      const event = JSON.parse(String(row.payload)) as ResponseEvent;
+      const response = event.response;
+      if ((event.type === 'response.completed' || event.type === 'response.incomplete' || event.type === 'response.failed')
+        && response && typeof response === 'object' && !('usage' in response)) {
+        return { sequence: Number(row.sequence), event: { ...event, response: { ...response, usage: this.#usageFor(id) } } };
+      }
+      return { sequence: Number(row.sequence), event };
+    });
+  }
+
+  #usageFor(id: string): ResponsesUsage {
+    const row = this.#db.prepare('SELECT usage_json FROM responses WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row?.usage_json ? JSON.parse(String(row.usage_json)) as ResponsesUsage : zeroResponsesUsage;
   }
 
   status(id: string) {

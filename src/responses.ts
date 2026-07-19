@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AppError, InputItem, OutputItem, RequestContext, ResponseScope, Result, ResponsesPayload, StoredResponse, Tool } from './types.js';
+import type { AppError, InputItem, OutputItem, RequestContext, ResponseScope, ResponsesUsage, Result, ResponsesPayload, StoredResponse, Tool } from './types.js';
 import { digest } from './state.js';
-import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort } from './adapter.js';
+import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort, toResponsesUsage } from './adapter.js';
 import { HttpStreamEventSink, replaySse } from './sse.js';
 import { redactHeaders, requireBridgeAuthentication, sendError, setErrorCode } from './http.js';
 import { executeFailover, executeJsonFailover, type ExecutionNeeds } from './failover-execution.js';
@@ -11,11 +11,11 @@ import { FetchUpstreamJson, FetchUpstreamStream } from './upstream-stream.js';
 type ParsedRequest = { payload: ResponsesPayload; rawBody: string; idempotencyKey: string | undefined; reasoningEffort: string | undefined; input: InputItem[]; tools: Tool[] | undefined };
 type ResolvedChain = { ancestors: StoredResponse[]; input: InputItem[]; effectiveTools: Tool[]; degradeWebSearch: boolean; needs: ExecutionNeeds };
 type ClaimResult = { kind: 'reused'; responseId: string } | { kind: 'created'; responseId: string };
-type ChatCompletionJson = { choices?: Array<{ message?: { content?: unknown } }> };
+type ChatCompletionJson = { choices?: Array<{ message?: { content?: unknown }; finish_reason?: unknown }>; usage?: unknown };
 
 export const handleResponsesRequest = async (ctx: RequestContext, request: IncomingMessage, response: ServerResponse, requestId: string, scope: ResponseScope) => {
   if (!requireBridgeAuthentication(request, response, ctx.options.apiKey)) return;
-  const fail = (error: AppError) => { sendError(response, error.status, error.message, error.code); };
+  const fail = (error: AppError) => { sendError(response, error.status, error.message, error.code, error); };
   const parsed = await parseAndValidateRequest(ctx, request, requestId);
   if (!parsed.ok) { fail(parsed.error); return; }
   const resolved = resolveChainAndCapabilities(ctx, parsed.value.payload, parsed.value.input, parsed.value.tools);
@@ -51,7 +51,7 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
       if (!completed.ok) {
         if (completed.error.code === 'client_disconnected') return;
         ctx.state.discardRejectedResponse(claimed.value.responseId);
-        sendError(response, completed.error.status, completed.error.message, completed.error.code);
+        sendError(response, completed.error.status, completed.error.message, completed.error.code, completed.error);
         return;
       }
       ctx.logging.log('info', 'traffic_downstream_outbound', {
@@ -68,7 +68,7 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
     }, new FetchUpstreamStream(ctx.logging, requestId, built.value.namespaceAliases), new HttpStreamEventSink(response, ctx.state, claimed.value.responseId, ctx.logging, requestId), cancelled.signal);
     if (outcome.kind === 'pre_output_failure') {
       ctx.state.discardRejectedResponse(claimed.value.responseId);
-      if (outcome.reason === 'rejected') sendError(response, 400, 'Upstream rejected request', 'upstream_rejected');
+      if (outcome.reason === 'rejected') sendError(response, outcome.status ?? 400, outcome.error?.message ?? 'Upstream rejected request', outcome.error?.code ?? 'upstream_rejected', outcome.error);
       else if (outcome.reason === 'unsupported_capabilities') sendError(response, 400, 'No upstream supports the requested capabilities', 'unsupported_capabilities');
       else sendError(response, 503, 'Upstream unavailable', 'upstream_unavailable');
       return;
@@ -202,7 +202,7 @@ const completeJsonResponse = async (
   needs: ExecutionNeeds,
   requestId: string,
   cancelled: AbortSignal,
-): Promise<Result<{ id: string; object: string; status: string; model: string; output: OutputItem[] }>> => {
+): Promise<Result<{ id: string; object: string; status: string; model: string; output: OutputItem[]; usage?: ResponsesUsage; incomplete_details?: { reason: string } }>> => {
   const outcome = await executeJsonFailover({
     responseId, model: String(upstreamBody.model), upstreamBody, upstreams: ctx.options.upstreams, needs,
     firstEventTimeoutMs: ctx.options.firstEventTimeoutMs ?? 30_000, outputIdleTimeoutMs: ctx.options.outputIdleTimeoutMs ?? 60_000,
@@ -218,7 +218,7 @@ const completeJsonResponse = async (
     return { ok: false, error: outcome.reason === 'unsupported_capabilities'
       ? { status: 400, message: 'No upstream supports the requested capabilities', code: 'unsupported_capabilities' }
       : outcome.reason === 'rejected'
-        ? { status: outcome.status ?? 400, message: 'Upstream rejected request', code: 'upstream_rejected' }
+        ? outcome.error ?? { status: outcome.status ?? 400, message: 'Upstream rejected request', code: 'upstream_rejected' }
         : { status: 503, message: 'Upstream unavailable', code: 'upstream_unavailable' } };
   }
   const completion = outcome.completion as ChatCompletionJson | undefined;
@@ -230,7 +230,8 @@ const completeJsonResponse = async (
     const output: OutputItem[] = [{
       id: `msg_${responseId}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text }],
     }];
-    ctx.state.completeJson(responseId, text, output, outcome.attempt);
+    const status = completion?.choices?.some((choice) => choice.finish_reason === 'length') ? 'incomplete' : 'completed';
+    ctx.state.completeJson(responseId, status, text, output, outcome.attempt, toResponsesUsage(completion?.usage));
     const completed = ctx.state.jsonResponse(responseId);
     if (!completed) return { ok: false, error: { status: 500, message: 'Completed Response was not persisted', code: 'state_store_error' } };
     return { ok: true, value: completed };

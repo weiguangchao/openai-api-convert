@@ -78,8 +78,15 @@ export type ChatMessage =
   | { role: 'assistant'; content?: string | ChatContentPart[]; tool_calls?: ChatToolCall[] };
 
 export type ResolvedStatePolicy = Required<StatePolicy>;
-export type AppError = { status: number; message: string; code: string };
+export type AppError = { status: number; message: string; code: string; type?: string; param?: string | null };
 export type Result<T> = { ok: true; value: T } | { ok: false; error: AppError };
+
+export type ResponsesUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  input_tokens_details: { cached_tokens: number; cache_creation_tokens?: number };
+  output_tokens_details: { reasoning_tokens: number };
+};
 
 export type BridgeLogger = { log: BridgeLog; level: LogLevel; close: () => Promise<void> };
 export type RequestContext = { options: BridgeOptions; state: StateStore; logging: BridgeLogger };

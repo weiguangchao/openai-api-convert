@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ChatContentPart, ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, Result, StoredResponse, Tool } from './types.js';
+import type { ChatContentPart, ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, ResponsesUsage, Result, StoredResponse, Tool } from './types.js';
 
 export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
 
@@ -307,12 +307,31 @@ export const parseReasoningEffort = (reasoning: unknown): string | undefined | n
 
 export type NamespaceAliases = ReturnType<typeof buildNamespaceAliasMaps>;
 type UpstreamToolCall = { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown }; custom?: { name?: unknown; input?: unknown } };
-type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] } }> };
+type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] }; finish_reason?: unknown }>; usage?: unknown };
+
+const usageNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : 0;
+export const toResponsesUsage = (usage: unknown): ResponsesUsage => {
+  const source = usage && typeof usage === 'object' ? usage as Record<string, unknown> : {};
+  const inputDetails = source.prompt_tokens_details && typeof source.prompt_tokens_details === 'object' ? source.prompt_tokens_details as Record<string, unknown> : {};
+  const outputDetails = source.completion_tokens_details && typeof source.completion_tokens_details === 'object' ? source.completion_tokens_details as Record<string, unknown> : {};
+  const cacheCreationTokens = usageNumber(inputDetails.cache_creation_tokens ?? source.cache_creation_input_tokens);
+  return {
+    input_tokens: usageNumber(source.prompt_tokens ?? source.input_tokens),
+    output_tokens: usageNumber(source.completion_tokens ?? source.output_tokens),
+    input_tokens_details: {
+      cached_tokens: usageNumber(inputDetails.cached_tokens ?? source.cache_read_input_tokens),
+      ...(cacheCreationTokens ? { cache_creation_tokens: cacheCreationTokens } : {}),
+    },
+    output_tokens_details: { reasoning_tokens: usageNumber(outputDetails.reasoning_tokens ?? source.reasoning_tokens) },
+  };
+};
 
 export class StreamTranslator {
   outputStarted = false;
   outputText = '';
   output: OutputItem[] = [];
+  usage: ResponsesUsage = toResponsesUsage(undefined);
+  finishReason: 'completed' | 'incomplete' | undefined;
   #nextOutputIndex = 0;
   #textOutputIndex: number | undefined;
   #calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
@@ -328,8 +347,18 @@ export class StreamTranslator {
     const chunk = JSON.parse(data) as UpstreamChunk;
     const delta = chunk.choices?.[0]?.delta;
     const events: ResponseEvent[] = [];
+    if (chunk.usage !== undefined) this.usage = toResponsesUsage(chunk.usage);
+    if (chunk.choices?.some((choice) => choice.finish_reason !== undefined && choice.finish_reason !== null)) {
+      this.finishReason = chunk.choices.some((choice) => choice.finish_reason === 'length') ? 'incomplete' : 'completed';
+    }
     if (typeof delta?.content === 'string' && delta.content.length) {
-      if (this.#textOutputIndex === undefined) this.#textOutputIndex = this.#nextOutputIndex++;
+      if (this.#textOutputIndex === undefined) {
+        this.#textOutputIndex = this.#nextOutputIndex++;
+        events.push({
+          type: 'response.output_item.added', output_index: this.#textOutputIndex,
+          item: { id: `msg_${this.#id}`, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
+        });
+      }
       this.outputStarted = true;
       this.outputText += delta.content;
       events.push({ type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta: delta.content });
@@ -338,6 +367,7 @@ export class StreamTranslator {
       if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
       if (call.type !== undefined && call.type !== 'function' && call.type !== 'custom') throw new Error('Invalid upstream Tool call');
       const kind = call.type === 'custom' ? 'custom' : 'function';
+      const isNew = !this.#calls.has(Number(call.index));
       const current = this.#calls.get(Number(call.index)) ?? {
         kind, input: '', outputIndex: Number(call.index) + (this.#textOutputIndex === undefined ? 0 : 1),
       };
@@ -347,6 +377,12 @@ export class StreamTranslator {
       const name = current.kind === 'function' ? call.function?.name : call.custom?.name;
       const inputDelta = current.kind === 'function' ? call.function?.arguments : call.custom?.input;
       if (typeof name === 'string') current.name = name;
+      if (isNew) {
+        events.push({
+          type: 'response.output_item.added', output_index: current.outputIndex,
+          item: { id: current.id ?? `tc_${Number(call.index)}`, type: current.kind === 'function' ? 'function_call' : 'custom_tool_call', status: 'in_progress' },
+        });
+      }
       if (typeof inputDelta === 'string') {
         this.outputStarted = true;
         current.input += inputDelta;
