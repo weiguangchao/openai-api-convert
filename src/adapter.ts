@@ -98,7 +98,7 @@ const normalizeMessageContent = (content: unknown[], role: 'user' | 'assistant' 
 };
 
 export const TOOL_NAME_MAX = 64;
-export const ALIAS_HASH_LEN = 8;
+export const ALIAS_HASH_LEN = 16;
 
 export const normalizeFunctionTool = (value: Record<string, unknown>): FunctionTool | undefined => {
   const nested = value.function;
@@ -181,23 +181,25 @@ export const normalizeTools = (tools: unknown): Tool[] | undefined => {
   return normalized;
 };
 
-export const sanitizeToolNamePart = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-export const namespaceToolAlias = (namespace: string, name: string, reserved: Set<string>) => {
-  const hash = createHash('sha256').update(`${namespace}\0${name}`).digest('hex').slice(0, ALIAS_HASH_LEN);
-  const readable = sanitizeToolNamePart(`${namespace}_${name}`);
-  const maxPrefix = TOOL_NAME_MAX - 1 - hash.length;
-  let prefix = readable.slice(0, Math.max(maxPrefix, 0)).replace(/_+$/g, '');
-  if (!prefix || !/^[a-zA-Z0-9]/.test(prefix)) prefix = `ns_${prefix}`.slice(0, Math.max(maxPrefix, 2));
-  let alias = `${prefix}_${hash}`.slice(0, TOOL_NAME_MAX);
-  let n = 0;
-  while (reserved.has(alias)) {
-    n += 1;
-    const suffix = `_${hash}${n}`;
-    alias = `${prefix.slice(0, Math.max(TOOL_NAME_MAX - suffix.length, 1))}${suffix}`.slice(0, TOOL_NAME_MAX);
-    if (n > 1000) throw new Error('Tool Namespace alias conflict');
+// Tool Namespace alias mirrors CC Switch's flatten_namespace_tool_name: the Chat
+// function name is `namespace__name`; only names exceeding the 64-byte limit are
+// truncated and suffixed with a short SHA-256 hash so overlong aliases stay unique.
+export const namespaceToolAlias = (namespace: string, name: string) => {
+  const fullName = `${namespace}__${name}`;
+  if (Buffer.byteLength(fullName, 'utf8') <= TOOL_NAME_MAX) return fullName;
+  const hash = createHash('sha256').update(fullName).digest('hex').slice(0, ALIAS_HASH_LEN);
+  const suffix = `__${hash}`;
+  const prefixLen = TOOL_NAME_MAX - Buffer.byteLength(suffix, 'utf8');
+  let prefix = '';
+  let used = 0;
+  for (const ch of fullName) {
+    const size = Buffer.byteLength(ch, 'utf8');
+    if (used + size > prefixLen) break;
+    used += size;
+    prefix += ch;
   }
-  return alias;
+  return `${prefix}${suffix}`;
 };
 
 export const buildNamespaceAliasMaps = (tools: Tool[]) => {
@@ -212,7 +214,8 @@ export const buildNamespaceAliasMaps = (tools: Tool[]) => {
     for (const child of tool.tools) {
       const key = `${tool.name}\0${child.name}`;
       if (refToAlias.has(key)) throw new Error('Tool Namespace alias conflict');
-      const alias = namespaceToolAlias(tool.name, child.name, reserved);
+      const alias = namespaceToolAlias(tool.name, child.name);
+      if (reserved.has(alias)) throw new Error('Tool Namespace alias conflict');
       reserved.add(alias);
       aliasToRef.set(alias, { name: child.name, namespace: tool.name });
       refToAlias.set(key, alias);

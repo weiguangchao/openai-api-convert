@@ -13,14 +13,13 @@ import {
   normalizeInput,
   normalizeTools,
   parseReasoningEffort,
-  sanitizeToolNamePart,
   toChatMessages,
   toChatToolChoice,
   toChatTools,
 } from '../src/adapter.js';
 import type { StoredResponse, Tool } from '../src/types.js';
 
-const hash8 = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, ALIAS_HASH_LEN);
+const shortHash = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, ALIAS_HASH_LEN);
 
 const baseResponse = (overrides: Partial<StoredResponse> = {}): StoredResponse => ({
   id: 'r1', model: 'm', input: [], tools: [], parallelToolCalls: false, output: [], ...overrides,
@@ -32,9 +31,9 @@ test('INPUT_ECHO_TYPES is the set of echoed type names', () => {
   assert.deepEqual([...INPUT_ECHO_TYPES].sort(), ['custom_tool_call', 'function_call', 'reasoning', 'web_search_call']);
 });
 
-test('TOOL_NAME_MAX is 64 and ALIAS_HASH_LEN is 8', () => {
+test('TOOL_NAME_MAX is 64 and ALIAS_HASH_LEN is 16', () => {
   assert.strictEqual(TOOL_NAME_MAX, 64);
-  assert.strictEqual(ALIAS_HASH_LEN, 8);
+  assert.strictEqual(ALIAS_HASH_LEN, 16);
 });
 
 test('WEB_SEARCH_UNAVAILABLE_HINT is the exact constant string', () => {
@@ -275,65 +274,30 @@ test('normalizeTools: unknown tool type returns undefined', () => {
   assert.strictEqual(normalizeTools([{ type: 'other', name: 'x' }]), undefined);
 });
 
-// ---- sanitizeToolNamePart ----
-
-test('sanitizeToolNamePart: replaces non [a-zA-Z0-9_-] with _', () => {
-  assert.strictEqual(sanitizeToolNamePart('abc 123!@#'), 'abc_123___');
-  assert.strictEqual(sanitizeToolNamePart('a.b-c_d'), 'a_b-c_d');
-  assert.strictEqual(sanitizeToolNamePart(''), '');
-  assert.strictEqual(sanitizeToolNamePart('weird/stuff'), 'weird_stuff');
-});
-
 // ---- namespaceToolAlias ----
 
-test('namespaceToolAlias: basic alias is sanitized prefix + hash', () => {
-  const ns = 'weather';
-  const name = 'get_forecast';
-  const hash = hash8(`${ns}\0${name}`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set()), `weather_get_forecast_${hash}`);
+test('namespaceToolAlias: short name is namespace__name with no hash', () => {
+  assert.strictEqual(namespaceToolAlias('weather', 'get_forecast'), 'weather__get_forecast');
 });
 
-test('namespaceToolAlias: prefix derived from sanitized namespace_name', () => {
-  const ns = 'wea.ther';
-  const name = 'get.forecast';
-  const hash = hash8(`${ns}\0${name}`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set()), `wea_ther_get_forecast_${hash}`);
+test('namespaceToolAlias: preserves raw namespace and name characters', () => {
+  assert.strictEqual(namespaceToolAlias('wea.ther', 'get.forecast'), 'wea.ther__get.forecast');
+  assert.strictEqual(namespaceToolAlias('', ''), '__');
 });
 
 test('namespaceToolAlias: alias length never exceeds TOOL_NAME_MAX', () => {
-  const alias = namespaceToolAlias('a'.repeat(200), 'b'.repeat(200), new Set());
+  const alias = namespaceToolAlias('a'.repeat(200), 'b'.repeat(200));
   assert.ok(alias.length <= TOOL_NAME_MAX, `alias too long: ${alias.length}`);
 });
 
-test('namespaceToolAlias: prefix not starting alnum gets ns_ prefix', () => {
-  const ns = '-foo';
-  const name = 'bar';
-  const hash = hash8(`${ns}\0${name}`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set()), `ns_-foo_bar_${hash}`);
-});
-
-test('namespaceToolAlias: empty namespace and name yields ns_ prefix', () => {
-  const hash = hash8('\0');
-  assert.strictEqual(namespaceToolAlias('', '', new Set()), `ns__${hash}`);
-});
-
-test('namespaceToolAlias: collision appends hash+n', () => {
-  const ns = 'ns';
-  const name = 'fn';
-  const hash = hash8(`${ns}\0${name}`);
-  const base = `ns_fn_${hash}`;
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set([base])), `${base}1`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set([base, `${base}1`, `${base}2`])), `${base}3`);
-});
-
-test('namespaceToolAlias: throws after more than 1000 conflicts', () => {
-  const ns = 'ns';
-  const name = 'fn';
-  const hash = hash8(`${ns}\0${name}`);
-  const base = `ns_fn_${hash}`;
-  const reserved = new Set<string>([base]);
-  for (let i = 1; i <= 1000; i += 1) reserved.add(`${base}${i}`);
-  assert.throws(() => namespaceToolAlias(ns, name, reserved), /Tool Namespace alias conflict/);
+test('namespaceToolAlias: overlong name truncates to 64 with a short hash suffix', () => {
+  const ns = 'a'.repeat(200);
+  const name = 'b'.repeat(200);
+  const fullName = `${ns}__${name}`;
+  const hash = shortHash(fullName);
+  const alias = namespaceToolAlias(ns, name);
+  assert.strictEqual(alias, `${'a'.repeat(46)}__${hash}`);
+  assert.strictEqual(alias.length, TOOL_NAME_MAX);
 });
 
 // ---- buildNamespaceAliasMaps ----
@@ -345,7 +309,7 @@ test('buildNamespaceAliasMaps: maps namespace children to aliases, reserves top-
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
   ];
   const { aliasToRef, refToAlias } = buildNamespaceAliasMaps(tools);
-  const alias = `ns_child_${hash8('ns\0child')}`;
+  const alias = 'ns__child';
   assert.strictEqual(refToAlias.get('ns\0child'), alias);
   assert.deepEqual(aliasToRef.get(alias), { name: 'child', namespace: 'ns' });
   assert.strictEqual(refToAlias.has('top_fn'), false);
@@ -356,6 +320,14 @@ test('buildNamespaceAliasMaps: duplicate namespace+child name throws', () => {
   const tools: Tool[] = [
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
+  ];
+  assert.throws(() => buildNamespaceAliasMaps(tools), /Tool Namespace alias conflict/);
+});
+
+test('buildNamespaceAliasMaps: alias colliding with a peer Function name throws', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'ns__child' },
+    { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
   ];
   assert.throws(() => buildNamespaceAliasMaps(tools), /Tool Namespace alias conflict/);
 });
@@ -386,12 +358,11 @@ test('toChatTools: drops web_search and preserves function/custom', () => {
 });
 
 test('toChatTools: expands namespace children into function tools with aliases', () => {
-  const hash = hash8('weather\0get_forecast');
   const tools: Tool[] = [
     { type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast', description: 'd', strict: true }] },
   ];
   assert.deepEqual(toChatTools(tools), [
-    { type: 'function', function: { name: `weather_get_forecast_${hash}`, description: 'd', parameters: { type: 'object', properties: {} }, strict: true } },
+    { type: 'function', function: { name: 'weather__get_forecast', description: 'd', parameters: { type: 'object', properties: {} }, strict: true } },
   ]);
 });
 
@@ -437,10 +408,9 @@ test('toChatToolChoice: function with name returns function choice', () => {
 
 test('toChatToolChoice: namespace function resolves alias', () => {
   const tools: Tool[] = [{ type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast' }] }];
-  const hash = hash8('weather\0get_forecast');
   assert.deepEqual(
     toChatToolChoice({ type: 'function', name: 'get_forecast', namespace: 'weather' }, tools),
-    { type: 'function', function: { name: `weather_get_forecast_${hash}` } },
+    { type: 'function', function: { name: 'weather__get_forecast' } },
   );
 });
 
@@ -498,10 +468,9 @@ test('toChatMessages: assistant message with both text and tool_calls', () => {
 
 test('toChatMessages: function_call with namespace resolves alias', () => {
   const tools: Tool[] = [{ type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast' }] }];
-  const hash = hash8('weather\0get_forecast');
   assert.deepEqual(
     toChatMessages(baseResponse({ tools, output: [{ id: 'o1', type: 'function_call', status: 'completed', call_id: 'c1', name: 'get_forecast', arguments: '{}', namespace: 'weather' }] })),
-    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: `weather_get_forecast_${hash}`, arguments: '{}' } }] }],
+    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'weather__get_forecast', arguments: '{}' } }] }],
   );
 });
 

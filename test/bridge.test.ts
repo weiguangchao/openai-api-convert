@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startBridge, type RunningBridge } from '../src/server.js';
+import { namespaceToolAlias } from '../src/adapter.js';
 
 const captureStdoutLines = () => {
   const lines: string[] = [];
@@ -2506,7 +2507,7 @@ test('rejects Tool Namespace children that are not Function Tools', async () => 
 
 test('Function-only Tool Namespace continues a Response Chain via Completion aliases', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const alias = 'crm_get_customer_profile_e3d1fa98';
+  const alias = 'crm__get_customer_profile';
   const streams = [
     [
       `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_crm","type":"function","function":{"name":"${alias}","arguments":"{\\\"customer_id\\\":\\\"1\\\"}"}}]}}]}\r\n\r\n`,
@@ -2552,13 +2553,15 @@ test('Function-only Tool Namespace continues a Response Chain via Completion ali
       }),
     });
     assert.equal(first.status, 200);
-    const firstEvents = sseTypes(await first.text());
+    const firstBody = await first.text();
+    const firstEvents = sseTypes(firstBody);
     const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
     const call = firstEvents.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown };
     assert.deepEqual(call.item, {
       id: 'call_crm', type: 'function_call', status: 'completed', call_id: 'call_crm',
       name: 'get_customer_profile', namespace: 'crm', arguments: '{"customer_id":"1"}',
     });
+    assert.equal(firstBody.includes(alias), false, 'Chat alias must not leak to the Responses client');
 
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -2616,7 +2619,7 @@ test('Tool Namespace aliases stay legal and at most 64 characters for overlong n
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const namespace = `ns_${'x'.repeat(80)}`;
   const name = `fn_${'y'.repeat(80)}`;
-  const alias = 'ns_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_2db6913b';
+  const alias = namespaceToolAlias(namespace, name);
   const streams = [[
     `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_long","type":"function","function":{"name":"${alias}","arguments":"{}"}}]}}]}\r\n\r\n`,
     'data: [DONE]\r\n\r\n',
@@ -2637,11 +2640,13 @@ test('Tool Namespace aliases stay legal and at most 64 characters for overlong n
       }),
     });
     assert.equal(response.status, 200);
-    const events = sseTypes(await response.text());
+    const body = await response.text();
+    const events = sseTypes(body);
     assert.deepEqual((events.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
       id: 'call_long', type: 'function_call', status: 'completed', call_id: 'call_long',
       name, namespace, arguments: '{}',
     });
+    assert.equal(body.includes(alias), false, 'Chat alias must not leak to the Responses client');
     const forwarded = (upstream.requests[0] as { tools: Array<{ function: { name: string } }> }).tools[0].function.name;
     assert.equal(forwarded, alias);
     assert.equal(forwarded.length, 64);
@@ -2653,14 +2658,9 @@ test('Tool Namespace aliases stay legal and at most 64 characters for overlong n
   }
 });
 
-test('Tool Namespace aliases disambiguate conflicts with peer Function names', async () => {
+test('Tool Namespace alias collisions with a peer Function name are rejected before upstream contact', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const alias = 'crm_get_customer_profile_e3d1fa981';
-  const streams = [[
-    `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_crm","type":"function","function":{"name":"${alias}","arguments":"{}"}}]}}]}\r\n\r\n`,
-    'data: [DONE]\r\n\r\n',
-  ]];
-  const upstream = await startFunctionFixture(streams);
+  const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
@@ -2673,7 +2673,7 @@ test('Tool Namespace aliases disambiguate conflicts with peer Function names', a
       body: JSON.stringify({
         stream: true, input: 'Lookup.',
         tools: [
-          { type: 'function', name: 'crm_get_customer_profile_e3d1fa98' },
+          { type: 'function', name: 'crm__get_customer_profile' },
           {
             type: 'namespace', name: 'crm', description: 'CRM tools',
             tools: [{ type: 'function', name: 'get_customer_profile' }],
@@ -2681,16 +2681,9 @@ test('Tool Namespace aliases disambiguate conflicts with peer Function names', a
         ],
       }),
     });
-    assert.equal(response.status, 200);
-    const events = sseTypes(await response.text());
-    assert.deepEqual((events.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
-      id: 'call_crm', type: 'function_call', status: 'completed', call_id: 'call_crm',
-      name: 'get_customer_profile', namespace: 'crm', arguments: '{}',
-    });
-    assert.deepEqual(
-      (upstream.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map((tool) => tool.function.name),
-      ['crm_get_customer_profile_e3d1fa98', alias],
-    );
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
+    assert.deepEqual(upstream.requests, []);
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -2790,7 +2783,7 @@ test('Tool Namespace requests require functionTools capability', async () => {
 
 test('Codex mixed-tools Compatibility Fixture continues Namespaced Function calls on Completion', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const spawnAlias = 'multi_agent_v1_spawn_agent_ba58fe27';
+  const spawnAlias = 'multi_agent_v1__spawn_agent';
   const spawnArgs = '{"agent_type":"explorer","message":"Find the bridge entrypoint."}';
   const streams = [
     [
@@ -2832,6 +2825,7 @@ test('Codex mixed-tools Compatibility Fixture continues Namespaced Function call
       id: 'call_spawn', type: 'function_call', status: 'completed', call_id: 'call_spawn',
       name: 'spawn_agent', namespace: 'multi_agent_v1', arguments: spawnArgs,
     });
+    assert.equal(firstBody.includes(spawnAlias), false, 'Chat alias must not leak to the Responses client');
 
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -2854,11 +2848,11 @@ test('Codex mixed-tools Compatibility Fixture continues Namespaced Function call
     assert.equal(request.tools.some((tool) => tool.type === 'web_search' || tool.function?.name === 'web_search'), false);
     assert.deepEqual(request.tools.map((tool) => tool.function.name), [
       'exec_command',
-      'multi_agent_v1_close_agent_4e4a21c0',
-      'multi_agent_v1_resume_agent_01cc6017',
-      'multi_agent_v1_send_input_ba78fa14',
+      'multi_agent_v1__close_agent',
+      'multi_agent_v1__resume_agent',
+      'multi_agent_v1__send_input',
       spawnAlias,
-      'multi_agent_v1_wait_agent_619dd87b',
+      'multi_agent_v1__wait_agent',
     ]);
     assert.equal(request.tools.every((tool) => tool.function.strict === false), true);
     assert.equal(request.tool_choice, undefined);
