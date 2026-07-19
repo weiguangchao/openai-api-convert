@@ -18,7 +18,7 @@ const textStream = (text: string) => async function* (): AsyncIterable<UpstreamS
     event: { type: 'response.output_text.delta', item_id: 'msg_resp_test', output_index: 0, content_index: 0, delta: text },
   };
   yield {
-    kind: 'completed', status: 'completed', usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } }, eventsBeforeOutputItems: [], outputText: text,
+    kind: 'completed', status: 'completed', usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } }, eventsBeforeOutputItems: [], outputText: text,
     output: [{ id: 'msg_resp_test', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text }] }],
   };
 };
@@ -104,7 +104,7 @@ test('Failover Policy Execution completes through scripted Upstream Stream and r
     status: 'completed',
     event: { type: 'response.completed', response: {
       id: 'resp_test', object: 'response', status: 'completed', model: 'test-model', output: sink.output,
-      usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
     } },
     attempt: { id: 1, result: 'completed', preOutputFailure: false },
   });
@@ -210,11 +210,11 @@ test('Failover Policy Execution retains a normalized SSE error and terminal usag
     { kind: 'stream', events: () => (async function* (): AsyncIterable<UpstreamStreamEvent> {
       yield {
         kind: 'event', outputStarted: true, outputText: 'partial',
-        usage: { input_tokens: 4, output_tokens: 1, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
+        usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
         event: { type: 'response.output_text.delta', item_id: 'msg_resp_test', output_index: 0, content_index: 0, delta: 'partial' },
       };
       yield {
-        kind: 'failed', outputText: 'partial', usage: { input_tokens: 4, output_tokens: 1, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
+        kind: 'failed', outputText: 'partial', usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
         error: { status: 502, message: 'Bad upstream event', type: 'upstream_error', param: 'tools', code: 'bad_event' },
       };
     })() },
@@ -227,7 +227,7 @@ test('Failover Policy Execution retains a normalized SSE error and terminal usag
   }, stream, sink), { kind: 'failed' });
   assert.deepEqual((sink.terminalRecord?.event as unknown as { response: { error: unknown; usage: unknown } }).response, {
     id: 'resp_test', object: 'response', status: 'failed',
-    usage: { input_tokens: 4, output_tokens: 1, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
+    usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5, input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 1 } },
     error: { message: 'Bad upstream event', type: 'upstream_error', param: 'tools', code: 'bad_event' },
   });
   assert.deepEqual(sink.terminalRecord?.attempt, { id: 1, result: 'failed', preOutputFailure: false, errorCode: 'bad_event' });
@@ -237,7 +237,7 @@ test('Failover Policy Execution keeps a pre-output SSE error as a pre-output fai
   const stream = new ScriptedUpstreamStream([
     { kind: 'stream', events: () => (async function* (): AsyncIterable<UpstreamStreamEvent> {
       yield {
-        kind: 'failed', outputText: '', usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+        kind: 'failed', outputText: '', usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
         error: { status: 502, message: 'Bad upstream event', type: 'upstream_error', param: null, code: 'bad_event' },
       };
     })() },

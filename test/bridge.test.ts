@@ -849,7 +849,7 @@ test('bridges structured non-stream Responses input into a persisted JSON Respon
     assert.match(firstBody.id, /^resp_/);
     assert.deepEqual({ ...firstBody, id: '<local-response-id>' }, {
       id: '<local-response-id>', object: 'response', status: 'completed', model: 'o3',
-      usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
       output: [{
         id: `msg_${firstBody.id}`, type: 'message', status: 'completed', role: 'assistant',
         content: [{ type: 'output_text', text: 'Done.' }],
@@ -2939,7 +2939,7 @@ test('terminal Compatibility Fixture maps multiline LF SSE length and usage to a
     ]);
     const terminal = events.at(-1)?.response;
     assert.equal(terminal?.status, 'incomplete');
-    assert.deepEqual(terminal?.usage, { input_tokens: 2, output_tokens: 3, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } });
+    assert.deepEqual(terminal?.usage, { input_tokens: 2, output_tokens: 3, total_tokens: 5, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } });
     assert.deepEqual(terminal?.incomplete_details, { reason: 'max_output_tokens' });
     assert.deepEqual(bridge.state.responses(), [{ status: 'incomplete', outputText: 'Hello' }]);
     assert.deepEqual(upstream.requests[0], {
@@ -2966,7 +2966,7 @@ test('non-stream Completion length persists default usage and does not reuse its
     const body = await response.json() as { id: string; status: string; incomplete_details?: unknown; usage?: unknown; output: unknown[] };
     assert.deepEqual({ ...body, id: '<local-response-id>' }, {
       id: '<local-response-id>', object: 'response', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
-      usage: { input_tokens: 0, output_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
       model: 'gpt-4.1', output: [{
         id: `msg_${body.id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'Cut short' }],
       }],

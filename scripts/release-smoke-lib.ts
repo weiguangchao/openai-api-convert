@@ -13,7 +13,6 @@ type SmokeEvent = {
 type CodexRunner = (args: string[], env: NodeJS.ProcessEnv, timeoutMs: number, signal?: AbortSignal) => Promise<void>;
 type CodexVersionRunner = (codexBin: string, env: NodeJS.ProcessEnv, timeoutMs?: number, signal?: AbortSignal) => Promise<string>;
 
-export const PINNED_CODEX_VERSION = '0.144.5';
 export const DIRECT_PROBE_TIMEOUT_MS = 90_000;
 export const CODEX_SCENARIO_TIMEOUT_MS = 180_000;
 export const RELEASE_PREFLIGHT_TIMEOUT_MS = 900_000;
@@ -50,16 +49,16 @@ const readEvents = (body: string): SmokeEvent[] => [...body.matchAll(/^data: (.+
   catch { throw new Error('Bridge returned an invalid SSE event'); }
 });
 
-const assertSemanticCompletion = (events: SmokeEvent[], scenario: string) => {
+const assertSemanticCompletion = (events: SmokeEvent[], scenario: string, codexVersion: string) => {
   const types = events.map((event) => event.type);
   if (types[0] !== 'response.created' || types.at(-1) !== 'response.completed' || types.filter((type) => type === 'response.completed').length !== 1
     || types.some((type) => typeof type !== 'string' || type.startsWith('chat.') || type === 'response.failed' || type === 'response.incomplete')) {
-    throw new Error(`${scenario} [codex-cli ${PINNED_CODEX_VERSION}] did not complete semantically (events=${types.join(',') || 'none'})`);
+    throw new Error(`${scenario} [codex-cli ${codexVersion}] did not complete semantically (events=${types.join(',') || 'none'})`);
   }
 };
 
-const scenarioFailure = (scenario: string, detail: string, events: Array<{ type?: unknown }> = []) => new Error(
-  `${scenario} [codex-cli ${PINNED_CODEX_VERSION}] ${detail} (events=${events.map((event) => event.type).join(',') || 'none'})`,
+const scenarioFailure = (scenario: string, detail: string, codexVersion: string, events: Array<{ type?: unknown }> = []) => new Error(
+  `${scenario} [codex-cli ${codexVersion}] ${detail} (events=${events.map((event) => event.type).join(',') || 'none'})`,
 );
 
 const responseId = (events: SmokeEvent[], scenario: string) => {
@@ -68,9 +67,10 @@ const responseId = (events: SmokeEvent[], scenario: string) => {
   return id;
 };
 
-const requirePinnedCodexVersion = async (codexBin: string, getCodexVersion: CodexVersionRunner, timeoutMs = CODEX_SCENARIO_TIMEOUT_MS, signal?: AbortSignal) => {
+const requireCodexAvailable = async (codexBin: string, getCodexVersion: CodexVersionRunner, timeoutMs = CODEX_SCENARIO_TIMEOUT_MS, signal?: AbortSignal): Promise<string> => {
   const version = (await getCodexVersion(codexBin, { PATH: process.env.PATH ?? '' }, timeoutMs, signal)).match(/\bcodex-cli\s+([^\s]+)/)?.[1];
-  if (version !== PINNED_CODEX_VERSION) throw new Error(`Codex CLI smoke requires codex-cli ${PINNED_CODEX_VERSION}`);
+  if (!version) throw new Error('Codex CLI smoke could not determine the installed codex-cli version');
+  return version;
 };
 
 const codexExecArgs = (codexBin: string, provider: string, model: string, baseUrl: string, dir: string) => [
@@ -100,7 +100,7 @@ const protocolTextFrames = [
 
 export const runCodexProtocolFixture = async ({ model, codexBin = 'codex', runCodex = runCodexCli, getCodexVersion = readCodexVersion, timeoutMs = CODEX_SCENARIO_TIMEOUT_MS, signal }: CodexProtocolFixtureOptions) => {
   if (!model.trim()) throw new Error('Release Preflight Model is required');
-  await requirePinnedCodexVersion(codexBin, getCodexVersion, timeoutMs, signal);
+  const codexVersion = await requireCodexAvailable(codexBin, getCodexVersion, timeoutMs, signal);
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-protocol-fixture-'));
   let upstream: Server | undefined;
   let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
@@ -142,7 +142,7 @@ export const runCodexProtocolFixture = async ({ model, codexBin = 'codex', runCo
         'Run pwd, then reply with a short acknowledgement.',
       ], { PATH: process.env.PATH ?? '', CODEX_HOME: codexHome, BRIDGE_API_KEY: 'codex-protocol-fixture-key' }, timeoutMs, signal);
     } catch {
-      throw scenarioFailure('Codex Protocol Fixture', 'execution failed', bridge.state.events().slice(eventCount));
+      throw scenarioFailure('Codex Protocol Fixture', 'execution failed', codexVersion, bridge.state.events().slice(eventCount));
     }
     const responses = bridge.state.responses().slice(responseCount);
     const events = bridge.state.events().slice(eventCount).map((event) => event.type);
@@ -150,7 +150,7 @@ export const runCodexProtocolFixture = async ({ model, codexBin = 'codex', runCo
       || events.filter((type) => type === 'response.completed').length !== 2
       || !events.includes('response.function_call_arguments.done')
       || events.some((type) => type === 'response.failed' || type === 'response.incomplete' || type.startsWith('chat.'))) {
-      throw new Error(`Codex Protocol Fixture [codex-cli ${PINNED_CODEX_VERSION}] did not complete a native tool loop (events=${events.join(',') || 'none'})`);
+      throw new Error(`Codex Protocol Fixture [codex-cli ${codexVersion}] did not complete a native tool loop (events=${events.join(',') || 'none'})`);
     }
   } finally {
     await bridge?.close();
@@ -214,7 +214,7 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model, codexBin = 'co
   if (!upstreams.some(({ capabilities }) => capabilities?.functionTools === true && capabilities.parallelToolCalls === true)) {
     throw new Error('Codex CLI smoke requires Function Tool and parallel Tool Calling support');
   }
-  await requirePinnedCodexVersion(codexBin, getCodexVersion, boundedTimeout(CODEX_SCENARIO_TIMEOUT_MS, deadlineAt), signal);
+  const codexVersion = await requireCodexAvailable(codexBin, getCodexVersion, boundedTimeout(CODEX_SCENARIO_TIMEOUT_MS, deadlineAt), signal);
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-smoke-'));
   let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
   try {
@@ -234,11 +234,11 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model, codexBin = 'co
           signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
         });
       } catch {
-        throw scenarioFailure(scenario, 'timed out');
+        throw scenarioFailure(scenario, 'timed out', codexVersion);
       }
-      if (response.status !== 200) throw scenarioFailure(scenario, `failed (status=${response.status})`);
+      if (response.status !== 200) throw scenarioFailure(scenario, `failed (status=${response.status})`, codexVersion);
       const events = readEvents(await response.text());
-      assertSemanticCompletion(events, scenario);
+      assertSemanticCompletion(events, scenario, codexVersion);
       return events;
     };
     await directResponse({ input: 'Reply with a short acknowledgement.' }, 'Bridge text Direct Probe');
@@ -247,7 +247,7 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model, codexBin = 'co
       tools: [{ type: 'web_search' }], tool_choice: { type: 'web_search' }, include: ['web_search_call.action.sources'],
     }, 'Bridge Web Search Direct Probe');
     if (webSearchEvents.some((event) => event.type === 'response.web_search_call.in_progress')) {
-      throw scenarioFailure('Bridge Web Search Direct Probe', 'forged a Hosted Web Search call', webSearchEvents);
+      throw scenarioFailure('Bridge Web Search Direct Probe', 'forged a Hosted Web Search call', codexVersion, webSearchEvents);
     }
     const runFunctionProbe = async (parallel: boolean) => {
       const names = parallel ? ['release_smoke_parallel_one', 'release_smoke_parallel_two'] : ['release_smoke_single'];
@@ -263,7 +263,7 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model, codexBin = 'co
         && typeof event.item.call_id === 'string' && typeof event.item.name === 'string'
         ? [{ callId: event.item.call_id, name: event.item.name }] : []);
       if (calls.length !== names.length || names.some((name) => !calls.some((call) => call.name === name))) {
-        throw scenarioFailure(parallel ? 'Bridge parallel Function Direct Probe' : 'Bridge single Function Direct Probe', 'did not return the declared Function Tools', first);
+        throw scenarioFailure(parallel ? 'Bridge parallel Function Direct Probe' : 'Bridge single Function Direct Probe', 'did not return the declared Function Tools', codexVersion, first);
       }
       await directResponse({
         previous_response_id: responseId(first, parallel ? 'Bridge parallel Function Direct Probe' : 'Bridge single Function Direct Probe'),
@@ -287,16 +287,16 @@ export const runReleaseSmoke = async ({ apiKey, upstreams, model, codexBin = 'co
       try {
         await runCodex(codexArgs(withWebSearch), { PATH: process.env.PATH ?? '', CODEX_HOME: codexHome, BRIDGE_API_KEY: apiKey }, boundedTimeout(CODEX_SCENARIO_TIMEOUT_MS, deadlineAt), signal);
       } catch {
-        throw scenarioFailure(withWebSearch ? 'Codex Web Search Smoke' : 'Codex baseline Smoke', 'execution failed');
+        throw scenarioFailure(withWebSearch ? 'Codex Web Search Smoke' : 'Codex baseline Smoke', 'execution failed', codexVersion);
       }
       const codexResponses = runningBridge.state.responses().slice(responseCount);
       const codexEvents = runningBridge.state.events().slice(eventCount).map((event) => event.type);
       if (!codexResponses.some((response) => response.status === 'completed')
         || codexEvents.filter((type) => type === 'response.completed').length !== 1
         || codexEvents.some((type) => type === 'response.failed' || type === 'response.incomplete' || type.startsWith('chat.'))) {
-        throw new Error(`Codex CLI [codex-cli ${PINNED_CODEX_VERSION}] did not complete a Bridge Response (responses=${codexResponses.map((response) => response.status).join(',') || 'none'}; events=${codexEvents.join(',') || 'none'})`);
+        throw new Error(`Codex CLI [codex-cli ${codexVersion}] did not complete a Bridge Response (responses=${codexResponses.map((response) => response.status).join(',') || 'none'}; events=${codexEvents.join(',') || 'none'})`);
       }
-      if (codexEvents.includes('response.web_search_call.in_progress')) throw scenarioFailure(withWebSearch ? 'Codex Web Search Smoke' : 'Codex baseline Smoke', 'forged a Hosted Web Search call', codexEvents.map((type) => ({ type })));
+      if (codexEvents.includes('response.web_search_call.in_progress')) throw scenarioFailure(withWebSearch ? 'Codex Web Search Smoke' : 'Codex baseline Smoke', 'forged a Hosted Web Search call', codexVersion, codexEvents.map((type) => ({ type })));
     };
     await runCodexScenario(false);
     await runCodexScenario(true);

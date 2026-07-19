@@ -39,7 +39,7 @@ test('StreamTranslator emits an added item before text delta and retains a later
   t.feed(JSON.stringify({ usage: { prompt_tokens: 2, completion_tokens: 3, cache_creation_input_tokens: 1 } }));
   assert.equal(t.finishReason, 'incomplete');
   assert.deepEqual(t.usage, {
-    input_tokens: 2, output_tokens: 3, input_tokens_details: { cached_tokens: 0, cache_creation_tokens: 1 }, output_tokens_details: { reasoning_tokens: 0 },
+    input_tokens: 2, output_tokens: 3, total_tokens: 5, input_tokens_details: { cached_tokens: 0, cache_creation_tokens: 1 }, output_tokens_details: { reasoning_tokens: 0 },
   });
 });
 

@@ -43,7 +43,7 @@
 - **Codex Integration Gate**: 对已声明的 Codex 调用路径，Compatibility Fixture 与真实 Codex CLI smoke 均通过且每次产生语义 `response.completed`、无协议错误和无伪造 Hosted Web Search 调用的发布门禁；它不承诺外部模型或网络永不发生瞬态故障。
 - **Codex Native Tool Loop**: 真实 Codex CLI 在隔离临时工作目录中发起一次只读 `exec_command` 函数调用、提交工具结果并完成续接的调用路径；它验证 Codex 工具声明与结果回传的端到端协议。`apps` 与 `multi_agent` 保持禁用，不属于此路径或 Bridge 的支持承诺。
 - **Codex Smoke Evidence**: Codex Integration Gate 的稳定验收信号：函数调用与工具结果续接、每轮唯一的 `response.completed`、无 `response.failed` / `response.incomplete` 及无非 Responses SSE；不以模型生成正文或调用 ID 为验收依据。
-- **Codex Compatibility Version**: Codex Integration Gate 唯一允许执行真实预检的 CLI 版本；初始值为 `0.144.5`。升级该版本必须作为显式兼容性变更，更新样本并重新通过完整门禁。
+- **Codex Compatibility Version**: 真实 Codex 预检使用的本地已安装 `codex-cli` 版本；Bridge 在运行前只校验它能报告版本，不再固定某个兼容版本，也不以特定 CLI 版本作为门禁。
 - **Codex Protocol Fixture**: 真实 Codex CLI 配合脚本化 Completion 上游的确定性预检；上游强制产生 Codex Native Tool Loop 所需的工具调用，以验证客户端协议而不依赖模型的工具选择策略。
 - **Inline Tool Replay**: `store:false` Codex 客户端在单次输入中同时提供工具调用和对应工具输出、但不提供 `previous_response_id` 的续接表达；Bridge 仅在调用与输出的 `call_id` 成对匹配时接受，并将其转为上游 assistant 工具调用与 tool 消息。
 - **Release Preflight Model**: 仅由忽略的 `config.test.yaml` 显式指定、用于全部真实预检请求的模型；没有默认值，以使模型替换成为可见的部署变更。
