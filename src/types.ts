@@ -41,11 +41,14 @@ export type FunctionTool = { type: 'function'; name: string; description?: strin
 export type CustomTool = { type: 'custom'; name: string; description?: string; format?: unknown };
 export type WebSearchTool = { type: 'web_search' };
 export type NamespaceTool = { type: 'namespace'; name: string; description: string; tools: FunctionTool[] };
-export type Tool = FunctionTool | CustomTool | WebSearchTool | NamespaceTool;
+export type ToolSearchTool = { type: 'tool_search'; description?: string };
+export type Tool = FunctionTool | CustomTool | WebSearchTool | NamespaceTool | ToolSearchTool;
 export type FunctionToolOutput = { type: 'function_call_output'; call_id: string; output: string };
 export type CustomToolOutput = { type: 'custom_tool_call_output'; call_id: string; output: string };
+export type ToolSearchOutput = { type: 'tool_search_output'; call_id: string; tools: Tool[] };
 export type InlineFunctionCall = { type: 'function_call'; call_id: string; name: string; arguments: string };
 export type InlineCustomToolCall = { type: 'custom_tool_call'; call_id: string; name: string; input: string };
+export type InlineToolSearchCall = { type: 'tool_search_call'; call_id: string; arguments: string };
 export type ChatContentPart =
   | { type: 'text'; text: string }
   | { type: 'refusal'; refusal: string }
@@ -53,11 +56,12 @@ export type ChatContentPart =
   | { type: 'file'; file: { file_id?: string; filename?: string; file_data?: string } }
   | { type: 'input_audio'; input_audio: { data: string; format: string } };
 export type InputMessage = { type: 'message'; id?: string; role: 'user' | 'assistant' | 'system' | 'developer'; content: string | ChatContentPart[] };
-export type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput | InlineFunctionCall | InlineCustomToolCall;
+export type InputItem = InputMessage | FunctionToolOutput | CustomToolOutput | ToolSearchOutput | InlineFunctionCall | InlineCustomToolCall | InlineToolSearchCall;
 export type OutputItem =
   | { id: string; type: 'message'; status: 'completed'; role: 'assistant'; content: Array<{ type: 'output_text'; text: string }> }
   | { id: string; type: 'function_call'; status: 'completed'; call_id: string; name: string; arguments: string; namespace?: string }
   | { id: string; type: 'custom_tool_call'; status: 'completed'; call_id: string; name: string; input: string }
+  | { id: string; type: 'tool_search_call'; status: 'completed'; call_id: string; execution: 'client'; arguments: string }
   | { id: string; type: 'web_search_call'; status: string; [key: string]: unknown };
 export type StoredResponse = {
   id: string; parentId?: string; model: string; input: InputItem[]; tools: Tool[]; parallelToolCalls: boolean; output: OutputItem[];

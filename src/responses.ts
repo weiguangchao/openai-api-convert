@@ -115,15 +115,16 @@ const parseAndValidateRequest = async (ctx: RequestContext, request: IncomingMes
   }
   const tools = normalizeTools(payload.tools);
   if (payload.tools !== undefined && !tools) {
-    return { ok: false, error: { status: 400, message: 'Only Function, Custom, Tool Namespace, and web_search tools are supported', code: 'unsupported_tools' } };
+    return { ok: false, error: { status: 400, message: 'Only Function, Custom, Tool Namespace, Tool Search, and web_search tools are supported', code: 'unsupported_tools' } };
   }
   if (payload.previous_response_id !== undefined && (typeof payload.previous_response_id !== 'string' || !payload.previous_response_id)) {
     return { ok: false, error: { status: 400, message: 'previous_response_id must be a string', code: 'invalid_previous_response_id' } };
   }
-  const inlineCallKinds = new Map(input.flatMap((item) => item.type === 'function_call' || item.type === 'custom_tool_call'
+  const inlineCallKinds = new Map(input.flatMap((item) => item.type === 'function_call' || item.type === 'custom_tool_call' || item.type === 'tool_search_call'
     ? [[item.call_id, item.type] as const] : []));
   if (input.some((item) => (item.type === 'function_call_output' && inlineCallKinds.get(item.call_id) !== 'function_call')
-    || (item.type === 'custom_tool_call_output' && inlineCallKinds.get(item.call_id) !== 'custom_tool_call')) && !payload.previous_response_id) {
+    || (item.type === 'custom_tool_call_output' && inlineCallKinds.get(item.call_id) !== 'custom_tool_call')
+    || (item.type === 'tool_search_output' && inlineCallKinds.get(item.call_id) !== 'tool_search_call')) && !payload.previous_response_id) {
     return { ok: false, error: { status: 400, message: 'Tool output requires previous_response_id', code: 'missing_previous_response_id' } };
   }
   return { ok: true, value: { payload, rawBody, idempotencyKey, reasoningEffort, input, tools } };
@@ -143,23 +144,31 @@ const resolveChainAndCapabilities = (ctx: RequestContext, payload: ResponsesPayl
   ), -1);
   const effectiveInput = lastEchoedMessage === -1 ? input : input.slice(lastEchoedMessage + 1);
   const callKinds = new Map((ancestors.at(-1)?.output ?? [])
-    .filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call')
+    .filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' | 'tool_search_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call' || item.type === 'tool_search_call')
     .map((item) => [item.call_id, item.type]));
   for (const item of effectiveInput) {
-    if (item.type === 'function_call' || item.type === 'custom_tool_call') callKinds.set(item.call_id, item.type);
+    if (item.type === 'function_call' || item.type === 'custom_tool_call' || item.type === 'tool_search_call') callKinds.set(item.call_id, item.type);
   }
   if (effectiveInput.some((item) => (item.type === 'function_call_output' && callKinds.get(item.call_id) !== 'function_call')
-    || (item.type === 'custom_tool_call_output' && callKinds.get(item.call_id) !== 'custom_tool_call'))) {
+    || (item.type === 'custom_tool_call_output' && callKinds.get(item.call_id) !== 'custom_tool_call')
+    || (item.type === 'tool_search_output' && callKinds.get(item.call_id) !== 'tool_search_call'))) {
     return { ok: false, error: { status: 400, message: 'Tool call was not found', code: 'function_call_not_found' } };
   }
   const effectiveTools = tools ?? [...ancestors].reverse().find((item) => item.tools.length > 0)?.tools ?? [];
-  const chainTools = [...ancestors.flatMap((item) => item.tools), ...effectiveTools];
+  // Tool Search output carries dynamically loaded tool definitions; they immediately enter
+  // the effective Tool Context for this and every successor Response, derived from the
+  // persisted chain input rather than the current request tools.
+  const loadedTools = [...ancestors.flatMap((item) => item.input), ...effectiveInput]
+    .filter((item): item is Extract<InputItem, { type: 'tool_search_output' }> => item.type === 'tool_search_output')
+    .flatMap((item) => item.tools);
+  const effectiveToolsWithLoaded = [...effectiveTools, ...loadedTools];
+  const chainTools = [...ancestors.flatMap((item) => item.tools), ...effectiveToolsWithLoaded];
   const needs: ExecutionNeeds = {
-    functionTools: chainTools.some((tool) => tool.type === 'function' || tool.type === 'namespace' || tool.type === 'custom'),
+    functionTools: chainTools.some((tool) => tool.type === 'function' || tool.type === 'namespace' || tool.type === 'custom' || tool.type === 'tool_search'),
     parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
   };
   const degradeWebSearch = chainTools.some((tool) => tool.type === 'web_search');
-  return { ok: true, value: { ancestors, input: effectiveInput, effectiveTools, degradeWebSearch, needs } };
+  return { ok: true, value: { ancestors, input: effectiveInput, effectiveTools: effectiveToolsWithLoaded, degradeWebSearch, needs } };
 };
 
 const claimOrCreateResponse = async (ctx: RequestContext, request: IncomingMessage, payload: ResponsesPayload, input: InputItem[], tools: Tool[] | undefined, reasoningEffort: string | undefined, idempotencyKey: string | undefined, model: string): Promise<Result<ClaimResult>> => {

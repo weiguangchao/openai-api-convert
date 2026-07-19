@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ChatContentPart, ChatMessage, ChatToolCall, CustomTool, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, ResponsesUsage, Result, StoredResponse, Tool } from './types.js';
 
-export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
+export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'tool_search_call', 'web_search_call', 'reasoning']);
 
 export const normalizeInput = (input: unknown): InputItem[] | undefined => {
   if (typeof input === 'string' && input.length > 0) return [{ type: 'message', role: 'user', content: input }];
@@ -11,8 +11,8 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
     const item = input[index];
     if (!item || typeof item !== 'object') continue;
     const value = item as Record<string, unknown>;
-    if ((value.type !== 'function_call' && value.type !== 'custom_tool_call') || typeof value.call_id !== 'string') continue;
-    const outputType = value.type === 'function_call' ? 'function_call_output' : 'custom_tool_call_output';
+    if ((value.type !== 'function_call' && value.type !== 'custom_tool_call' && value.type !== 'tool_search_call') || typeof value.call_id !== 'string') continue;
+    const outputType = value.type === 'function_call' ? 'function_call_output' : value.type === 'custom_tool_call' ? 'custom_tool_call_output' : 'tool_search_output';
     if (input.slice(index + 1).some((next) => next && typeof next === 'object'
       && (next as Record<string, unknown>).type === outputType && (next as Record<string, unknown>).call_id === value.call_id)) {
       inlineCallIndexes.add(index);
@@ -33,6 +33,11 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
       classified.push({ kind: 'item', item: { type: 'custom_tool_call', call_id: value.call_id, name: value.name, input: value.input } });
       continue;
     }
+    if (value.type === 'tool_search_call' && inlineCallIndexes.has(index)
+      && typeof value.call_id === 'string' && typeof value.arguments === 'string') {
+      classified.push({ kind: 'item', item: { type: 'tool_search_call', call_id: value.call_id, arguments: value.arguments } });
+      continue;
+    }
     if (typeof value.type === 'string' && INPUT_ECHO_TYPES.has(value.type)) {
       classified.push({ kind: 'echo' });
       continue;
@@ -41,6 +46,13 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
       const content = normalizeMessageContent(value.content, value.role);
       if (!content) return undefined;
       classified.push({ kind: 'item', item: { type: 'message', role: value.role, content, ...(typeof value.id === 'string' ? { id: value.id } : {}) } });
+      continue;
+    }
+    if (value.type === 'tool_search_output') {
+      if (typeof value.call_id !== 'string') return undefined;
+      const tools = normalizeTools(value.tools);
+      if (!tools) return undefined;
+      classified.push({ kind: 'item', item: { type: 'tool_search_output', call_id: value.call_id, tools } });
       continue;
     }
     if ((value.type !== 'function_call_output' && value.type !== 'custom_tool_call_output') || typeof value.call_id !== 'string' || typeof value.output !== 'string') return undefined;
@@ -176,6 +188,14 @@ export const normalizeTools = (tools: unknown): Tool[] | undefined => {
       });
       continue;
     }
+    if (value.type === 'tool_search') {
+      // Tool Search is a client-executed discovery protocol proxied as a fixed Chat function;
+      // only the optional description is preserved. execution is never stored: this bridge
+      // always proxies tool_search as client-executed and restores execution:'client'.
+      if (value.description !== undefined && value.description !== null && typeof value.description !== 'string') return undefined;
+      normalized.push({ type: 'tool_search', ...(typeof value.description === 'string' ? { description: value.description } : {}) });
+      continue;
+    }
     return undefined;
   }
   return normalized;
@@ -210,9 +230,17 @@ export const namespaceToolAlias = (namespace: string, name: string) => {
 export const buildToolContext = (tools: Tool[]) => {
   const reserved = new Set<string>();
   const customNames = new Set<string>();
+  const toolSearchNames = new Set<string>();
   for (const tool of tools) {
+    if (tool.type === 'tool_search') {
+      // Tool Search proxies as the fixed `tool_search` Chat function, so that name is
+      // reserved and a client Function/Custom named `tool_search` would collide on reverse.
+      if (toolSearchNames.has(TOOL_SEARCH_PROXY_NAME) || reserved.has(TOOL_SEARCH_PROXY_NAME) || customNames.has(TOOL_SEARCH_PROXY_NAME)) throw new Error('Tool name conflict');
+      toolSearchNames.add(TOOL_SEARCH_PROXY_NAME);
+      continue;
+    }
     if (tool.type !== 'function' && tool.type !== 'custom') continue;
-    if (reserved.has(tool.name) || customNames.has(tool.name)) throw new Error('Tool name conflict');
+    if (reserved.has(tool.name) || customNames.has(tool.name) || toolSearchNames.has(tool.name)) throw new Error('Tool name conflict');
     if (tool.type === 'custom') customNames.add(tool.name);
     else reserved.add(tool.name);
   }
@@ -224,13 +252,13 @@ export const buildToolContext = (tools: Tool[]) => {
       const key = `${tool.name}\0${child.name}`;
       if (refToAlias.has(key)) throw new Error('Tool Namespace alias conflict');
       const alias = namespaceToolAlias(tool.name, child.name);
-      if (reserved.has(alias) || customNames.has(alias)) throw new Error('Tool Namespace alias conflict');
+      if (reserved.has(alias) || customNames.has(alias) || toolSearchNames.has(alias)) throw new Error('Tool Namespace alias conflict');
       reserved.add(alias);
       aliasToRef.set(alias, { name: child.name, namespace: tool.name });
       refToAlias.set(key, alias);
     }
   }
-  return { aliasToRef, refToAlias, customNames };
+  return { aliasToRef, refToAlias, customNames, toolSearchNames };
 };
 
 // Custom Tool proxy description embeds the original Custom tool definition so the model
@@ -245,6 +273,16 @@ export const buildCustomProxyDescription = (tool: CustomTool): string => {
 // Custom Tool proxy parameters: a single required string `input` carrying the free-form
 // Custom input. The schema is fixed regardless of the original `format`.
 export const CUSTOM_PROXY_PARAMETERS = { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] };
+
+// Tool Search proxies as a fixed Chat function named `tool_search` with an empty object
+// parameter schema (the Responses client-executed tool_search carries EmptyModelParam).
+export const TOOL_SEARCH_PROXY_NAME = 'tool_search';
+export const TOOL_SEARCH_PROXY_PARAMETERS = { type: 'object', properties: {} };
+
+// Tool Search output is the loaded tool definitions; they are serialized into the Chat
+// `tool` message content so the upstream model observes what the discovery returned. The
+// same tools are also placed in the Chat `tools` array so they can be called directly.
+export const toolSearchOutputContent = (tools: Tool[]) => JSON.stringify(tools);
 
 // Reverse conversion prefers `{ input: string }`; empty, non-JSON, non-object, missing
 // or non-string input falls back to the raw arguments so free-form input is never lost.
@@ -275,6 +313,19 @@ export const toChatTools = (tools: Tool[]) => {
           },
         });
       }
+      continue;
+    }
+    if (tool.type === 'tool_search') {
+      // Tool Search proxied as the fixed `tool_search` Chat function; the optional
+      // client description is passed through so the model knows when to discover tools.
+      chatTools.push({
+        type: 'function',
+        function: {
+          name: TOOL_SEARCH_PROXY_NAME,
+          ...(tool.description === undefined ? {} : { description: tool.description }),
+          parameters: TOOL_SEARCH_PROXY_PARAMETERS,
+        },
+      });
       continue;
     }
     if (tool.type === 'function') {
@@ -318,7 +369,13 @@ export const toChatToolChoice = (toolChoice: unknown, tools: Tool[]) => {
 export const WEB_SEARCH_UNAVAILABLE_HINT = 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.';
 
 export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
-  const { refToAlias } = buildToolContext(response.tools);
+  // The Tool Context for this Response is the declared tools plus any tools dynamically
+  // loaded by tool_search_output items in its own input; both are persisted, so the
+  // alias map is rebuilt from them rather than from the current request tools.
+  const loadedTools = response.input
+    .filter((item): item is Extract<InputItem, { type: 'tool_search_output' }> => item.type === 'tool_search_output')
+    .flatMap((item) => item.tools);
+  const { refToAlias } = buildToolContext([...response.tools, ...loadedTools]);
   const messages: ChatMessage[] = response.input.flatMap((item): ChatMessage[] => {
     if (item.type === 'message') return [{ role: item.role === 'developer' || item.role === 'system' ? 'system' : item.role, content: item.content }];
     if (item.type === 'function_call') return [{
@@ -327,17 +384,26 @@ export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
     if (item.type === 'custom_tool_call') return [{
       role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: JSON.stringify({ input: item.input }) } }],
     }];
+    if (item.type === 'tool_search_call') return [{
+      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, arguments: item.arguments } }],
+    }];
+    if (item.type === 'tool_search_output') return [{
+      role: 'tool', tool_call_id: item.call_id, content: toolSearchOutputContent(item.tools),
+    }];
     return [{ role: 'tool', tool_call_id: item.call_id, content: item.output }];
   });
-  const toolCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call');
+  const toolCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' | 'tool_search_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call' || item.type === 'tool_search_call');
   const text = response.output.find((item): item is Extract<OutputItem, { type: 'message' }> => item.type === 'message');
   if (text || toolCalls.length) {
     messages.push({
       role: 'assistant',
       ...(text ? { content: text.content.map((part) => part.text).join('') } : {}),
       ...(toolCalls.length ? { tool_calls: toolCalls.map((item): ChatToolCall => {
-        if (item.type !== 'function_call') {
+        if (item.type === 'custom_tool_call') {
           return { id: item.call_id, type: 'function', function: { name: item.name, arguments: JSON.stringify({ input: item.input }) } };
+        }
+        if (item.type === 'tool_search_call') {
+          return { id: item.call_id, type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, arguments: item.arguments } };
         }
         const alias = item.namespace ? refToAlias.get(`${item.namespace}\0${item.name}`) : undefined;
         if (item.namespace && !alias) throw new Error('Tool Namespace alias missing');
@@ -393,7 +459,7 @@ export class StreamTranslator {
   finishReason: 'completed' | 'incomplete' | undefined;
   #nextOutputIndex = 0;
   #textOutputIndex: number | undefined;
-  #calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
+  #calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom' | 'tool_search'; input: string; outputIndex: number }>();
   #id: string;
   #toolContext: ToolContext;
 
@@ -431,7 +497,9 @@ export class StreamTranslator {
       const isNew = !this.#calls.has(index);
       if (isNew) {
         const initialName = typeof call.function?.name === 'string' ? call.function.name : undefined;
-        const kind = initialName && this.#toolContext.customNames.has(initialName) ? 'custom' : 'function';
+        const kind = initialName && this.#toolContext.toolSearchNames.has(initialName) ? 'tool_search'
+          : initialName && this.#toolContext.customNames.has(initialName) ? 'custom'
+          : 'function';
         this.#calls.set(index, { kind, input: '', outputIndex: index + (this.#textOutputIndex === undefined ? 0 : 1) });
       }
       const current = this.#calls.get(index)!;
@@ -441,7 +509,7 @@ export class StreamTranslator {
       if (isNew) {
         events.push({
           type: 'response.output_item.added', output_index: current.outputIndex,
-          item: { id: current.id ?? `tc_${index}`, type: current.kind === 'function' ? 'function_call' : 'custom_tool_call', status: 'in_progress' },
+          item: { id: current.id ?? `tc_${index}`, type: current.kind === 'function' ? 'function_call' : current.kind === 'custom' ? 'custom_tool_call' : 'tool_search_call', status: 'in_progress' },
         });
       }
       const inputDelta = call.function?.arguments;
@@ -470,6 +538,15 @@ export class StreamTranslator {
     });
     for (const [index, call] of [...this.#calls.entries()].sort(([left], [right]) => left - right)) {
       if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
+      if (call.kind === 'tool_search') {
+        // Tool Search has no dedicated argument delta/done event in the Responses SSE
+        // lifecycle, so only the completed tool_search_call item is emitted.
+        orderedOutput.push({
+          index: call.outputIndex,
+          item: { id: call.id, type: 'tool_search_call', status: 'completed', call_id: call.id, execution: 'client', arguments: call.input },
+        });
+        continue;
+      }
       const resolved = call.kind === 'function' ? this.#toolContext.aliasToRef.get(call.name) : undefined;
       orderedOutput.push({
         index: call.outputIndex,

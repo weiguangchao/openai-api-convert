@@ -7,7 +7,8 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startBridge, type RunningBridge } from '../src/server.js';
-import { namespaceToolAlias } from '../src/adapter.js';
+import { namespaceToolAlias, toolSearchOutputContent } from '../src/adapter.js';
+import type { Tool } from '../src/types.js';
 
 const captureStdoutLines = () => {
   const lines: string[] = [];
@@ -181,6 +182,73 @@ const startCustomFixture = async () => {
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell","type":"function","function":{"name":"shell","arguments":"{\\"input\\":\\"ls\\"}"}}]}}]}\r\n\r\n',
       'data: [DONE]\r\n\r\n',
     ],
+    [
+      'data: {"choices":[{"delta":{"content":"done"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  ];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end((streams[requests.length - 1] ?? ['data: [DONE]\r\n\r\n']).join(''));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
+const startToolSearchFixture = async () => {
+  const requests: unknown[] = [];
+  const streams = [
+    // Turn 1: the model discovers tools via the fixed tool_search function proxy.
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ts","type":"function","function":{"name":"tool_search","arguments":"{}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+    // Turn 2: the model calls a dynamically loaded function returned by tool search.
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Paris\\"}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  ];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end((streams[requests.length - 1] ?? ['data: [DONE]\r\n\r\n']).join(''));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
+const startToolSearchNamespaceFixture = async () => {
+  const requests: unknown[] = [];
+  const streams = [
+    // Turn 1: discover tools via tool_search.
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ts","type":"function","function":{"name":"tool_search","arguments":"{}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+    // Turn 2: call a dynamically loaded namespace function (aliased weather__get_forecast).
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ns","type":"function","function":{"name":"weather__get_forecast","arguments":"{}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+    // Turn 3: plain text reply.
     [
       'data: {"choices":[{"delta":{"content":"done"}}]}\r\n\r\n',
       'data: [DONE]\r\n\r\n',
@@ -1632,6 +1700,155 @@ test('Custom Tool runs on a Function-only upstream without native Custom support
     assert.equal(request.tools.length, 1);
     assert.equal(request.tools[0].type, 'function');
     assert.equal(request.tools[0].function?.name, 'shell');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const loadedWeatherTool: Tool = { type: 'function', name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } };
+const toolSearchProxy = { type: 'function', function: { name: 'tool_search', description: 'Discover tools', parameters: { type: 'object', properties: {} } } };
+
+test('Tool Search discovers, loads tools, and drives a subsequent dynamic tool call', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startToolSearchFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ stream: true, input: 'Find a weather tool.', tools: [{ type: 'tool_search', description: 'Discover tools' }] }),
+    });
+    assert.equal(first.status, 200);
+    const firstEvents = sseTypes(await first.text()) as unknown as Array<{ type: string; item?: { type: string; call_id: string; arguments: string; execution: string } }>;
+    assert.deepEqual(
+      firstEvents.find((event) => event.type === 'response.output_item.done')?.item,
+      { id: 'call_ts', type: 'tool_search_call', status: 'completed', call_id: 'call_ts', execution: 'client', arguments: '{}' },
+    );
+    assert.deepEqual(upstream.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [{ role: 'user', content: 'Find a weather tool.' }],
+      tools: [toolSearchProxy],
+    });
+
+    const responseId = (firstEvents.find((event) => event.type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        stream: true, previous_response_id: responseId,
+        input: [{ type: 'tool_search_output', call_id: 'call_ts', tools: [loadedWeatherTool] }],
+      }),
+    });
+    assert.equal(second.status, 200);
+    const secondEvents = sseTypes(await second.text()) as unknown as Array<{ type: string; item?: { type: string; call_id: string; name: string; arguments: string } }>;
+    assert.deepEqual(
+      secondEvents.find((event) => event.type === 'response.output_item.done')?.item,
+      { id: 'call_weather', type: 'function_call', status: 'completed', call_id: 'call_weather', name: 'get_weather', arguments: '{"city":"Paris"}' },
+    );
+    assert.deepEqual(upstream.requests[1], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'user', content: 'Find a weather tool.' },
+        { role: 'assistant', tool_calls: [{ id: 'call_ts', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'call_ts', content: toolSearchOutputContent([loadedWeatherTool]) },
+      ],
+      tools: [toolSearchProxy, { type: 'function', function: { name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } }],
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Tool Search is proxied while Hosted Web Search still degrades alongside it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Find an example.',
+        tools: [{ type: 'tool_search', description: 'Discover tools' }, { type: 'web_search' }],
+        tool_choice: { type: 'web_search' },
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    const events = sseTypes(body);
+    assert.equal(events.at(-1)?.type, 'response.completed');
+    assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
+    assert.equal(body.includes('url_citation'), false);
+    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools: Array<{ type: string; function: { name: string } }>; tool_choice: unknown; parallel_tool_calls?: unknown };
+    assert.deepEqual(request.tools, [toolSearchProxy]);
+    assert.equal(request.tool_choice, 'auto');
+    assert.equal(request.parallel_tool_calls, undefined);
+    assert.equal(request.messages.some(({ role, content }) => role === 'system' && content.includes('web search is unavailable')), true);
+    assert.deepEqual(request.messages.at(-1), { role: 'user', content: 'Find an example.' });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Tool Search loaded Namespace tool continues across a Response Chain', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startToolSearchNamespaceFixture();
+  const loadedNamespace: Tool = { type: 'namespace', name: 'weather', description: 'Weather tools', tools: [{ type: 'function', name: 'get_forecast' }] };
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, parallelToolCalls: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ stream: true, input: 'Find tools.', tools: [{ type: 'tool_search', description: 'Discover tools' }] }),
+    });
+    const firstId = (sseTypes(await first.text()).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ stream: true, previous_response_id: firstId, input: [{ type: 'tool_search_output', call_id: 'call_ts', tools: [loadedNamespace] }] }),
+    });
+    const secondBody = await second.text();
+    const secondId = (sseTypes(secondBody).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+    const secondCall = (sseTypes(secondBody) as unknown as Array<{ type: string; item?: { type: string; name: string; namespace: string } }>)
+      .find((event) => event.type === 'response.output_item.done')?.item;
+    assert.deepEqual(secondCall, { id: 'call_ns', type: 'function_call', status: 'completed', call_id: 'call_ns', name: 'get_forecast', arguments: '{}', namespace: 'weather' });
+
+    // The continuation rebuilds the predecessor's Tool Context from its persisted
+    // tool_search_output input; without the loaded namespace alias this turn would fail.
+    const third = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ stream: true, previous_response_id: secondId, input: [{ type: 'function_call_output', call_id: 'call_ns', output: 'sunny' }] }),
+    });
+    assert.equal(third.status, 200);
+    assert.equal(sseTypes(await third.text()).at(-1)?.type, 'response.completed');
+    const continuation = upstream.requests[2] as { messages: Array<{ role: string; content?: string; tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>; tool_call_id?: string }>; tools: Array<{ type: string; function: { name: string } }> };
+    assert.deepEqual(continuation.tools.map((tool) => tool.function.name), ['tool_search', 'weather__get_forecast']);
+    assert.deepEqual(continuation.messages, [
+      { role: 'user', content: 'Find tools.' },
+      { role: 'assistant', tool_calls: [{ id: 'call_ts', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_ts', content: toolSearchOutputContent([loadedNamespace]) },
+      { role: 'assistant', tool_calls: [{ id: 'call_ns', type: 'function', function: { name: 'weather__get_forecast', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_ns', content: 'sunny' },
+    ]);
   } finally {
     await bridge?.close();
     await upstream.close();

@@ -7,6 +7,8 @@ import {
   INPUT_ECHO_TYPES,
   REASONING_EFFORTS,
   TOOL_NAME_MAX,
+  TOOL_SEARCH_PROXY_NAME,
+  TOOL_SEARCH_PROXY_PARAMETERS,
   WEB_SEARCH_UNAVAILABLE_HINT,
   buildCustomProxyDescription,
   buildToolContext,
@@ -19,6 +21,7 @@ import {
   toChatMessages,
   toChatToolChoice,
   toChatTools,
+  toolSearchOutputContent,
 } from '../src/adapter.js';
 import type { StoredResponse, Tool } from '../src/types.js';
 
@@ -31,7 +34,7 @@ const baseResponse = (overrides: Partial<StoredResponse> = {}): StoredResponse =
 // ---- constants ----
 
 test('INPUT_ECHO_TYPES is the set of echoed type names', () => {
-  assert.deepEqual([...INPUT_ECHO_TYPES].sort(), ['custom_tool_call', 'function_call', 'reasoning', 'web_search_call']);
+  assert.deepEqual([...INPUT_ECHO_TYPES].sort(), ['custom_tool_call', 'function_call', 'reasoning', 'tool_search_call', 'web_search_call']);
 });
 
 test('TOOL_NAME_MAX is 64 and ALIAS_HASH_LEN is 16', () => {
@@ -144,6 +147,41 @@ test('normalizeInput: invalid item type or non-object item returns undefined', (
   assert.strictEqual(normalizeInput([{ type: 'something_else' }]), undefined);
   assert.strictEqual(normalizeInput(['x']), undefined);
   assert.strictEqual(normalizeInput([null]), undefined);
+});
+
+// ---- normalizeInput: Tool Search ----
+
+test('normalizeInput: tool_search_call is an echo type dropped before the suffix', () => {
+  assert.deepEqual(
+    normalizeInput([{ type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }]),
+    [{ type: 'message', role: 'user', content: 'hi' }],
+  );
+});
+
+test('normalizeInput: tool_search_output normalizes loaded tools and keeps call_id', () => {
+  assert.deepEqual(
+    normalizeInput([{ type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather', description: 'd', parameters: { type: 'object' } }] }]),
+    [{ type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather', description: 'd', parameters: { type: 'object' } }] }],
+  );
+});
+
+test('normalizeInput: tool_search_output with missing call_id or invalid tools returns undefined', () => {
+  assert.strictEqual(normalizeInput([{ type: 'tool_search_output', tools: [] }]), undefined);
+  assert.strictEqual(normalizeInput([{ type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'file_search' }] }]), undefined);
+  assert.strictEqual(normalizeInput([{ type: 'tool_search_output', call_id: 'ts_1', tools: 'nope' }]), undefined);
+});
+
+test('normalizeInput: paired inline tool_search_call and output are kept for store:false clients', () => {
+  assert.deepEqual(
+    normalizeInput([
+      { type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' },
+      { type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather' }] },
+    ]),
+    [
+      { type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' },
+      { type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather' }] },
+    ],
+  );
 });
 
 // ---- normalizeFunctionTool ----
@@ -277,6 +315,15 @@ test('normalizeTools: unknown tool type returns undefined', () => {
   assert.strictEqual(normalizeTools([{ type: 'other', name: 'x' }]), undefined);
 });
 
+test('normalizeTools: tool_search normalized with optional description; execution is not stored', () => {
+  assert.deepEqual(normalizeTools([{ type: 'tool_search' }]), [{ type: 'tool_search' }]);
+  assert.deepEqual(normalizeTools([{ type: 'tool_search', description: 'Discover tools' }]), [{ type: 'tool_search', description: 'Discover tools' }]);
+  assert.deepEqual(normalizeTools([{ type: 'tool_search', execution: 'server', parameters: {} }]), [{ type: 'tool_search' }]);
+  assert.strictEqual(normalizeTools([{ type: 'tool_search', description: 1 }]), undefined);
+  // execution is never stored, so any value is accepted and dropped rather than validated.
+  assert.deepEqual(normalizeTools([{ type: 'tool_search', execution: 'bogus' }]), [{ type: 'tool_search' }]);
+});
+
 // ---- namespaceToolAlias ----
 
 test('namespaceToolAlias: short name is namespace__name with no hash', () => {
@@ -371,6 +418,39 @@ test('buildToolContext: different namespaces with same child name do not conflic
   assert.notStrictEqual(refToAlias.get('ns1\0fn'), refToAlias.get('ns2\0fn'));
 });
 
+// ---- Tool Search context ----
+
+test('buildToolContext: tool_search registers the fixed proxy name', () => {
+  const { toolSearchNames, customNames, aliasToRef } = buildToolContext([{ type: 'tool_search', description: 'd' }]);
+  assert.deepEqual([...toolSearchNames], [TOOL_SEARCH_PROXY_NAME]);
+  assert.deepEqual([...customNames], []);
+  assert.equal(aliasToRef.has(TOOL_SEARCH_PROXY_NAME), false);
+});
+
+test('buildToolContext: a Function named tool_search conflicts with the proxy', () => {
+  assert.throws(() => buildToolContext([{ type: 'tool_search' }, { type: 'function', name: 'tool_search' }]), /Tool name conflict/);
+  assert.throws(() => buildToolContext([{ type: 'function', name: 'tool_search' }, { type: 'tool_search' }]), /Tool name conflict/);
+});
+
+test('buildToolContext: a Custom named tool_search conflicts with the proxy', () => {
+  assert.throws(() => buildToolContext([{ type: 'tool_search' }, { type: 'custom', name: 'tool_search' }]), /Tool name conflict/);
+});
+
+test('buildToolContext: duplicate tool_search tools conflict', () => {
+  assert.throws(() => buildToolContext([{ type: 'tool_search' }, { type: 'tool_search' }]), /Tool name conflict/);
+});
+
+test('buildToolContext: tool_search coexists with namespace and function tools', () => {
+  const tools: Tool[] = [
+    { type: 'tool_search' },
+    { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'tool_search_child' }] },
+    { type: 'function', name: 'get_weather' },
+  ];
+  const { toolSearchNames, refToAlias } = buildToolContext(tools);
+  assert.deepEqual([...toolSearchNames], [TOOL_SEARCH_PROXY_NAME]);
+  assert.ok(refToAlias.has('ns\0tool_search_child'));
+});
+
 // ---- Custom Tool proxy ----
 
 test('buildCustomProxyDescription: embeds the original Custom tool definition as JSON', () => {
@@ -452,6 +532,30 @@ test('toChatTools: keeps an object schema but ensures parameters.type is object'
     { type: 'function', function: { name: 'typed', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } },
     { type: 'function', function: { name: 'missing_type', parameters: { type: 'object', properties: { city: { type: 'string' } } } } },
     { type: 'function', function: { name: 'wrong_type', parameters: { type: 'object', description: 'x' } } },
+  ]);
+});
+
+// ---- toChatTools: Tool Search ----
+
+test('toChatTools: tool_search proxies as the fixed tool_search function with empty parameters', () => {
+  assert.deepEqual(toChatTools([{ type: 'tool_search', description: 'Discover tools' }]), [
+    { type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, description: 'Discover tools', parameters: TOOL_SEARCH_PROXY_PARAMETERS } },
+  ]);
+  assert.deepEqual(toChatTools([{ type: 'tool_search' }]), [
+    { type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, parameters: TOOL_SEARCH_PROXY_PARAMETERS } },
+  ]);
+});
+
+test('toChatTools: tool_search sits alongside function and custom tools', () => {
+  const tools: Tool[] = [
+    { type: 'tool_search', description: 'Discover tools' },
+    { type: 'function', name: 'get_weather' },
+    { type: 'custom', name: 'shell' },
+  ];
+  assert.deepEqual(toChatTools(tools), [
+    { type: 'function', function: { name: 'tool_search', description: 'Discover tools', parameters: TOOL_SEARCH_PROXY_PARAMETERS } },
+    { type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'shell', description: buildCustomProxyDescription({ type: 'custom', name: 'shell' }), parameters: CUSTOM_PROXY_PARAMETERS } },
   ]);
 });
 
@@ -548,6 +652,62 @@ test('toChatMessages: no text and no tool_calls yields no assistant message', ()
   assert.deepEqual(
     toChatMessages(baseResponse({ output: [{ id: 'o1', type: 'web_search_call', status: 'completed' }] })),
     [],
+  );
+});
+
+// ---- toChatMessages: Tool Search ----
+
+const loadedWeatherTool = { type: 'function', name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } as const;
+
+test('toChatMessages: tool_search_call output maps to a tool_search function tool_call', () => {
+  assert.deepEqual(
+    toChatMessages(baseResponse({ output: [{ id: 'ts_1', type: 'tool_search_call', status: 'completed', call_id: 'ts_1', execution: 'client', arguments: '{}' }] })),
+    [{ role: 'assistant', tool_calls: [{ id: 'ts_1', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] }],
+  );
+});
+
+test('toChatMessages: inline tool_search_call input maps to a tool_search function tool_call', () => {
+  assert.deepEqual(
+    toChatMessages(baseResponse({ input: [{ type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' }] })),
+    [{ role: 'assistant', tool_calls: [{ id: 'ts_1', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] }],
+  );
+});
+
+test('toChatMessages: tool_search_output input maps to a tool message carrying the loaded tools', () => {
+  assert.deepEqual(
+    toChatMessages(baseResponse({ input: [{ type: 'tool_search_output', call_id: 'ts_1', tools: [loadedWeatherTool] }] })),
+    [{ role: 'tool', tool_call_id: 'ts_1', content: toolSearchOutputContent([loadedWeatherTool]) }],
+  );
+});
+
+test('toChatMessages: tool_search_call output continues alongside loaded function calls', () => {
+  const tools: Tool[] = [{ type: 'tool_search' }, loadedWeatherTool];
+  assert.deepEqual(
+    toChatMessages(baseResponse({ tools, output: [
+      { id: 'ts_1', type: 'tool_search_call', status: 'completed', call_id: 'ts_1', execution: 'client', arguments: '{}' },
+      { id: 'c1', type: 'function_call', status: 'completed', call_id: 'c1', name: 'get_weather', arguments: '{"city":"Paris"}' },
+    ] })),
+    [{ role: 'assistant', tool_calls: [
+      { id: 'ts_1', type: 'function', function: { name: 'tool_search', arguments: '{}' } },
+      { id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Paris"}' } },
+    ] }],
+  );
+});
+
+test('toChatMessages: a namespace call resolves via a tool loaded by tool_search_output', () => {
+  // The namespace tool is not declared in response.tools; it was discovered in-line, so
+  // the alias must be rebuilt from the persisted tool_search_output input on continuation.
+  const loadedNamespace: Tool[] = [{ type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast' }] }];
+  assert.deepEqual(
+    toChatMessages(baseResponse({
+      tools: [],
+      input: [{ type: 'tool_search_output', call_id: 'ts_1', tools: loadedNamespace }],
+    output: [{ id: 'c1', type: 'function_call', status: 'completed', call_id: 'c1', name: 'get_forecast', arguments: '{}', namespace: 'weather' }],
+    })),
+    [
+      { role: 'tool', tool_call_id: 'ts_1', content: toolSearchOutputContent(loadedNamespace) },
+      { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'weather__get_forecast', arguments: '{}' } }] },
+    ],
   );
 });
 
