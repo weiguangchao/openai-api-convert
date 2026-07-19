@@ -1465,9 +1465,10 @@ test('Hosted Web Search always degrades to Chat Completions without forging sear
     assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
     assert.equal(body.includes('url_citation'), false);
     assert.equal(upstream.requests.length, 1);
-    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: unknown };
+    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: unknown; parallel_tool_calls?: unknown };
     assert.equal(request.tools, undefined);
-    assert.equal(request.tool_choice, 'auto');
+    assert.equal(request.tool_choice, undefined);
+    assert.equal(request.parallel_tool_calls, undefined);
     assert.equal(request.messages.some(({ role, content }) => role === 'system' && content.includes('web search is unavailable')), true);
     assert.deepEqual(request.messages.at(-1), { role: 'user', content: 'Find an example.' });
   } finally {
@@ -1784,7 +1785,9 @@ test('forced web_search tool_choice degrades to auto', async () => {
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }], tool_choice: { type: 'web_search' },
+        stream: true, input: 'Find an example.',
+        tools: [{ type: 'web_search' }, { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } }],
+        tool_choice: { type: 'web_search' }, parallel_tool_calls: true,
       }),
     });
     assert.equal(response.status, 200);
@@ -1795,7 +1798,41 @@ test('forced web_search tool_choice degrades to auto', async () => {
         { role: 'system', content: 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.' },
         { role: 'user', content: 'Find an example.' },
       ],
+      tools: [{ type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } }],
+      parallel_tool_calls: true,
       tool_choice: 'auto',
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('forced web_search without Chat tools omits tool_choice and parallel_tool_calls', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }], tool_choice: { type: 'web_search' }, parallel_tool_calls: true,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual(upstream.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'system', content: 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.' },
+        { role: 'user', content: 'Find an example.' },
+      ],
     });
   } finally {
     await bridge?.close();
