@@ -802,7 +802,7 @@ test('bridges a text stream into ordered Responses SSE', async () => {
       model: 'gpt-test', stream: true, stream_options: { include_usage: true },
       messages: [{ role: 'user', content: 'hello' }],
     }]);
-    assert.deepEqual(bridge.state.events().map((event) => event.sequence), [1, 2, 3, 4, 5]);
+    assert.deepEqual(bridge.state.events().map((event) => event.sequence), [1, 2, 3, 4, 5, 6, 7]);
     assert.deepEqual(bridge.state.responses(), [{ status: 'completed', outputText: 'Hello world' }]);
   } finally {
     await bridge?.close();
@@ -1956,7 +1956,7 @@ test('declared-capability-client-4xx Compatibility Fixture does not switch upstr
     });
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
-      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+      error: { message: 'invalid tool', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
     });
     assert.equal(rejected.requests.length, 1);
     assert.equal(fallback.requests.length, 0);
@@ -1982,12 +1982,12 @@ test('Idempotency-Key does not turn a pre-stream upstream rejection into SSE', a
     const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
     assert.equal(first.status, 400);
     assert.deepEqual(await first.json(), {
-      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+      error: { message: 'invalid tool', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
     });
     const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
     assert.equal(replay.status, 400);
     assert.deepEqual(await replay.json(), {
-      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+      error: { message: 'invalid tool', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
     });
     assert.equal(upstream.requests.length, 2);
     assert.deepEqual(bridge.state.attempts(), []);
