@@ -268,6 +268,34 @@ export class StateStore {
       .run(responseId, outputIndex, JSON.stringify(item));
   }
 
+  completeJson(id: string, outputText: string, output: OutputItem[], attempt: AttemptCompletion) {
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [outputIndex, item] of output.entries()) this.appendOutputItem(id, outputIndex, item);
+      this.#db.prepare('UPDATE attempts SET finished_at = ?, result = ?, pre_output_failure = ?, error_code = ? WHERE id = ?')
+        .run(Date.now(), attempt.result, Number(attempt.preOutputFailure), attempt.errorCode ?? null, attempt.id);
+      this.#db.prepare("UPDATE responses SET status = 'completed', output_text = ?, terminal_at = COALESCE(terminal_at, ?) WHERE id = ?")
+        .run(outputText, Date.now(), id);
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  cancelJson(id: string) {
+    this.#db.prepare("UPDATE responses SET status = 'cancelled', terminal_at = COALESCE(terminal_at, ?) WHERE id = ?")
+      .run(Date.now(), id);
+  }
+
+  jsonResponse(id: string) {
+    const row = this.#db.prepare('SELECT id, status, model FROM responses WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row || row.status !== 'completed') return undefined;
+    const output = this.#db.prepare('SELECT item_json FROM output_items WHERE response_id = ? ORDER BY output_index')
+      .all(id).map((item) => JSON.parse(String(item.item_json)) as OutputItem);
+    return { id: String(row.id), object: 'response', status: 'completed', model: String(row.model), output };
+  }
+
   startAttempt(responseId: string) {
     this.#db.exec('BEGIN IMMEDIATE');
     try {

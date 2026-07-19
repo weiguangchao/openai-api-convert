@@ -1,7 +1,7 @@
 import { redactHeaders } from './http.js';
 import type { BridgeLogger } from './types.js';
 import { StreamTranslator, type NamespaceAliases } from './adapter.js';
-import type { UpstreamStream, UpstreamStreamEvent, UpstreamStreamOutcome, UpstreamStreamRequest } from './failover-execution.js';
+import type { UpstreamJson, UpstreamJsonOutcome, UpstreamStream, UpstreamStreamEvent, UpstreamStreamOutcome, UpstreamStreamRequest } from './failover-execution.js';
 
 export class FetchUpstreamStream implements UpstreamStream {
   #logging: BridgeLogger;
@@ -89,6 +89,38 @@ export class FetchUpstreamStream implements UpstreamStream {
         yield { kind: 'event', event, outputStarted: translator.outputStarted, outputText: translator.outputText };
       }
     }
+  }
+}
+
+export class FetchUpstreamJson implements UpstreamJson {
+  #logging: BridgeLogger;
+  #requestId: string;
+
+  constructor(logging: BridgeLogger, requestId: string) {
+    this.#logging = logging;
+    this.#requestId = requestId;
+  }
+
+  async complete(request: UpstreamStreamRequest, signal: AbortSignal): Promise<UpstreamJsonOutcome> {
+    const upstreamUrl = new URL('/v1/chat/completions', request.upstream.baseUrl);
+    const upstreamBody = { ...request.upstreamBody, ...(request.upstream.thinking ? { thinking: request.upstream.thinking } : {}) };
+    const headers = { authorization: `Bearer ${request.upstream.apiKey}`, 'content-type': 'application/json', accept: 'application/json' };
+    this.#logging.log('info', 'traffic_upstream_outbound', { requestId: this.#requestId, responseId: request.responseId, attempt_index: request.attemptIndex });
+    if (this.#logging.level === 'debug') this.#logging.log('debug', 'traffic_upstream_outbound', {
+      requestId: this.#requestId, responseId: request.responseId, attempt_index: request.attemptIndex, upstream_url: upstreamUrl.href, headers: redactHeaders(headers), body: JSON.stringify(upstreamBody),
+    });
+    let response: Response;
+    try {
+      response = await fetch(upstreamUrl, { method: 'POST', headers, body: JSON.stringify(upstreamBody), signal });
+    } catch {
+      this.#logging.log('info', 'traffic_upstream_inbound', { requestId: this.#requestId, responseId: request.responseId, attempt_index: request.attemptIndex, status: 0 });
+      return { kind: 'unavailable' };
+    }
+    this.#logging.log('info', 'traffic_upstream_inbound', { requestId: this.#requestId, responseId: request.responseId, attempt_index: request.attemptIndex, status: response.status });
+    if (!response.ok) return response.status === 408 || response.status === 429 || response.status >= 500
+      ? { kind: 'unavailable' } : { kind: 'rejected', status: response.status };
+    try { return { kind: 'completion', completion: await response.json() }; }
+    catch { return { kind: 'completion', completion: undefined }; }
   }
 }
 

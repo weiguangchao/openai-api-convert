@@ -16,6 +16,25 @@ export interface UpstreamStream {
   open(request: UpstreamStreamRequest, signal: AbortSignal): Promise<UpstreamStreamOutcome>;
 }
 
+export type UpstreamJsonOutcome =
+  | { kind: 'completion'; completion: unknown }
+  | { kind: 'unavailable' }
+  | { kind: 'rejected'; status: number };
+
+export interface UpstreamJson {
+  complete(request: UpstreamStreamRequest, signal: AbortSignal): Promise<UpstreamJsonOutcome>;
+}
+
+export interface JsonExecutionSink {
+  startAttempt(attemptIndex: number): number;
+  finishAttempt(attempt: AttemptCompletion): void;
+}
+
+export type JsonFailoverExecutionOutcome =
+  | { kind: 'completed'; completion: unknown; attempt: AttemptCompletion }
+  | { kind: 'cancelled'; attempt?: AttemptCompletion }
+  | { kind: 'pre_output_failure'; reason: 'rejected' | 'unavailable' | 'unsupported_capabilities'; status?: number };
+
 export interface StreamEventSink {
   startAttempt(attemptIndex: number): number;
   finishAttempt(attempt: AttemptCompletion): void;
@@ -159,5 +178,48 @@ export const executeFailover = async (
   }
 
   if (cancelled?.aborted) return cancel(retryAttempt, failedOutputText);
+  return { kind: 'pre_output_failure', reason: 'unavailable' };
+};
+
+export const executeJsonFailover = async (
+  input: FailoverExecutionInput,
+  upstreamJson: UpstreamJson,
+  sink: JsonExecutionSink,
+  cancelled?: AbortSignal,
+): Promise<JsonFailoverExecutionOutcome> => {
+  const planned = planFailoverExecution(input.upstreams, input.needs);
+  if (!planned.ok) return { kind: 'pre_output_failure', reason: 'unsupported_capabilities' };
+  let attemptIndex = 0;
+  for (const upstream of planned.value) {
+    if (cancelled?.aborted) return { kind: 'cancelled' };
+    attemptIndex += 1;
+    const attemptId = sink.startAttempt(attemptIndex);
+    const abort = new AbortController();
+    const onCancel = () => abort.abort();
+    cancelled?.addEventListener('abort', onCancel, { once: true });
+    try {
+      const outcome = await upstreamJson.complete({ upstream, responseId: input.responseId, upstreamBody: input.upstreamBody, attemptIndex }, abort.signal);
+      if (cancelled?.aborted) {
+        const attempt = { id: attemptId, result: 'cancelled' as const, preOutputFailure: true, errorCode: 'client_disconnected' };
+        sink.finishAttempt(attempt);
+        return { kind: 'cancelled', attempt };
+      }
+      if (outcome.kind === 'completion') return { kind: 'completed', completion: outcome.completion, attempt: { id: attemptId, result: 'completed', preOutputFailure: false } };
+      if (outcome.kind === 'rejected') {
+        sink.finishAttempt({ id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_rejected' });
+        return { kind: 'pre_output_failure', reason: 'rejected', status: outcome.status };
+      }
+      sink.finishAttempt({ id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' });
+    } catch {
+      if (cancelled?.aborted) {
+        const attempt = { id: attemptId, result: 'cancelled' as const, preOutputFailure: true, errorCode: 'client_disconnected' };
+        sink.finishAttempt(attempt);
+        return { kind: 'cancelled', attempt };
+      }
+      sink.finishAttempt({ id: attemptId, result: 'failed', preOutputFailure: true, errorCode: 'upstream_retryable' });
+    } finally {
+      cancelled?.removeEventListener('abort', onCancel);
+    }
+  }
   return { kind: 'pre_output_failure', reason: 'unavailable' };
 };

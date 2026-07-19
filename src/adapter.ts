@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, Result, StoredResponse, Tool } from './types.js';
+import type { ChatContentPart, ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, Result, StoredResponse, Tool } from './types.js';
 
 export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
 
@@ -23,10 +23,6 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
   for (const [index, item] of input.entries()) {
     if (!item || typeof item !== 'object') return undefined;
     const value = item as Record<string, unknown>;
-    if (value.type === 'message' && value.role === 'assistant') {
-      classified.push({ kind: 'echo' });
-      continue;
-    }
     if (value.type === 'function_call' && inlineCallIndexes.has(index)
       && typeof value.call_id === 'string' && typeof value.name === 'string' && typeof value.arguments === 'string') {
       classified.push({ kind: 'item', item: { type: 'function_call', call_id: value.call_id, name: value.name, arguments: value.arguments } });
@@ -41,14 +37,10 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
       classified.push({ kind: 'echo' });
       continue;
     }
-    if (value.type === 'message' && (value.role === 'user' || value.role === 'developer') && Array.isArray(value.content)) {
-      const text = value.content.map((part) => {
-        if (!part || typeof part !== 'object') return undefined;
-        const content = part as Record<string, unknown>;
-        return content.type === 'input_text' && typeof content.text === 'string' ? content.text : undefined;
-      });
-      if (!text.length || text.some((part) => part === undefined)) return undefined;
-      classified.push({ kind: 'item', item: { type: 'message', role: value.role, content: text.join('') } });
+    if (value.type === 'message' && (value.role === 'user' || value.role === 'assistant' || value.role === 'system' || value.role === 'developer') && Array.isArray(value.content)) {
+      const content = normalizeMessageContent(value.content, value.role);
+      if (!content) return undefined;
+      classified.push({ kind: 'item', item: { type: 'message', role: value.role, content, ...(typeof value.id === 'string' ? { id: value.id } : {}) } });
       continue;
     }
     if ((value.type !== 'function_call_output' && value.type !== 'custom_tool_call_output') || typeof value.call_id !== 'string' || typeof value.output !== 'string') return undefined;
@@ -61,6 +53,48 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
   }
   const items = classified.slice(start).flatMap((entry) => entry.kind === 'item' ? [entry.item] : []);
   return items.length ? items : undefined;
+};
+
+const normalizeMessageContent = (content: unknown[], role: 'user' | 'assistant' | 'system' | 'developer'): string | ChatContentPart[] | undefined => {
+  if (!content.length) return role === 'assistant' ? [] : undefined;
+  const parts: ChatContentPart[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') return undefined;
+    const value = part as Record<string, unknown>;
+    if ((value.type === 'input_text' || (value.type === 'output_text' && role === 'assistant')) && typeof value.text === 'string') {
+      parts.push({ type: 'text', text: value.text });
+      continue;
+    }
+    if (value.type === 'refusal' && role === 'assistant' && typeof value.refusal === 'string') {
+      parts.push({ type: 'refusal', refusal: value.refusal });
+      continue;
+    }
+    if (value.type === 'input_image' && role === 'user' && typeof value.image_url === 'string'
+      && (value.detail === undefined || typeof value.detail === 'string')) {
+      parts.push({ type: 'image_url', image_url: { url: value.image_url, ...(typeof value.detail === 'string' ? { detail: value.detail } : {}) } });
+      continue;
+    }
+    if (value.type === 'input_file' && role === 'user'
+      && (value.file_id === undefined || typeof value.file_id === 'string')
+      && (value.filename === undefined || typeof value.filename === 'string')
+      && (value.file_data === undefined || typeof value.file_data === 'string')
+      && (typeof value.file_id === 'string' || typeof value.filename === 'string' || typeof value.file_data === 'string')) {
+      parts.push({ type: 'file', file: {
+        ...(typeof value.file_id === 'string' ? { file_id: value.file_id } : {}),
+        ...(typeof value.filename === 'string' ? { filename: value.filename } : {}),
+        ...(typeof value.file_data === 'string' ? { file_data: value.file_data } : {}),
+      } });
+      continue;
+    }
+    const audio = value.input_audio;
+    if (value.type === 'input_audio' && role === 'user' && audio && typeof audio === 'object'
+      && typeof (audio as Record<string, unknown>).data === 'string' && typeof (audio as Record<string, unknown>).format === 'string') {
+      parts.push({ type: 'input_audio', input_audio: { data: String((audio as Record<string, unknown>).data), format: String((audio as Record<string, unknown>).format) } });
+      continue;
+    }
+    return undefined;
+  }
+  return parts.every((part) => part.type === 'text') ? parts.map((part) => (part as { text: string }).text).join('') : parts;
 };
 
 export const TOOL_NAME_MAX = 64;
@@ -230,7 +264,7 @@ export const WEB_SEARCH_UNAVAILABLE_HINT = 'Hosted web search is unavailable on 
 export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
   const { refToAlias } = buildNamespaceAliasMaps(response.tools);
   const messages: ChatMessage[] = response.input.flatMap((item): ChatMessage[] => {
-    if (item.type === 'message') return [{ role: item.role === 'developer' ? 'system' : 'user', content: item.content }];
+    if (item.type === 'message') return [{ role: item.role === 'developer' || item.role === 'system' ? 'system' : item.role, content: item.content }];
     if (item.type === 'function_call') return [{
       role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }],
     }];
@@ -377,15 +411,33 @@ export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool
   } catch {
     return { ok: false, error: { status: 400, message: 'Tool Namespace aliases conflict', code: 'unsupported_tools' } };
   }
-  const messages: ChatMessage[] = [
+  const rawMessages: ChatMessage[] = [
     ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
     ...ancestors.flatMap(toChatMessages),
     ...toChatMessages({ id: '', model: '', input, tools: [], parallelToolCalls: false, output: [] }),
   ];
+  const instructions = typeof payload.instructions === 'string' && payload.instructions.length ? payload.instructions : undefined;
+  const systemPrefix = rawMessages.filter((message): message is Extract<ChatMessage, { role: 'system' }> => message.role === 'system');
+  const messages: ChatMessage[] = [
+    ...(instructions || systemPrefix.length ? [{ role: 'system' as const, content: [instructions, ...systemPrefix.map(({ content }) => typeof content === 'string' ? content : '')].filter(Boolean).join('\n') }] : []),
+    ...rawMessages.filter((message) => message.role !== 'system'),
+  ];
   const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
   const parallelToolCalls = payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls);
+  const stream = payload.stream === true;
+  const explicitCeiling = payload.max_completion_tokens ?? payload.max_tokens;
+  const maxOutputTokens = explicitCeiling ?? payload.max_output_tokens;
+  const ceilingKey = payload.max_completion_tokens !== undefined ? 'max_completion_tokens'
+    : payload.max_tokens !== undefined ? 'max_tokens'
+      : /^o(?:\d|[-_])/i.test(model) ? 'max_completion_tokens' : 'max_tokens';
+  const controls = Object.fromEntries([
+    'temperature', 'top_p', 'presence_penalty', 'frequency_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'seed', 'stop', 'response_format', 'n', 'user',
+  ].flatMap((key) => payload[key as keyof ResponsesPayload] === undefined ? [] : [[key, payload[key as keyof ResponsesPayload]]]));
   const upstreamBody: Record<string, unknown> = {
-    model, stream: true, stream_options: { include_usage: true }, messages,
+    model, stream, messages,
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
+    ...(maxOutputTokens === undefined ? {} : { [ceilingKey]: maxOutputTokens }),
+    ...controls,
     ...(chatTools.length ? { tools: chatTools } : {}),
     ...(parallelToolCalls ? { parallel_tool_calls: true } : {}),
     ...(chatToolChoice === undefined ? {} : { tool_choice: chatToolChoice }),

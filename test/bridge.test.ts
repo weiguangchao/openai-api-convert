@@ -69,6 +69,25 @@ const startCompatibilityFixture = async () => {
   };
 };
 
+const startJsonFixture = async (completion: Record<string, unknown>) => {
+  const requests: unknown[] = [];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(completion));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
 const startIdempotencyFixture = async () => {
   const requests: unknown[] = [];
   let release!: () => void;
@@ -765,13 +784,6 @@ test('bridges a text stream into ordered Responses SSE', async () => {
     });
     assert.equal(unauthorized.status, 401);
 
-    const nonStreaming = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST',
-      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: false, input: 'hello' }),
-    });
-    assert.equal(nonStreaming.status, 400);
-
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -792,6 +804,150 @@ test('bridges a text stream into ordered Responses SSE', async () => {
     }]);
     assert.deepEqual(bridge.state.events().map((event) => event.sequence), [1, 2, 3, 4, 5]);
     assert.deepEqual(bridge.state.responses(), [{ status: 'completed', outputText: 'Hello world' }]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('bridges structured non-stream Responses input into a persisted JSON Response', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({
+    id: 'chatcmpl_upstream', model: 'o3',
+    choices: [{ message: { role: 'assistant', content: 'Done.' }, finish_reason: 'stop' }],
+  });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'plain-json' };
+    const payload = {
+      model: 'o3', instructions: 'Follow instructions.', max_output_tokens: 42,
+      temperature: 0.2, top_p: 0.8,
+      input: [
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'Developer policy.' }] },
+        { type: 'message', role: 'system', content: [{ type: 'input_text', text: 'System policy.' }] },
+        {
+          type: 'message', role: 'user', content: [
+            { type: 'input_text', text: 'Inspect these.' },
+            { type: 'input_image', image_url: 'https://example.test/image.png', detail: 'low' },
+            { type: 'input_file', filename: 'note.txt', file_data: 'data:text/plain;base64,bm90ZQ==' },
+            { type: 'input_audio', input_audio: { data: 'YXVkaW8=', format: 'wav' } },
+          ],
+        },
+        { id: 'external-history-id', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Prior answer.' }, { type: 'refusal', refusal: 'No secrets.' }] },
+      ],
+    };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(payload) });
+    assert.equal(first.status, 200);
+    const firstBody = await first.json() as { id: string; object: string; status: string; model: string; output: unknown[] };
+    assert.match(firstBody.id, /^resp_/);
+    assert.deepEqual({ ...firstBody, id: '<local-response-id>' }, {
+      id: '<local-response-id>', object: 'response', status: 'completed', model: 'o3',
+      output: [{
+        id: `msg_${firstBody.id}`, type: 'message', status: 'completed', role: 'assistant',
+        content: [{ type: 'output_text', text: 'Done.' }],
+      }],
+    });
+    const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(payload) });
+    assert.deepEqual(await replay.json(), firstBody);
+    const changedControl = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ ...payload, temperature: 0.7 }),
+    });
+    assert.equal(changedControl.status, 409);
+    assert.equal((await changedControl.json() as { error: { code: string } }).error.code, 'idempotency_key_conflict');
+    assert.deepEqual(upstream.requests, [{
+      model: 'o3', stream: false, max_completion_tokens: 42, temperature: 0.2, top_p: 0.8,
+      messages: [
+        { role: 'system', content: 'Follow instructions.\nDeveloper policy.\nSystem policy.' },
+        {
+          role: 'user', content: [
+            { type: 'text', text: 'Inspect these.' },
+            { type: 'image_url', image_url: { url: 'https://example.test/image.png', detail: 'low' } },
+            { type: 'file', file: { filename: 'note.txt', file_data: 'data:text/plain;base64,bm90ZQ==' } },
+            { type: 'input_audio', input_audio: { data: 'YXVkaW8=', format: 'wav' } },
+          ],
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'Prior answer.' }, { type: 'refusal', refusal: 'No secrets.' }] },
+      ],
+    }]);
+    assert.deepEqual(bridge.state.responses(), [{ status: 'completed', outputText: 'Done.' }]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects an unknown structured input part without contacting the upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: false, input: [{ type: 'message', role: 'user', content: [{ type: 'input_video', video_url: 'https://example.test/video.mp4' }] }] }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_input');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects a non-stream Chat JSON response without a first text choice', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ choices: [] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: false, input: 'hello' }),
+    });
+    assert.equal(response.status, 502);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'upstream_invalid_json');
+    assert.deepEqual(bridge.state.responses(), []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('persists an empty first Chat choice as an empty Responses message item', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ choices: [{ message: { role: 'assistant', content: '' } }] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: false, input: 'hello' }),
+    });
+    const body = await response.json() as { output: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.output.map((item) => item.content[0]?.text), ['']);
   } finally {
     await bridge?.close();
     await upstream.close();
