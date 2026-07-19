@@ -1,6 +1,6 @@
 import type { StateStore } from './state.js';
 
-export type CapabilityProfile = { functionTools?: boolean; customTools?: boolean; parallelToolCalls?: boolean };
+export type CapabilityProfile = { functionTools?: boolean; parallelToolCalls?: boolean };
 export type UpstreamThinkingPolicy = { type: 'enabled' | 'disabled' };
 export type Upstream = { baseUrl: string; apiKey: string; capabilities?: CapabilityProfile; thinking?: UpstreamThinkingPolicy };
 export type StatePolicy = {
@@ -69,9 +69,7 @@ export type IdempotencyClaim =
   | { kind: 'capacity_exceeded' };
 export type AttemptResult = 'completed' | 'failed' | 'cancelled';
 export type AttemptCompletion = { id: number; result: AttemptResult; preOutputFailure: boolean; errorCode?: string };
-export type ChatToolCall =
-  | { id: string; type: 'function'; function: { name: string; arguments: string } }
-  | { id: string; type: 'custom'; custom: { name: string; input: string } };
+export type ChatToolCall = { id: string; type: 'function'; function: { name: string; arguments: string } };
 export type ChatMessage =
   | { role: 'user' | 'system'; content: string | ChatContentPart[] }
   | { role: 'tool'; tool_call_id: string; content: string }

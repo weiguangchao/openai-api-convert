@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   ALIAS_HASH_LEN,
+  CUSTOM_PROXY_PARAMETERS,
   INPUT_ECHO_TYPES,
   REASONING_EFFORTS,
   TOOL_NAME_MAX,
   WEB_SEARCH_UNAVAILABLE_HINT,
-  buildNamespaceAliasMaps,
+  buildCustomProxyDescription,
+  buildToolContext,
+  extractCustomInput,
   namespaceToolAlias,
   normalizeFunctionTool,
   normalizeInput,
@@ -300,52 +303,112 @@ test('namespaceToolAlias: overlong name truncates to 64 with a short hash suffix
   assert.strictEqual(alias.length, TOOL_NAME_MAX);
 });
 
-// ---- buildNamespaceAliasMaps ----
+// ---- buildToolContext ----
 
-test('buildNamespaceAliasMaps: maps namespace children to aliases, reserves top-level names', () => {
+test('buildToolContext: maps namespace aliases and records custom proxy names', () => {
   const tools: Tool[] = [
     { type: 'function', name: 'top_fn' },
     { type: 'custom', name: 'top_custom' },
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
   ];
-  const { aliasToRef, refToAlias } = buildNamespaceAliasMaps(tools);
+  const { aliasToRef, refToAlias, customNames } = buildToolContext(tools);
   const alias = 'ns__child';
   assert.strictEqual(refToAlias.get('ns\0child'), alias);
   assert.deepEqual(aliasToRef.get(alias), { name: 'child', namespace: 'ns' });
   assert.strictEqual(refToAlias.has('top_fn'), false);
   assert.strictEqual(aliasToRef.has('top_fn'), false);
+  assert.deepEqual([...customNames], ['top_custom']);
 });
 
-test('buildNamespaceAliasMaps: duplicate namespace+child name throws', () => {
+test('buildToolContext: duplicate namespace+child name throws', () => {
   const tools: Tool[] = [
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
   ];
-  assert.throws(() => buildNamespaceAliasMaps(tools), /Tool Namespace alias conflict/);
+  assert.throws(() => buildToolContext(tools), /Tool Namespace alias conflict/);
 });
 
-test('buildNamespaceAliasMaps: alias colliding with a peer Function name throws', () => {
+test('buildToolContext: alias colliding with a peer Function name throws', () => {
   const tools: Tool[] = [
     { type: 'function', name: 'ns__child' },
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
   ];
-  assert.throws(() => buildNamespaceAliasMaps(tools), /Tool Namespace alias conflict/);
+  assert.throws(() => buildToolContext(tools), /Tool Namespace alias conflict/);
 });
 
-test('buildNamespaceAliasMaps: different namespaces with same child name do not conflict', () => {
+test('buildToolContext: alias colliding with a Custom proxy name throws', () => {
+  const tools: Tool[] = [
+    { type: 'custom', name: 'ns__child' },
+    { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
+  ];
+  assert.throws(() => buildToolContext(tools), /Tool Namespace alias conflict/);
+});
+
+test('buildToolContext: custom name colliding with a Function name throws', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'shared' },
+    { type: 'custom', name: 'shared' },
+  ];
+  assert.throws(() => buildToolContext(tools), /Tool name conflict/);
+});
+
+test('buildToolContext: duplicate custom names throw', () => {
+  const tools: Tool[] = [
+    { type: 'custom', name: 'shell' },
+    { type: 'custom', name: 'shell' },
+  ];
+  assert.throws(() => buildToolContext(tools), /Tool name conflict/);
+});
+
+test('buildToolContext: different namespaces with same child name do not conflict', () => {
   const tools: Tool[] = [
     { type: 'namespace', name: 'ns1', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
     { type: 'namespace', name: 'ns2', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
   ];
-  const { refToAlias } = buildNamespaceAliasMaps(tools);
+  const { refToAlias } = buildToolContext(tools);
   assert.ok(refToAlias.has('ns1\0fn'));
   assert.ok(refToAlias.has('ns2\0fn'));
   assert.notStrictEqual(refToAlias.get('ns1\0fn'), refToAlias.get('ns2\0fn'));
 });
 
+// ---- Custom Tool proxy ----
+
+test('buildCustomProxyDescription: embeds the original Custom tool definition as JSON', () => {
+  assert.equal(buildCustomProxyDescription({ type: 'custom', name: 'shell' }), '{"type":"custom","name":"shell"}');
+  assert.equal(
+    buildCustomProxyDescription({ type: 'custom', name: 'shell', description: 'Runs shell', format: 'text' }),
+    '{"type":"custom","name":"shell","description":"Runs shell","format":"text"}',
+  );
+});
+
+test('CUSTOM_PROXY_PARAMETERS: a single required string input', () => {
+  assert.deepEqual(CUSTOM_PROXY_PARAMETERS, {
+    type: 'object', properties: { input: { type: 'string' } }, required: ['input'],
+  });
+});
+
+test('extractCustomInput: prefers the string input envelope and falls back to raw arguments', () => {
+  assert.equal(extractCustomInput('{"input":"ls -la"}'), 'ls -la');
+  assert.equal(extractCustomInput('{"input":"ls","extra":1}'), 'ls');
+  // empty -> raw (empty)
+  assert.equal(extractCustomInput(''), '');
+  // non-JSON -> raw
+  assert.equal(extractCustomInput('not json'), 'not json');
+  // non-object JSON -> raw
+  assert.equal(extractCustomInput('42'), '42');
+  assert.equal(extractCustomInput('"plain"'), '"plain"');
+  assert.equal(extractCustomInput('null'), 'null');
+  assert.equal(extractCustomInput('[]'), '[]');
+  // missing input -> raw
+  assert.equal(extractCustomInput('{"other":1}'), '{"other":1}');
+  // non-string input -> raw
+  assert.equal(extractCustomInput('{"input":5}'), '{"input":5}');
+  assert.equal(extractCustomInput('{"input":{"x":1}}'), '{"input":{"x":1}}');
+});
+
 // ---- toChatTools ----
 
-test('toChatTools: drops web_search and preserves function/custom', () => {
+test('toChatTools: drops web_search, keeps functions and proxies custom as a function', () => {
   const tools: Tool[] = [
     { type: 'web_search' },
     { type: 'function', name: 'fn', description: 'd', strict: true },
@@ -353,7 +416,7 @@ test('toChatTools: drops web_search and preserves function/custom', () => {
   ];
   assert.deepEqual(toChatTools(tools), [
     { type: 'function', function: { name: 'fn', description: 'd', parameters: { type: 'object', properties: {} }, strict: true } },
-    { type: 'custom', custom: { name: 'c', description: 'd', format: 'text' } },
+    { type: 'function', function: { name: 'c', description: buildCustomProxyDescription({ type: 'custom', name: 'c', description: 'd', format: 'text' }), parameters: CUSTOM_PROXY_PARAMETERS } },
   ]);
 });
 
@@ -449,10 +512,10 @@ test('toChatMessages: function_call output maps to function tool_call', () => {
   );
 });
 
-test('toChatMessages: custom_tool_call output maps to custom tool_call', () => {
+test('toChatMessages: custom_tool_call output maps to a proxied function tool_call', () => {
   assert.deepEqual(
     toChatMessages(baseResponse({ output: [{ id: 'o1', type: 'custom_tool_call', status: 'completed', call_id: 'c1', name: 'fn', input: 'data' }] })),
-    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'custom', custom: { name: 'fn', input: 'data' } }] }],
+    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'fn', arguments: '{"input":"data"}' } }] }],
   );
 });
 

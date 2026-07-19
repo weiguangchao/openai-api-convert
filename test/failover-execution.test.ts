@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildNamespaceAliasMaps } from '../src/adapter.js';
+import { buildToolContext } from '../src/adapter.js';
 import {
   executeFailover,
   type StreamEventSink,
@@ -11,7 +11,7 @@ import {
 import type { AttemptCompletion, OutputItem, ResponseEvent, Upstream } from '../src/types.js';
 
 const upstream = (name: string): Upstream => ({ baseUrl: `https://${name}.example`, apiKey: `${name}-key` });
-const noCapabilities = { functionTools: false, customTools: false, parallelToolCalls: false };
+const noCapabilities = { functionTools: false, parallelToolCalls: false };
 const textStream = (text: string) => async function* (): AsyncIterable<UpstreamStreamEvent> {
   yield {
     kind: 'event', outputStarted: true, outputText: text,
@@ -163,7 +163,7 @@ test('Failover Policy Execution rejects incompatible pools without creating an A
   assert.deepEqual(await executeFailover({
     responseId: 'resp_test', model: 'test-model', upstreamBody: {},
     upstreams: [upstream('primary')],
-    needs: { functionTools: true, customTools: false, parallelToolCalls: false },
+    needs: { functionTools: true, parallelToolCalls: false },
     firstEventTimeoutMs: 1_000, outputIdleTimeoutMs: 1_000,
   }, stream, sink), { kind: 'pre_output_failure', reason: 'unsupported_capabilities' });
   assert.deepEqual(stream.calls, []);

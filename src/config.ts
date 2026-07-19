@@ -7,7 +7,7 @@ import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, Release
 type RecordValue = Record<string, unknown>;
 const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy', 'logging', 'releasePreflight']);
 const upstreamKeys = new Set(['baseUrl', 'apiKey', 'capabilities', 'thinking']);
-const capabilityKeys = new Set(['functionTools', 'customTools', 'parallelToolCalls']);
+const capabilityKeys = new Set(['functionTools', 'parallelToolCalls']);
 const statePolicyKeys = new Set(['responseRetentionDays', 'attemptRetentionDays', 'cleanupThresholdBytes', 'hardLimitBytes']);
 const loggingKeys = new Set(['level', 'path', 'retentionDays']);
 const releasePreflightKeys = new Set(['model']);

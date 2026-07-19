@@ -63,7 +63,6 @@ export type FailoverExecutionOutcome =
 export const planFailoverExecution = (upstreams: Upstream[], needs: ExecutionNeeds): Result<Upstream[]> => {
   const compatible = upstreams.filter((upstream) => (
     (!needs.functionTools || upstream.capabilities?.functionTools === true)
-    && (!needs.customTools || upstream.capabilities?.customTools === true)
     && (!needs.parallelToolCalls || upstream.capabilities?.parallelToolCalls === true)
   ));
   if (!compatible.length) {
