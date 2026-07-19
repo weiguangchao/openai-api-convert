@@ -78,10 +78,9 @@ test('normalizeInput: message with empty or non-array content returns undefined'
   assert.strictEqual(normalizeInput([{ type: 'message', role: 'user', content: 'hi' }]), undefined);
 });
 
-test('normalizeInput: assistant message and echo types are dropped, suffix kept', () => {
+test('normalizeInput: echo types are dropped and the suffix is kept', () => {
   const suffix = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }];
   for (const echo of [
-    { type: 'message', role: 'assistant', content: [] },
     { type: 'function_call' },
     { type: 'custom_tool_call' },
     { type: 'web_search_call' },
@@ -89,6 +88,12 @@ test('normalizeInput: assistant message and echo types are dropped, suffix kept'
   ]) {
     assert.deepEqual(normalizeInput([echo, ...suffix]), [{ type: 'message', role: 'user', content: 'hi' }]);
   }
+});
+
+test('normalizeInput: preserves explicit assistant messages, including an empty content array', () => {
+  assert.deepEqual(normalizeInput([{ type: 'message', role: 'assistant', content: [] }]), [
+    { type: 'message', role: 'assistant', content: [] },
+  ]);
 });
 
 test('normalizeInput: all-echo input returns undefined', () => {

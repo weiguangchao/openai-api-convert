@@ -5,12 +5,13 @@ import { digest } from './state.js';
 import { buildChatRequest, normalizeInput, normalizeTools, parseReasoningEffort } from './adapter.js';
 import { HttpStreamEventSink, replaySse } from './sse.js';
 import { redactHeaders, requireBridgeAuthentication, sendError, setErrorCode } from './http.js';
-import { executeFailover, type ExecutionNeeds } from './failover-execution.js';
-import { FetchUpstreamStream } from './upstream-stream.js';
+import { executeFailover, executeJsonFailover, type ExecutionNeeds } from './failover-execution.js';
+import { FetchUpstreamJson, FetchUpstreamStream } from './upstream-stream.js';
 
 type ParsedRequest = { payload: ResponsesPayload; rawBody: string; idempotencyKey: string | undefined; reasoningEffort: string | undefined; input: InputItem[]; tools: Tool[] | undefined };
-type ResolvedChain = { ancestors: StoredResponse[]; effectiveTools: Tool[]; degradeWebSearch: boolean; needs: ExecutionNeeds };
+type ResolvedChain = { ancestors: StoredResponse[]; input: InputItem[]; effectiveTools: Tool[]; degradeWebSearch: boolean; needs: ExecutionNeeds };
 type ClaimResult = { kind: 'reused'; responseId: string } | { kind: 'created'; responseId: string };
+type ChatCompletionJson = { choices?: Array<{ message?: { content?: unknown } }> };
 
 export const handleResponsesRequest = async (ctx: RequestContext, request: IncomingMessage, response: ServerResponse, requestId: string, scope: ResponseScope) => {
   if (!requireBridgeAuthentication(request, response, ctx.options.apiKey)) return;
@@ -19,12 +20,19 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
   if (!parsed.ok) { fail(parsed.error); return; }
   const resolved = resolveChainAndCapabilities(ctx, parsed.value.payload, parsed.value.input, parsed.value.tools);
   if (!resolved.ok) { fail(resolved.error); return; }
-  const built = buildChatRequest(parsed.value.payload, resolved.value.effectiveTools, resolved.value.ancestors, parsed.value.input, resolved.value.degradeWebSearch, parsed.value.reasoningEffort);
+  const built = buildChatRequest(parsed.value.payload, resolved.value.effectiveTools, resolved.value.ancestors, resolved.value.input, resolved.value.degradeWebSearch, parsed.value.reasoningEffort);
   if (!built.ok) { fail(built.error); return; }
-  const claimed = await claimOrCreateResponse(ctx, request, parsed.value.payload, parsed.value.input, parsed.value.tools, parsed.value.reasoningEffort, parsed.value.idempotencyKey, built.value.model);
+  const claimed = await claimOrCreateResponse(ctx, request, parsed.value.payload, resolved.value.input, parsed.value.tools, parsed.value.reasoningEffort, parsed.value.idempotencyKey, built.value.model);
   if (!claimed.ok) { fail(claimed.error); return; }
   scope.responseId = claimed.value.responseId;
   if (claimed.value.kind === 'reused') {
+    if (parsed.value.payload.stream !== true) {
+      const reused = ctx.state.jsonResponse(claimed.value.responseId);
+      if (!reused) { sendError(response, 409, 'Idempotent Response is not complete', 'idempotency_in_progress'); return; }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(reused));
+      return;
+    }
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     await replaySse(response, ctx.state, claimed.value.responseId);
     return;
@@ -38,6 +46,21 @@ export const handleResponsesRequest = async (ctx: RequestContext, request: Incom
   request.once('aborted', cancel);
   response.once('close', onResponseClose);
   try {
+    if (parsed.value.payload.stream !== true) {
+      const completed = await completeJsonResponse(ctx, built.value.upstreamBody, claimed.value.responseId, resolved.value.needs, requestId, cancelled.signal);
+      if (!completed.ok) {
+        if (completed.error.code === 'client_disconnected') return;
+        ctx.state.discardRejectedResponse(claimed.value.responseId);
+        sendError(response, completed.error.status, completed.error.message, completed.error.code);
+        return;
+      }
+      ctx.logging.log('info', 'traffic_downstream_outbound', {
+        requestId, responseId: claimed.value.responseId, event_type: 'response.completed',
+      });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(completed.value));
+      return;
+    }
     const outcome = await executeFailover({
       responseId: claimed.value.responseId, model: built.value.model, upstreamBody: built.value.upstreamBody,
       upstreams: ctx.options.upstreams, needs: resolved.value.needs,
@@ -79,8 +102,8 @@ const parseAndValidateRequest = async (ctx: RequestContext, request: IncomingMes
       headers: redactHeaders(request.headers), body: rawBody,
     });
   }
-  if (payload.stream !== true) {
-    return { ok: false, error: { status: 400, message: 'Only stream: true is supported', code: 'stream_required' } };
+  if (payload.stream !== undefined && payload.stream !== true && payload.stream !== false) {
+    return { ok: false, error: { status: 400, message: 'stream must be a boolean', code: 'invalid_stream' } };
   }
   const reasoningEffort = parseReasoningEffort(payload.reasoning);
   if (reasoningEffort === null) {
@@ -88,7 +111,7 @@ const parseAndValidateRequest = async (ctx: RequestContext, request: IncomingMes
   }
   const input = normalizeInput(payload.input);
   if (!input) {
-    return { ok: false, error: { status: 400, message: 'Only text and Tool output input are supported', code: 'unsupported_input' } };
+    return { ok: false, error: { status: 400, message: 'Input contains an unsupported content part', code: 'unsupported_input' } };
   }
   const tools = normalizeTools(payload.tools);
   if (payload.tools !== undefined && !tools) {
@@ -113,13 +136,19 @@ const resolveChainAndCapabilities = (ctx: RequestContext, payload: ResponsesPayl
     try { ancestors = state.chain(payload.previous_response_id as string); }
     catch { return { ok: false, error: { status: 400, message: 'Previous response was not found', code: 'previous_response_not_found' } }; }
   }
+  const echoedMessageIds = new Set(ancestors.flatMap((ancestor) => ancestor.output)
+    .flatMap((item) => item.type === 'message' ? [item.id] : []));
+  const lastEchoedMessage = input.reduce((last, item, index) => (
+    item.type === 'message' && item.role === 'assistant' && item.id && echoedMessageIds.has(item.id) ? index : last
+  ), -1);
+  const effectiveInput = lastEchoedMessage === -1 ? input : input.slice(lastEchoedMessage + 1);
   const callKinds = new Map((ancestors.at(-1)?.output ?? [])
     .filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call')
     .map((item) => [item.call_id, item.type]));
-  for (const item of input) {
+  for (const item of effectiveInput) {
     if (item.type === 'function_call' || item.type === 'custom_tool_call') callKinds.set(item.call_id, item.type);
   }
-  if (input.some((item) => (item.type === 'function_call_output' && callKinds.get(item.call_id) !== 'function_call')
+  if (effectiveInput.some((item) => (item.type === 'function_call_output' && callKinds.get(item.call_id) !== 'function_call')
     || (item.type === 'custom_tool_call_output' && callKinds.get(item.call_id) !== 'custom_tool_call'))) {
     return { ok: false, error: { status: 400, message: 'Tool call was not found', code: 'function_call_not_found' } };
   }
@@ -131,7 +160,7 @@ const resolveChainAndCapabilities = (ctx: RequestContext, payload: ResponsesPayl
     parallelToolCalls: payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls),
   };
   const degradeWebSearch = chainTools.some((tool) => tool.type === 'web_search');
-  return { ok: true, value: { ancestors, effectiveTools, degradeWebSearch, needs } };
+  return { ok: true, value: { ancestors, input: effectiveInput, effectiveTools, degradeWebSearch, needs } };
 };
 
 const claimOrCreateResponse = async (ctx: RequestContext, request: IncomingMessage, payload: ResponsesPayload, input: InputItem[], tools: Tool[] | undefined, reasoningEffort: string | undefined, idempotencyKey: string | undefined, model: string): Promise<Result<ClaimResult>> => {
@@ -145,7 +174,13 @@ const claimOrCreateResponse = async (ctx: RequestContext, request: IncomingMessa
     hash: digest({
       model, input, tools: payload.tools ?? [], previousResponseId: payload.previous_response_id ?? null,
       parallelToolCalls: payload.parallel_tool_calls === true, toolChoice: payload.tool_choice, include: payload.include,
-      reasoningEffort: reasoningEffort ?? null,
+      reasoningEffort: reasoningEffort ?? null, deliveryMode: payload.stream === true ? 'stream' : 'json',
+      instructions: payload.instructions ?? null,
+      maxOutputTokens: payload.max_output_tokens ?? null, maxTokens: payload.max_tokens ?? null, maxCompletionTokens: payload.max_completion_tokens ?? null,
+      controls: Object.fromEntries([
+        'temperature', 'top_p', 'presence_penalty', 'frequency_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'seed', 'stop', 'response_format', 'n', 'user',
+      ].map((key) => [key, payload[key as keyof ResponsesPayload] === undefined
+        ? { present: false } : { present: true, value: payload[key as keyof ResponsesPayload] }])),
     }),
   });
   if (claim.kind === 'conflict') {
@@ -158,4 +193,45 @@ const claimOrCreateResponse = async (ctx: RequestContext, request: IncomingMessa
     return { ok: true, value: { kind: 'reused', responseId: claim.responseId } };
   }
   return { ok: true, value: { kind: 'created', responseId: id } };
+};
+
+const completeJsonResponse = async (
+  ctx: RequestContext,
+  upstreamBody: Record<string, unknown>,
+  responseId: string,
+  needs: ExecutionNeeds,
+  requestId: string,
+  cancelled: AbortSignal,
+): Promise<Result<{ id: string; object: string; status: string; model: string; output: OutputItem[] }>> => {
+  const outcome = await executeJsonFailover({
+    responseId, model: String(upstreamBody.model), upstreamBody, upstreams: ctx.options.upstreams, needs,
+    firstEventTimeoutMs: ctx.options.firstEventTimeoutMs ?? 30_000, outputIdleTimeoutMs: ctx.options.outputIdleTimeoutMs ?? 60_000,
+  }, new FetchUpstreamJson(ctx.logging, requestId), {
+    startAttempt: () => ctx.state.startAttempt(responseId),
+    finishAttempt: (attempt) => ctx.state.finishAttempt(attempt),
+  }, cancelled);
+  if (outcome.kind === 'cancelled') {
+    ctx.state.cancelJson(responseId);
+    return { ok: false, error: { status: 499, message: 'Client disconnected', code: 'client_disconnected' } };
+  }
+  if (outcome.kind === 'pre_output_failure') {
+    return { ok: false, error: outcome.reason === 'unsupported_capabilities'
+      ? { status: 400, message: 'No upstream supports the requested capabilities', code: 'unsupported_capabilities' }
+      : outcome.reason === 'rejected'
+        ? { status: outcome.status ?? 400, message: 'Upstream rejected request', code: 'upstream_rejected' }
+        : { status: 503, message: 'Upstream unavailable', code: 'upstream_unavailable' } };
+  }
+  const completion = outcome.completion as ChatCompletionJson | undefined;
+  const text = completion?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string') {
+      ctx.state.finishAttempt({ ...outcome.attempt, result: 'failed', preOutputFailure: true, errorCode: 'upstream_invalid_json' });
+      return { ok: false, error: { status: 502, message: 'Upstream returned an unsupported JSON completion', code: 'upstream_invalid_json' } };
+    }
+    const output: OutputItem[] = [{
+      id: `msg_${responseId}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text }],
+    }];
+    ctx.state.completeJson(responseId, text, output, outcome.attempt);
+    const completed = ctx.state.jsonResponse(responseId);
+    if (!completed) return { ok: false, error: { status: 500, message: 'Completed Response was not persisted', code: 'state_store_error' } };
+    return { ok: true, value: completed };
 };
