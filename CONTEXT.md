@@ -13,6 +13,7 @@
 - **Token Ceiling Mapping**: `max_output_tokens` 在下游模型为 o 系列时映射为 `max_completion_tokens`，其他模型映射为 `max_tokens`；请求显式给出的 `max_tokens` 或 `max_completion_tokens` 原样透传并覆盖该映射。
 - **Non-streaming Response**: `stream:false` 时，Bridge 将 Chat 的普通完成结果转换为单个 Responses JSON Response，并持久化 Response、Output Item、终态与 Attempt；幂等命中返回同一 JSON，不向客户端伪造或重放 SSE。
 - **Request Control Passthrough**: 除模型、输入、工具和 Token Ceiling Mapping 外，Bridge 仅透传 CC Switch 允许的 Chat 控制字段；仅流式请求的 `stream_options` 与强制的 `include_usage: true` 合并，客户端不得关闭 usage；非流式请求省略 `stream_options`；未列入允许集的顶层字段不转发。
+- **Tool Control Field Removal**: 转换后无 Chat tools（无工具，或仅 Hosted Web Search 被降级移除）时，Chat 请求省略 `tool_choice` 与 `parallel_tool_calls`，因严格 OpenAI 兼容上游在无非空 `tools` 数组时拒绝二者；Hosted Web Search 强制选择仅在仍有 Chat tools 时降为 `auto`。
 - **Output Item**: Response 输出中的有序规范项，包含 assistant 内容或工具调用。混合 Reasoning Output、文本与并行工具调用时，在首次可观察时分配连续 slot；后续分片复用该 slot，终态按 slot 顺序完成。
 - **Custom Tool**: `type=custom` 的 Responses 工具；Completion 上游以带唯一必填字符串 `input` 的 Function proxy 表达，description 嵌入原始工具定义。反向转换优先读取 `{input:string}`；空、非 JSON、缺少或非字符串 input 时保留原始 arguments，绝不丢失自由格式输入。
 - **Tool Namespace**: `type=namespace` 的 Responses 工具分组；MVP 仅接受 Function 子工具。Completion 上游以 CC Switch 的 `namespace__name` 别名扁平转发，仅超出 64 字符时截断并附短哈希；Tool Context 校验碰撞，客户端始终看到原始 namespace 与子工具 name。

@@ -166,6 +166,51 @@ test('normalizeFunctionTool: parameters included when defined regardless of type
   assert.deepEqual(normalizeFunctionTool({ name: 'foo', parameters: undefined }), { type: 'function', name: 'foo' });
 });
 
+test('normalizeFunctionTool: nested function form is accepted like direct fields', () => {
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true } }),
+    { type: 'function', name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo' } }),
+    { type: 'function', name: 'foo' },
+  );
+});
+
+test('normalizeFunctionTool: nested name wins, strict falls back to tool level', () => {
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', name: 'direct', function: { name: 'nested' } }),
+    { type: 'function', name: 'nested' },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo' }, strict: true }),
+    { type: 'function', name: 'foo', strict: true },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo', strict: false }, strict: true }),
+    { type: 'function', name: 'foo', strict: false },
+  );
+});
+
+test('normalizeFunctionTool: nested form does not inherit tool-level description or parameters', () => {
+  // name and strict fall back to the tool level, but description and parameters come from `function` only.
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', name: 'top', description: 'top desc', parameters: { type: 'string' }, function: { name: 'fn' } }),
+    { type: 'function', name: 'fn' },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', name: 'top', description: 'top desc', function: { name: 'fn', description: 'fn desc', parameters: { type: 'object' } } }),
+    { type: 'function', name: 'fn', description: 'fn desc', parameters: { type: 'object' } },
+  );
+});
+
+test('normalizeFunctionTool: nested form with missing or invalid name returns undefined', () => {
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: { name: '' } }), undefined);
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: { description: 'd' } }), undefined);
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: 'nope' }), undefined);
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: { name: 'foo', description: 1 } }), undefined);
+});
+
 // ---- normalizeTools ----
 
 test('normalizeTools: undefined and non-array return undefined', () => {
@@ -183,6 +228,17 @@ test('normalizeTools: function tool normalized', () => {
   assert.strictEqual(normalizeTools([{ type: 'function' }]), undefined);
   assert.strictEqual(normalizeTools([{ type: 'function', name: '' }]), undefined);
   assert.strictEqual(normalizeTools([{ type: 'function', name: 'foo', description: 1 }]), undefined);
+});
+
+test('normalizeTools: nested function form is accepted and canonicalized', () => {
+  assert.deepEqual(
+    normalizeTools([{ type: 'function', function: { name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true } }]),
+    [{ type: 'function', name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true }],
+  );
+  assert.deepEqual(
+    normalizeTools([{ type: 'function', function: { name: 'bar' } }]),
+    [{ type: 'function', name: 'bar' }],
+  );
 });
 
 test('normalizeTools: custom tool normalized', () => {
@@ -324,7 +380,7 @@ test('toChatTools: drops web_search and preserves function/custom', () => {
     { type: 'custom', name: 'c', description: 'd', format: 'text' },
   ];
   assert.deepEqual(toChatTools(tools), [
-    { type: 'function', function: { name: 'fn', description: 'd', strict: true } },
+    { type: 'function', function: { name: 'fn', description: 'd', parameters: { type: 'object', properties: {} }, strict: true } },
     { type: 'custom', custom: { name: 'c', description: 'd', format: 'text' } },
   ]);
 });
@@ -335,7 +391,33 @@ test('toChatTools: expands namespace children into function tools with aliases',
     { type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast', description: 'd', strict: true }] },
   ];
   assert.deepEqual(toChatTools(tools), [
-    { type: 'function', function: { name: `weather_get_forecast_${hash}`, description: 'd', strict: true } },
+    { type: 'function', function: { name: `weather_get_forecast_${hash}`, description: 'd', parameters: { type: 'object', properties: {} }, strict: true } },
+  ]);
+});
+
+test('toChatTools: normalizes missing/null/non-object function parameters to an object schema', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'no_params' },
+    { type: 'function', name: 'null_params', parameters: null },
+    { type: 'function', name: 'array_params', parameters: [{ type: 'string' }] },
+  ];
+  assert.deepEqual(toChatTools(tools), [
+    { type: 'function', function: { name: 'no_params', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'null_params', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'array_params', parameters: { type: 'object', properties: {} } } },
+  ]);
+});
+
+test('toChatTools: keeps an object schema but ensures parameters.type is object', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'typed', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } },
+    { type: 'function', name: 'missing_type', parameters: { properties: { city: { type: 'string' } } } },
+    { type: 'function', name: 'wrong_type', parameters: { type: 'string', description: 'x' } },
+  ];
+  assert.deepEqual(toChatTools(tools), [
+    { type: 'function', function: { name: 'typed', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } },
+    { type: 'function', function: { name: 'missing_type', parameters: { type: 'object', properties: { city: { type: 'string' } } } } },
+    { type: 'function', function: { name: 'wrong_type', parameters: { type: 'object', description: 'x' } } },
   ]);
 });
 
