@@ -7,6 +7,9 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startBridge, type RunningBridge } from '../src/server.js';
+import { namespaceToolAlias, toolSearchOutputContent } from '../src/adapter.js';
+import { digest, zeroResponsesUsage } from '../src/state.js';
+import type { Tool } from '../src/types.js';
 
 const captureStdoutLines = () => {
   const lines: string[] = [];
@@ -33,6 +36,9 @@ const captureStdoutLines = () => {
   };
 };
 
+const logLinesFor = (lines: string[], event: string, level?: 'debug' | 'info' | 'error') => lines.filter((line) => line.includes(`[bridge] ${event}`)
+  && (level === undefined || line.includes(` ${level.toUpperCase()} [bridge] `)));
+
 const codexMixedTools = JSON.parse(
   await readFile(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/codex-0.144.5-mixed-tools.json'), 'utf8'),
 ) as unknown[];
@@ -55,6 +61,25 @@ const startCompatibilityFixture = async () => {
     response.write('data: {"choices":[{"delta":{"content":"Hello "}}]}\r\n\r\n');
     response.write('data: {"choices":[{"delta":{"content":"world"}}]}\r\n\r\n');
     response.end('data: [DONE]\r\n\r\n');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
+const startJsonFixture = async (completion: Record<string, unknown>) => {
+  const requests: unknown[] = [];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(completion));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -149,15 +174,82 @@ const startFunctionFixture = async (streams = functionSingleStreams) => {
   };
 };
 
-const supportedCapabilities = { functionTools: true, customTools: true, parallelToolCalls: true };
+const supportedCapabilities = { functionTools: true, parallelToolCalls: true };
 
 const startCustomFixture = async () => {
   const requests: unknown[] = [];
   const streams = [
     [
-      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell","type":"custom","custom":{"name":"shell","input":"ls"}}]}}]}\r\n\r\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell","type":"function","function":{"name":"shell","arguments":"{\\"input\\":\\"ls\\"}"}}]}}]}\r\n\r\n',
       'data: [DONE]\r\n\r\n',
     ],
+    [
+      'data: {"choices":[{"delta":{"content":"done"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  ];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end((streams[requests.length - 1] ?? ['data: [DONE]\r\n\r\n']).join(''));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
+const startToolSearchFixture = async () => {
+  const requests: unknown[] = [];
+  const streams = [
+    // Turn 1: the model discovers tools via the fixed tool_search function proxy.
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ts","type":"function","function":{"name":"tool_search","arguments":"{}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+    // Turn 2: the model calls a dynamically loaded function returned by tool search.
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Paris\\"}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  ];
+  const server = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end((streams[requests.length - 1] ?? ['data: [DONE]\r\n\r\n']).join(''));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address !== 'string');
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+};
+
+const startToolSearchNamespaceFixture = async () => {
+  const requests: unknown[] = [];
+  const streams = [
+    // Turn 1: discover tools via tool_search.
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ts","type":"function","function":{"name":"tool_search","arguments":"{}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+    // Turn 2: call a dynamically loaded namespace function (aliased weather__get_forecast).
+    [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ns","type":"function","function":{"name":"weather__get_forecast","arguments":"{}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+    // Turn 3: plain text reply.
     [
       'data: {"choices":[{"delta":{"content":"done"}}]}\r\n\r\n',
       'data: [DONE]\r\n\r\n',
@@ -268,7 +360,7 @@ test('reports not ready when every upstream probe fails', async () => {
   }
 });
 
-test('returns not found for removed metrics and emits redacted JSON Lines logs', async () => {
+test('returns not found for removed metrics and emits redacted single-line backend logs', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
   const captured = captureStdoutLines();
@@ -287,19 +379,17 @@ test('returns not found for removed metrics and emits redacted JSON Lines logs',
     assert.equal((await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'secret response input' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'secret response input' }),
     })).status, 200);
     assert.equal((await fetch(`${bridge.url}/metrics`)).status, 404);
     assert.equal((await fetch(`${bridge.url}/metrics`, { headers: { authorization: 'Bearer bridge-key' } })).status, 404);
-    const requestLog = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>)
-      .find(({ event }) => event === 'http_request_completed');
+    const requestLog = captured.lines.find((line) => line.includes('http_request_completed'));
     assert(requestLog);
-    assert.equal(typeof requestLog.timestamp, 'string');
-    assert.equal(typeof requestLog.level, 'string');
-    assert.equal(typeof requestLog.request_id, 'string');
-    assert.equal(typeof requestLog.duration_ms, 'number');
-    assert.equal(Object.hasOwn(requestLog, 'response_id'), true);
-    assert.equal(Object.hasOwn(requestLog, 'error_code'), true);
+    assert.match(requestLog, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z (INFO|ERROR) \[bridge\] http_request_completed\b/);
+    assert.match(requestLog, /\brequest_id=[^\s]+/);
+    assert.match(requestLog, /\bduration_ms=\d+/);
+    assert.equal(requestLog.includes('response_id=null'), false);
+    assert.equal(requestLog.includes('error_code=null'), false);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('secret invalid payload'), false);
     assert.equal(serialized.includes('secret response input'), false);
@@ -328,16 +418,16 @@ test('writes human-readable Traffic Log files beside State Store without secrets
     assert.equal((await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'secret response input' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'secret response input' }),
     })).status, 200);
     await bridge.close();
     bridge = undefined;
     const logFiles = await readdir(join(dir, 'logs'));
     assert.ok(logFiles.length > 0, 'expected log files under dirname(statePath)/logs/');
     const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
-    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ (INFO|ERROR) http_request_completed$/m);
-    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ INFO state_store_cleanup$/m);
-    assert.match(content, /\n  "[a-z_]+": /);
+    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ (INFO|ERROR) \[bridge\] http_request_completed\b/m);
+    assert.match(content, /^\d{4}-\d{2}-\d{2}T[^\n]+ INFO \[bridge\] state_store_cleanup\b/m);
+    assert.equal(content.includes('\n  "'), false);
     assert.equal(content.includes('secret response input'), false);
     assert.equal(content.includes('bridge-key'), false);
     assert.equal(content.includes('upstream-key'), false);
@@ -363,22 +453,21 @@ test('Traffic Log records downstream inbound and upstream outbound at info level
     assert.equal((await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'secret response input' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'secret response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const inbound = entries.find(({ event, level }) => event === 'traffic_downstream_inbound' && level === 'info');
+    const inbound = logLinesFor(captured.lines, 'traffic_downstream_inbound', 'info').at(0);
     assert(inbound, 'expected info-level traffic_downstream_inbound log entry');
-    assert.equal(inbound.method, 'POST');
-    assert.equal(inbound.path, '/v1/responses');
-    assert.equal(Object.hasOwn(inbound, 'body'), false);
-    assert.equal(Object.hasOwn(inbound, 'headers'), false);
-    assert.equal(Object.hasOwn(inbound, 'upstream_url'), false);
-    const outbound = entries.find(({ event, level }) => event === 'traffic_upstream_outbound' && level === 'info');
+    assert.match(inbound, /\bmethod=POST\b/);
+    assert.match(inbound, /\bpath=\/v1\/responses\b/);
+    assert.equal(inbound.includes('body='), false);
+    assert.equal(inbound.includes('headers='), false);
+    assert.equal(inbound.includes('upstream_url='), false);
+    const outbound = logLinesFor(captured.lines, 'traffic_upstream_outbound', 'info').at(0);
     assert(outbound, 'expected info-level traffic_upstream_outbound log entry');
-    assert.equal(typeof outbound.attempt_index, 'number');
-    assert.equal(Object.hasOwn(outbound, 'body'), false);
-    assert.equal(Object.hasOwn(outbound, 'headers'), false);
-    assert.equal(Object.hasOwn(outbound, 'upstream_url'), false);
+    assert.match(outbound, /\battempt_index=1\b/);
+    assert.equal(outbound.includes('body='), false);
+    assert.equal(outbound.includes('headers='), false);
+    assert.equal(outbound.includes('upstream_url='), false);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('secret response input'), false);
     assert.equal(serialized.includes('bridge-key'), false);
@@ -386,6 +475,32 @@ test('Traffic Log records downstream inbound and upstream outbound at info level
     assert.equal(serialized.includes(upstream.url), false);
   } finally {
     captured.restore();
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('logs the actual loopback endpoint after binding a dynamic port', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+      port: 0,
+    });
+    const port = Number(new URL(bridge.url).port);
+    await bridge.close();
+    bridge = undefined;
+    const logFiles = await readdir(join(dir, 'logs'));
+    const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
+    assert.match(content, /INFO \[bridge\] bridge_started\b/);
+    assert.match(content, /\baddress=127\.0\.0\.1\b/);
+    assert.match(content, new RegExp(`\\bport=${port}\\b`));
+  } finally {
     await bridge?.close();
     await upstream.close();
     await rm(dir, { recursive: true, force: true });
@@ -407,20 +522,17 @@ test('Traffic Log at debug level records body and upstream URL with redacted sec
     assert.equal((await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'visible response input' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'visible response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const inboundDebug = entries.find(({ event, level }) => event === 'traffic_downstream_inbound' && level === 'debug');
+    const inboundDebug = logLinesFor(captured.lines, 'traffic_downstream_inbound', 'debug').at(0);
     assert(inboundDebug, 'expected debug-level traffic_downstream_inbound');
-    assert.equal(inboundDebug.body, JSON.stringify({ stream: true, input: 'visible response input' }));
-    assert.equal((inboundDebug.headers as Record<string, unknown>).authorization, '[REDACTED]');
-    const outboundDebug = entries.find(({ event, level }) => event === 'traffic_upstream_outbound' && level === 'debug');
+    assert.match(inboundDebug, /body="\{\\"model\\":\\"gpt-4.1\\",\\"stream\\":true,\\"input\\":\\"visible response input\\"\}"/);
+    assert.match(inboundDebug, /headers=\{.*"authorization":"\[REDACTED\]".*\}/);
+    const outboundDebug = logLinesFor(captured.lines, 'traffic_upstream_outbound', 'debug').at(0);
     assert(outboundDebug, 'expected debug-level traffic_upstream_outbound');
-    assert.equal(typeof outboundDebug.upstream_url, 'string');
-    assert.ok(String(outboundDebug.upstream_url).includes(upstream.url));
-    assert.equal(typeof outboundDebug.body, 'string');
-    assert.ok((outboundDebug.body as string).includes('visible response input'));
-    assert.equal((outboundDebug.headers as Record<string, unknown>).authorization, '[REDACTED]');
+    assert.equal(outboundDebug.includes(`upstream_url=${upstream.url}/v1/chat/completions`), true);
+    assert.match(outboundDebug, /body="\{.*visible response input.*\}"/);
+    assert.match(outboundDebug, /headers=\{.*"authorization":"\[REDACTED\]".*\}/);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('bridge-key'), false);
     assert.equal(serialized.includes('upstream-key'), false);
@@ -446,21 +558,20 @@ test('Traffic Log records upstream inbound and downstream outbound at info level
     assert.equal((await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'secret response input' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'secret response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const upstreamInbound = entries.filter(({ event, level }) => event === 'traffic_upstream_inbound' && level === 'info');
+    const upstreamInbound = logLinesFor(captured.lines, 'traffic_upstream_inbound', 'info');
     assert.ok(upstreamInbound.length > 0, 'expected info-level traffic_upstream_inbound log entries');
-    for (const entry of upstreamInbound) {
-      assert.equal(typeof entry.status, 'number');
-      assert.equal(Object.hasOwn(entry, 'body'), false);
-      assert.equal(Object.hasOwn(entry, 'headers'), false);
+    for (const line of upstreamInbound) {
+      assert.match(line, /\bstatus=\d+\b/);
+      assert.equal(line.includes('body='), false);
+      assert.equal(line.includes('headers='), false);
     }
-    const downstreamOutbound = entries.filter(({ event, level }) => event === 'traffic_downstream_outbound' && level === 'info');
+    const downstreamOutbound = logLinesFor(captured.lines, 'traffic_downstream_outbound', 'info');
     assert.ok(downstreamOutbound.length > 0, 'expected info-level traffic_downstream_outbound log entries');
-    for (const entry of downstreamOutbound) {
-      assert.equal(typeof entry.event_type, 'string');
-      assert.equal(Object.hasOwn(entry, 'sse_event'), false);
+    for (const line of downstreamOutbound) {
+      assert.match(line, /\bevent_type=[^\s]+/);
+      assert.equal(line.includes('sse_event='), false);
     }
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('secret response input'), false);
@@ -490,29 +601,27 @@ test('Traffic Log at debug level records upstream SSE chunks and downstream even
     assert.equal((await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'visible response input' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'visible response input' }),
     })).status, 200);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const upstreamDebug = entries.filter(({ event, level }) => event === 'traffic_upstream_inbound' && level === 'debug');
+    const upstreamDebug = logLinesFor(captured.lines, 'traffic_upstream_inbound', 'debug');
     assert.ok(upstreamDebug.length > 0, 'expected debug-level traffic_upstream_inbound entries');
-    const upstreamHeadersEntry = upstreamDebug.find((entry) => Object.hasOwn(entry, 'headers'));
+    const upstreamHeadersEntry = upstreamDebug.find((line) => line.includes('headers='));
     assert(upstreamHeadersEntry, 'expected upstream inbound debug entry with headers');
-    assert.equal(typeof (upstreamHeadersEntry!.headers as Record<string, unknown>)['content-type'], 'string');
-    const upstreamBodyEntries = upstreamDebug.filter((entry) => Object.hasOwn(entry, 'body'));
+    assert.match(upstreamHeadersEntry, /headers=\{.*"content-type":"[^"]+".*\}/);
+    const upstreamBodyEntries = upstreamDebug.filter((line) => line.includes('body='));
     assert.ok(upstreamBodyEntries.length >= 3, 'expected upstream inbound debug entries with SSE body chunks');
-    assert.ok(upstreamBodyEntries.some((entry) => typeof entry.body === 'string' && (entry.body as string).includes('Hello ')));
-    assert.ok(upstreamBodyEntries.some((entry) => typeof entry.body === 'string' && (entry.body as string).includes('world')));
-    assert.ok(upstreamBodyEntries.some((entry) => entry.body === '[DONE]'));
-    const downstreamDebug = entries.filter(({ event, level }) => event === 'traffic_downstream_outbound' && level === 'debug');
+    assert.ok(upstreamBodyEntries.some((line) => line.includes('Hello ')));
+    assert.ok(upstreamBodyEntries.some((line) => line.includes('world')));
+    assert.ok(upstreamBodyEntries.some((line) => line.includes('body="[DONE]"')));
+    const downstreamDebug = logLinesFor(captured.lines, 'traffic_downstream_outbound', 'debug');
     assert.ok(downstreamDebug.length >= 5, 'expected at least 5 debug-level traffic_downstream_outbound entries');
-    const downstreamEventTypes = downstreamDebug.map((entry) => entry.event_type);
-    assert.ok(downstreamEventTypes.includes('response.created'));
-    assert.ok(downstreamEventTypes.includes('response.output_text.delta'));
-    assert.ok(downstreamEventTypes.includes('response.output_item.done'));
-    assert.ok(downstreamEventTypes.includes('response.completed'));
-    for (const entry of downstreamDebug) {
-      assert.equal(typeof entry.event_type, 'string');
-      assert.equal(typeof entry.sse_event, 'object');
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.created')));
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.output_text.delta')));
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.output_item.done')));
+    assert.ok(downstreamDebug.some((line) => line.includes('event_type=response.completed')));
+    for (const line of downstreamDebug) {
+      assert.match(line, /\bevent_type=[^\s]+/);
+      assert.equal(line.includes('sse_event={'), true);
     }
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('bridge-key'), false);
@@ -546,27 +655,24 @@ test('Traffic Log records every Attempt during failover', async () => {
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers,
-      body: JSON.stringify({ stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
     });
     const firstEvents = sseTypes(await first.text());
     const previousResponseId = (firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers,
       body: JSON.stringify({
-        stream: true, previous_response_id: previousResponseId,
+        model: 'gpt-4.1', stream: true, previous_response_id: previousResponseId,
         input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
       }),
     });
     assert.equal((await second.text()).length > 0, true);
-    const entries = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    const outbound = entries.filter(({ event }) => event === 'traffic_upstream_outbound');
-    const inbound = entries.filter(({ event }) => event === 'traffic_upstream_inbound');
+    const outbound = logLinesFor(captured.lines, 'traffic_upstream_outbound');
+    const inbound = logLinesFor(captured.lines, 'traffic_upstream_inbound');
     assert.equal(outbound.length, 3, 'expected 3 outbound entries (1 + 2 failover)');
     assert.equal(inbound.length, 3, 'expected 3 inbound entries (1 + 2 failover)');
-    const attemptIndices = outbound.map((entry) => entry.attempt_index);
-    assert.deepEqual(attemptIndices, [1, 1, 2]);
-    const inboundStatuses = inbound.map((entry) => entry.status);
-    assert.deepEqual(inboundStatuses, [200, 429, 200]);
+    assert.deepEqual(outbound.map((line) => /\battempt_index=(\d+)\b/.exec(line)?.[1]), ['1', '1', '2']);
+    assert.deepEqual(inbound.map((line) => /\bstatus=(\d+)\b/.exec(line)?.[1]), ['200', '429', '200']);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('bridge-key'), false);
     assert.equal(serialized.includes('upstream-key'), false);
@@ -593,7 +699,7 @@ test('writes human-readable Traffic Log SSE events per line at debug level', asy
     assert.equal((await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'visible response input' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'visible response input' }),
     })).status, 200);
     await bridge.close();
     bridge = undefined;
@@ -601,9 +707,10 @@ test('writes human-readable Traffic Log SSE events per line at debug level', asy
     const content = (await Promise.all(logFiles.map((name) => readFile(join(dir, 'logs', name), 'utf8')))).join('\n');
     assert.match(content, /traffic_upstream_inbound/);
     assert.match(content, /traffic_downstream_outbound/);
-    assert.match(content, /\n  "body": /);
-    assert.match(content, /\n  "sse_event": /);
-    assert.match(content, /\n  "event_type": /);
+    assert.match(content, /\bbody=/);
+    assert.match(content, /\bsse_event=\{/);
+    assert.match(content, /\bevent_type=/);
+    assert.equal(content.includes('\n  "'), false);
     assert.equal(content.includes('bridge-key'), false);
     assert.equal(content.includes('upstream-key'), false);
   } finally {
@@ -642,11 +749,11 @@ test('State Store startup cleanup removes only expired terminal Response Chains 
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
     const first = sseTypes(await (await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'first retained input' }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'first retained input' }),
     })).text());
     const responseId = (first[0] as unknown as { response: { id: string } }).response.id;
     await (await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'second retained input', previous_response_id: responseId }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'second retained input', previous_response_id: responseId }),
     })).text();
     await bridge.close();
     bridge = undefined;
@@ -684,13 +791,12 @@ test('State Store startup cleanup removes only expired terminal Response Chains 
     assert.deepEqual(bridge.state.responses(), [{ status: 'in_progress', outputText: '' }]);
     assert.deepEqual(bridge.state.events(), []);
     assert.deepEqual(bridge.state.attempts(), [{ responseId: 'resp_active' }]);
-    const cleanupLog = captured.lines.map((line) => JSON.parse(line) as Record<string, unknown>)
-      .find(({ event, deleted_chains: deletedChains }) => event === 'state_store_cleanup' && deletedChains === 1);
+    const cleanupLog = logLinesFor(captured.lines, 'state_store_cleanup')
+      .find((line) => line.includes('deleted_chains=1'));
     assert(cleanupLog);
-    assert.equal(typeof cleanupLog.started_at, 'number');
-    assert.equal(typeof cleanupLog.ended_at, 'number');
-    assert.equal(typeof cleanupLog.reclaimed_bytes, 'number');
-    assert.equal(Number(cleanupLog.started_at) <= Number(cleanupLog.ended_at), true);
+    assert.match(cleanupLog, /\bstarted_at=\d+\b/);
+    assert.match(cleanupLog, /\bended_at=\d+\b/);
+    assert.match(cleanupLog, /\breclaimed_bytes=\d+\b/);
     const serialized = captured.lines.join('\n');
     assert.equal(serialized.includes('retained input'), false);
     assert.equal(serialized.includes('bridge-key'), false);
@@ -717,7 +823,7 @@ test('State Store rejects a new Response before writes at the hard capacity limi
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'must not be stored' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'must not be stored' }),
     });
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), {
@@ -744,16 +850,9 @@ test('bridges a text stream into ordered Responses SSE', async () => {
       statePath: join(dir, 'state.db'),
     });
     const unauthorized = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', body: JSON.stringify({ stream: true, input: 'hello' }),
+      method: 'POST', body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'hello' }),
     });
     assert.equal(unauthorized.status, 401);
-
-    const nonStreaming = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST',
-      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: false, input: 'hello' }),
-    });
-    assert.equal(nonStreaming.status, 400);
 
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST',
@@ -764,7 +863,7 @@ test('bridges a text stream into ordered Responses SSE', async () => {
     const body = await response.text();
     const events = sseTypes(body);
     assert.deepEqual(events.map(({ type }) => type), [
-      'response.created', 'response.output_text.delta', 'response.output_text.delta',
+      'response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_text.delta',
       'response.output_item.done', 'response.completed',
     ]);
     assert.equal(body.includes('chat.completion.chunk'), false);
@@ -773,8 +872,153 @@ test('bridges a text stream into ordered Responses SSE', async () => {
       model: 'gpt-test', stream: true, stream_options: { include_usage: true },
       messages: [{ role: 'user', content: 'hello' }],
     }]);
-    assert.deepEqual(bridge.state.events().map((event) => event.sequence), [1, 2, 3, 4, 5]);
+    assert.deepEqual(bridge.state.events().map((event) => event.sequence), [1, 2, 3, 4, 5, 6, 7]);
     assert.deepEqual(bridge.state.responses(), [{ status: 'completed', outputText: 'Hello world' }]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('bridges structured non-stream Responses input into a persisted JSON Response', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({
+    id: 'chatcmpl_upstream', model: 'o3',
+    choices: [{ message: { role: 'assistant', content: 'Done.' }, finish_reason: 'stop' }],
+  });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'plain-json' };
+    const payload = {
+      model: 'o3', instructions: 'Follow instructions.', max_output_tokens: 42,
+      temperature: 0.2, top_p: 0.8,
+      input: [
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'Developer policy.' }] },
+        { type: 'message', role: 'system', content: [{ type: 'input_text', text: 'System policy.' }] },
+        {
+          type: 'message', role: 'user', content: [
+            { type: 'input_text', text: 'Inspect these.' },
+            { type: 'input_image', image_url: 'https://example.test/image.png', detail: 'low' },
+            { type: 'input_file', filename: 'note.txt', file_data: 'data:text/plain;base64,bm90ZQ==' },
+            { type: 'input_audio', input_audio: { data: 'YXVkaW8=', format: 'wav' } },
+          ],
+        },
+        { id: 'external-history-id', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Prior answer.' }, { type: 'refusal', refusal: 'No secrets.' }] },
+      ],
+    };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(payload) });
+    assert.equal(first.status, 200);
+    const firstBody = await first.json() as { id: string; object: string; status: string; model: string; output: unknown[] };
+    assert.match(firstBody.id, /^resp_/);
+    assert.deepEqual({ ...firstBody, id: '<local-response-id>' }, {
+      id: '<local-response-id>', object: 'response', status: 'completed', model: 'o3',
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+      output: [{
+        id: `msg_${firstBody.id}`, type: 'message', status: 'completed', role: 'assistant',
+        content: [{ type: 'output_text', text: 'Done.' }],
+      }],
+    });
+    const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(payload) });
+    assert.deepEqual(await replay.json(), firstBody);
+    const changedControl = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify({ ...payload, temperature: 0.7 }),
+    });
+    assert.equal(changedControl.status, 409);
+    assert.equal((await changedControl.json() as { error: { code: string } }).error.code, 'idempotency_key_conflict');
+    assert.deepEqual(upstream.requests, [{
+      model: 'o3', stream: false, max_completion_tokens: 42, temperature: 0.2, top_p: 0.8,
+      messages: [
+        { role: 'system', content: 'Follow instructions.\nDeveloper policy.\nSystem policy.' },
+        {
+          role: 'user', content: [
+            { type: 'text', text: 'Inspect these.' },
+            { type: 'image_url', image_url: { url: 'https://example.test/image.png', detail: 'low' } },
+            { type: 'file', file: { filename: 'note.txt', file_data: 'data:text/plain;base64,bm90ZQ==' } },
+            { type: 'input_audio', input_audio: { data: 'YXVkaW8=', format: 'wav' } },
+          ],
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'Prior answer.' }, { type: 'refusal', refusal: 'No secrets.' }] },
+      ],
+    }]);
+    assert.deepEqual(bridge.state.responses(), [{ status: 'completed', outputText: 'Done.' }]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects an unknown structured input part without contacting the upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4.1', stream: false, input: [{ type: 'message', role: 'user', content: [{ type: 'input_video', video_url: 'https://example.test/video.mp4' }] }] }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_input');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects a non-stream Chat JSON response without a first text choice', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ choices: [] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4.1', stream: false, input: 'hello' }),
+    });
+    assert.equal(response.status, 502);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'upstream_invalid_json');
+    assert.deepEqual(bridge.state.responses(), []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('persists an empty first Chat choice as an empty Responses message item', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ choices: [{ message: { role: 'assistant', content: '' } }] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4.1', stream: false, input: 'hello' }),
+    });
+    const body = await response.json() as { output: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.output.map((item) => item.content[0]?.text), ['']);
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -856,7 +1100,7 @@ test('store:false Response Chain accepts echoed assistant input from prior turn'
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
     const first = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, store: false, input: 'hi' }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, store: false, input: 'hi' }),
     });
     const firstBody = await first.text();
     assert.equal(first.status, 200);
@@ -871,7 +1115,7 @@ test('store:false Response Chain accepts echoed assistant input from prior turn'
       method: 'POST',
       headers,
       body: JSON.stringify({
-        stream: true,
+        model: 'gpt-4.1', stream: true,
         store: false,
         previous_response_id: firstCompleted.response.id,
         input: [
@@ -975,7 +1219,7 @@ test('keeps mixed text and Function Tool SSE events aligned to Output Item order
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Check weather.', tools: [{ type: 'function', name: 'weather' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Check weather.', tools: [{ type: 'function', name: 'weather' }] }),
     });
     const events = sseTypes(await response.text()) as unknown as Array<{ type: string; output_index?: number; response?: { output: Array<{ type: string }> } }>;
     assert.deepEqual(events.filter((event) => event.type.includes('function_call_arguments')).map((event) => event.output_index), [1, 1]);
@@ -998,7 +1242,7 @@ test('orders out-of-order Function Tool chunks by their Chat call index', async 
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Check both.',
+        model: 'gpt-4.1', stream: true, input: 'Check both.',
         tools: [{ type: 'function', name: 'weather' }, { type: 'function', name: 'time' }],
       }),
     });
@@ -1027,7 +1271,7 @@ test('rejects a missing Response Chain ancestor without creating a response', as
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, previous_response_id: 'resp_missing',
+        model: 'gpt-4.1', stream: true, previous_response_id: 'resp_missing',
         input: [{ type: 'function_call_output', call_id: 'call_missing', output: 'unavailable' }],
       }),
     });
@@ -1042,7 +1286,7 @@ test('rejects a missing Response Chain ancestor without creating a response', as
     assert.deepEqual(bridge.state.responses(), []);
     const emptyPrevious = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, previous_response_id: '', input: 'Continue.' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, previous_response_id: '', input: 'Continue.' }),
     });
     assert.equal(emptyPrevious.status, 400);
     assert.deepEqual(upstream.requests, []);
@@ -1068,7 +1312,7 @@ test('rejects a legacy Response Chain ancestor without saved context', async () 
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, previous_response_id: 'resp_legacy', input: 'Continue.' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, previous_response_id: 'resp_legacy', input: 'Continue.' }),
     });
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
@@ -1078,6 +1322,242 @@ test('rejects a legacy Response Chain ancestor without saved context', async () 
       },
     });
     assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('forward-only State Store migration Compatibility Fixture preserves Tool Context, terminal facts, Output Items, Stream Events, and replay', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const statePath = join(dir, 'state.db');
+  const responseId = 'resp_pre_protocol';
+  const outputItem = {
+    id: `msg_${responseId}`, type: 'message', status: 'completed', role: 'assistant',
+    content: [{ type: 'output_text', text: 'Hello world' }],
+  };
+  const completedWithoutUsage = {
+    type: 'response.completed',
+    response: { id: responseId, object: 'response', status: 'completed', model: 'gpt-4.1', output: [outputItem] },
+  };
+  const controlKeys = [
+    'temperature', 'top_p', 'presence_penalty', 'frequency_penalty', 'logit_bias', 'logprobs', 'top_logprobs',
+    'seed', 'stop', 'response_format', 'n', 'user',
+  ];
+  const requestHash = digest({
+    model: 'gpt-4.1',
+    input: [{ type: 'message', role: 'user', content: 'Hello' }],
+    tools: [],
+    previousResponseId: null,
+    parallelToolCalls: false,
+    toolChoice: undefined,
+    include: undefined,
+    reasoningEffort: null,
+    deliveryMode: 'stream',
+    instructions: null,
+    maxOutputTokens: null,
+    maxTokens: null,
+    maxCompletionTokens: null,
+    controls: Object.fromEntries(controlKeys.map((key) => [key, { present: false }])),
+  });
+  const legacy = new DatabaseSync(statePath);
+  legacy.exec(`
+    CREATE TABLE responses (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      output_text TEXT NOT NULL DEFAULT ''
+    ) STRICT;
+    CREATE TABLE output_items (
+      response_id TEXT NOT NULL,
+      output_index INTEGER NOT NULL,
+      item_json TEXT NOT NULL,
+      PRIMARY KEY (response_id, output_index)
+    ) STRICT;
+    CREATE TABLE stream_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      response_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE idempotency_records (
+      auth_subject TEXT NOT NULL,
+      key TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      response_id TEXT NOT NULL UNIQUE,
+      PRIMARY KEY (auth_subject, key)
+    ) STRICT;
+  `);
+  legacy.prepare('INSERT INTO responses (id, status, output_text) VALUES (?, ?, ?)').run(responseId, 'completed', 'Hello world');
+  legacy.prepare('INSERT INTO output_items (response_id, output_index, item_json) VALUES (?, ?, ?)').run(responseId, 0, JSON.stringify(outputItem));
+  for (const event of [
+    { type: 'response.created', response: { id: responseId, object: 'response', status: 'queued', model: 'gpt-4.1', output: [] } },
+    { type: 'response.in_progress', response: { id: responseId, object: 'response', status: 'in_progress', model: 'gpt-4.1', output: [] } },
+    { type: 'response.output_item.added', output_index: 0, item: outputItem },
+    { type: 'response.output_text.delta', output_index: 0, delta: 'Hello world' },
+    { type: 'response.output_item.done', output_index: 0, item: outputItem },
+    completedWithoutUsage,
+  ]) {
+    legacy.prepare('INSERT INTO stream_events (response_id, type, payload) VALUES (?, ?, ?)')
+      .run(responseId, event.type, JSON.stringify(event));
+  }
+  legacy.prepare('INSERT INTO idempotency_records (auth_subject, key, request_hash, response_id) VALUES (?, ?, ?, ?)')
+    .run(digest('Bearer bridge-key'), 'pre-protocol', requestHash, responseId);
+  legacy.close();
+
+  const upstream = await startScriptedFixture([
+    { frames: functionSingleStreams[0] },
+    {
+      frames: [
+        'event: message\ndata: {"choices":[\ndata: {"delta":{"content":"Cut"},"finish_reason":"length"}]}\n\n',
+        'data: {"usage":{"prompt_tokens":2,"completion_tokens":1}}\r\n\r\n',
+        'data: [DONE]\r\n\r\n',
+      ],
+    },
+    {
+      frames: [
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        'event: error\ndata: {"error":{"message":"Interrupted","type":"upstream_error","param":null,"code":"stream_interrupted"}}\n\n',
+      ],
+    },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1_000_000, hardLimitBytes: 2_000_000, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+
+    const database = new DatabaseSync(statePath);
+    const columns = new Set(database.prepare('PRAGMA table_info(responses)').all().map((row) => String(row.name)));
+    for (const column of ['tools_json', 'usage_json', 'incomplete_reason', 'context_complete', 'created_at', 'terminal_at']) {
+      assert.equal(columns.has(column), true, `missing migrated column ${column}`);
+    }
+    const migrated = database.prepare('SELECT usage_json, incomplete_reason, context_complete, tools_json FROM responses WHERE id = ?')
+      .get(responseId) as { usage_json: string; incomplete_reason: string | null; context_complete: number; tools_json: string };
+    assert.deepEqual(JSON.parse(migrated.usage_json), zeroResponsesUsage);
+    assert.equal(migrated.incomplete_reason, null);
+    assert.equal(migrated.context_complete, 0);
+    assert.deepEqual(JSON.parse(migrated.tools_json), []);
+    assert.deepEqual(
+      database.prepare('SELECT item_json FROM output_items WHERE response_id = ? ORDER BY output_index').all(responseId)
+        .map((row) => JSON.parse(String(row.item_json))),
+      [outputItem],
+    );
+    assert.deepEqual(
+      database.prepare('SELECT type FROM stream_events WHERE response_id = ? ORDER BY sequence').all(responseId)
+        .map((row) => String(row.type)),
+      ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_item.done', 'response.completed'],
+    );
+    database.close();
+
+    const replay = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'pre-protocol' },
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
+    });
+    assert.equal(replay.status, 200);
+    const replayEvents = sseTypes(await replay.text()) as Array<{ type: string; response?: { usage?: unknown } }>;
+    assert.deepEqual(replayEvents.map(({ type }) => type), [
+      'response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_item.done', 'response.completed',
+    ]);
+    assert.deepEqual(replayEvents.at(-1)?.response?.usage, zeroResponsesUsage);
+    assert.equal(upstream.requests.length, 0);
+
+    const tool = { type: 'function', name: 'weather', parameters: null };
+    const toolResponse = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Weather?', tools: [tool] }),
+    });
+    const toolEvents = sseTypes(await toolResponse.text()) as Array<{ type: string; response?: { id?: string } }>;
+    const toolResponseId = toolEvents.find(({ type }) => type === 'response.completed')?.response?.id;
+    assert(typeof toolResponseId === 'string' && toolResponseId.length > 0);
+    const afterTools = new DatabaseSync(statePath);
+    assert.deepEqual(
+      JSON.parse(String((afterTools.prepare('SELECT tools_json FROM responses WHERE id = ?').get(toolResponseId) as { tools_json: string }).tools_json)),
+      [tool],
+    );
+    afterTools.close();
+
+    const incomplete = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'truncate' }),
+    });
+    const incompleteUsage = {
+      input_tokens: 2, output_tokens: 1, total_tokens: 3, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
+    };
+    const incompleteEvents = sseTypes(await incomplete.text()) as Array<{ type: string; response?: { status?: string; incomplete_details?: unknown; usage?: unknown } }>;
+    assert.equal(incompleteEvents.at(-1)?.type, 'response.incomplete');
+    assert.deepEqual(incompleteEvents.at(-1)?.response?.incomplete_details, { reason: 'max_output_tokens' });
+    assert.deepEqual(incompleteEvents.at(-1)?.response?.usage, incompleteUsage);
+    const afterIncomplete = new DatabaseSync(statePath);
+    const incompleteRow = afterIncomplete.prepare("SELECT incomplete_reason, usage_json FROM responses WHERE status = 'incomplete' ORDER BY rowid DESC LIMIT 1")
+      .get() as { incomplete_reason: string; usage_json: string };
+    assert.equal(incompleteRow.incomplete_reason, 'max_output_tokens');
+    assert.deepEqual(JSON.parse(incompleteRow.usage_json), incompleteUsage);
+    afterIncomplete.close();
+
+    const failed = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'fail after output' }),
+    });
+    const failedEvents = sseTypes(await failed.text()) as Array<{ type: string; response?: { error?: unknown } }>;
+    assert.equal(failedEvents.at(-1)?.type, 'response.failed');
+    assert.deepEqual(failedEvents.at(-1)?.response?.error, {
+      message: 'Interrupted', type: 'upstream_error', param: null, code: 'stream_interrupted',
+    });
+    const afterFailed = new DatabaseSync(statePath);
+    const failedPayload = JSON.parse(String(
+      (afterFailed.prepare("SELECT payload FROM stream_events WHERE type = 'response.failed' ORDER BY sequence DESC LIMIT 1").get() as { payload: string }).payload,
+    )) as { response?: { error?: unknown } };
+    assert.deepEqual(failedPayload.response?.error, {
+      message: 'Interrupted', type: 'upstream_error', param: null, code: 'stream_interrupted',
+    });
+    assert.equal(
+      (afterFailed.prepare("SELECT status, output_text FROM responses WHERE status = 'failed' ORDER BY rowid DESC LIMIT 1").get() as { status: string; output_text: string }).output_text,
+      'partial',
+    );
+    afterFailed.close();
+
+    await bridge.close();
+    bridge = undefined;
+    const expiredStore = new DatabaseSync(statePath);
+    expiredStore.prepare('UPDATE responses SET terminal_at = 0 WHERE id = ?').run(responseId);
+    expiredStore.exec("INSERT INTO responses (id, status, model, input_json, tools_json, parallel_tool_calls, context_complete, output_text, created_at) VALUES ('resp_active', 'in_progress', 'gpt-test', '[]', '[]', 0, 1, '', 0)");
+    expiredStore.close();
+
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1, hardLimitBytes: 1_000_000, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+    assert.equal(bridge.state.responses().some((row) => row.status === 'in_progress' && row.outputText === ''), true);
+    assert.equal(bridge.state.responses().some((row) => row.outputText === 'Hello world'), false);
+    const retainedAfterCleanup = bridge.state.responses().length;
+    await bridge.close();
+    bridge = undefined;
+
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath,
+      statePolicy: { cleanupThresholdBytes: 1, hardLimitBytes: 2, responseRetentionDays: 30, attemptRetentionDays: 7 },
+    });
+    const capacity = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'must not be stored' }),
+    });
+    assert.equal(capacity.status, 503);
+    assert.equal((await capacity.json() as { error: { code: string } }).error.code, 'state_store_capacity_exceeded');
+    assert.equal(bridge.state.responses().length, retainedAfterCleanup);
+    assert.equal(upstream.requests.length, 3);
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -1100,7 +1580,7 @@ test('rejects an incomplete Response Chain ancestor', async () => {
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, previous_response_id: 'resp_in_progress', input: 'Continue.' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, previous_response_id: 'resp_in_progress', input: 'Continue.' }),
     });
     assert.equal(response.status, 400);
     assert.deepEqual(upstream.requests, []);
@@ -1121,14 +1601,14 @@ test('rejects Function Tool output that is not associated with the Response Chai
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
     });
     const firstEvents = sseTypes(await first.text());
     const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, previous_response_id: firstResponse.response.id,
+        model: 'gpt-4.1', stream: true, previous_response_id: firstResponse.response.id,
         input: [{ type: 'function_call_output', call_id: 'call_unknown', output: 'sunny' }],
       }),
     });
@@ -1158,20 +1638,20 @@ test('rejects a delayed Function Tool result from an earlier Response', async ()
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
     });
     const firstEvents = sseTypes(await first.text());
     const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, previous_response_id: firstResponse.response.id, input: 'Never mind.' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, previous_response_id: firstResponse.response.id, input: 'Never mind.' }),
     });
     const secondEvents = sseTypes(await second.text());
     const secondResponse = secondEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
     const delayed = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, previous_response_id: secondResponse.response.id,
+        model: 'gpt-4.1', stream: true, previous_response_id: secondResponse.response.id,
         input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
       }),
     });
@@ -1184,62 +1664,308 @@ test('rejects a delayed Function Tool result from an earlier Response', async ()
   }
 });
 
-test('custom-supported Compatibility Fixture selects a native Custom Tool upstream', async () => {
+test('accepts nested and direct Function declarations and normalizes parameters for the Chat proxy', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const incompatible = await startCompatibilityFixture();
-  const compatible = await startCustomFixture();
+  const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [
-        { baseUrl: incompatible.url, apiKey: 'upstream-key', capabilities: { functionTools: true } },
-        { baseUrl: compatible.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
-      ],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const tools = [
+      { type: 'function', name: 'direct', description: 'direct form', parameters: null },
+      { type: 'function', function: { name: 'nested', parameters: { type: 'string' } } },
+    ];
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi', tools }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    assert.deepEqual((upstream.requests[0] as { tools: unknown[] }).tools, [
+      { type: 'function', function: { name: 'direct', description: 'direct form', parameters: { type: 'object', properties: {} } } },
+      { type: 'function', function: { name: 'nested', parameters: { type: 'object' } } },
+    ]);
+    const database = new DatabaseSync(join(dir, 'state.db'));
+    const row = database.prepare('SELECT tools_json FROM responses ORDER BY created_at DESC LIMIT 1').get() as { tools_json: string };
+    database.close();
+    // Tool Context persists the original downstream definitions; only the Chat proxy normalized them.
+    assert.deepEqual(JSON.parse(row.tools_json), [
+      { type: 'function', name: 'direct', description: 'direct form', parameters: null },
+      { type: 'function', name: 'nested', parameters: { type: 'string' } },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Function Tool Context is persisted and reused for continuation without re-deriving tools', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startFunctionFixture();
+  let bridge: RunningBridge | undefined;
+  const tool = { type: 'function', name: 'weather', parameters: null };
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Weather?', tools: [tool] }),
+    });
+    const firstEvents = sseTypes(await first.text());
+    const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
+    assert.deepEqual((upstream.requests[0] as { tools: unknown[] }).tools, [
+      { type: 'function', function: { name: 'weather', parameters: { type: 'object', properties: {} } } },
+    ]);
+    const database = new DatabaseSync(join(dir, 'state.db'));
+    const row = database.prepare('SELECT tools_json FROM responses WHERE id = ?').get(firstResponse.response.id) as { tools_json: string };
+    database.close();
+    assert.deepEqual(JSON.parse(row.tools_json), [{ type: 'function', name: 'weather', parameters: null }]);
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, previous_response_id: firstResponse.response.id,
+        input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
+      }),
+    });
+    const secondBody = await second.text();
+    assert.equal(second.status, 200, secondBody);
+    // Continuation sends no tools, so the Chat tools are rebuilt from the persisted Tool Context and re-normalized.
+    assert.deepEqual((upstream.requests[1] as { tools: unknown[] }).tools, [
+      { type: 'function', function: { name: 'weather', parameters: { type: 'object', properties: {} } } },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Inline Tool Replay accepts a paired call and output without previous_response_id', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather in Paris?' }] },
+          { type: 'function_call', call_id: 'call_weather', name: 'weather', arguments: '{"city":"Paris"}' },
+          { type: 'function_call_output', call_id: 'call_weather', output: 'sunny' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Thanks, what next?' }] },
+        ],
+        tools: [{ type: 'function', name: 'weather', parameters: { type: 'object' } }],
+      }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    assert.deepEqual((upstream.requests[0] as { messages: unknown[] }).messages, [
+      { role: 'user', content: 'Weather in Paris?' },
+      { role: 'assistant', tool_calls: [{ id: 'call_weather', type: 'function', function: { name: 'weather', arguments: '{"city":"Paris"}' } }] },
+      { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
+      { role: 'user', content: 'Thanks, what next?' },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Inline Tool Replay aliases a Namespace function_call for Chat upstreams', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Profile?' }] },
+          {
+            type: 'function_call', call_id: 'call_ns', name: 'get_customer_profile',
+            namespace: 'crm', arguments: '{"customer_id":"1"}',
+          },
+          { type: 'function_call_output', call_id: 'call_ns', output: '{"name":"Ada"}' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Thanks' }] },
+        ],
+        tools: [{
+          type: 'namespace', name: 'crm', description: 'CRM tools',
+          tools: [{ type: 'function', name: 'get_customer_profile', parameters: { type: 'object' } }],
+        }],
+      }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    assert.deepEqual((upstream.requests[0] as { messages: unknown[] }).messages, [
+      { role: 'user', content: 'Profile?' },
+      { role: 'assistant', tool_calls: [{ id: 'call_ns', type: 'function', function: { name: 'crm__get_customer_profile', arguments: '{"customer_id":"1"}' } }] },
+      { role: 'tool', tool_call_id: 'call_ns', content: '{"name":"Ada"}' },
+      { role: 'user', content: 'Thanks' },
+    ]);
+    assert.deepEqual((upstream.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map((tool) => tool.function.name), [
+      'crm__get_customer_profile',
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects a Function Tool output without previous_response_id or a paired inline call', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true,
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather?' }] },
+          { type: 'function_call_output', call_id: 'call_weather', output: 'sunny' },
+        ],
+        tools: [{ type: 'function', name: 'weather', parameters: { type: 'object' } }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: {
+        message: 'Tool output requires previous_response_id', type: 'invalid_request_error', param: null,
+        code: 'missing_previous_response_id',
+      },
+    });
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('drops tool_choice and parallel_tool_calls when no Chat tools remain', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, input: 'hi',
+        tools: [], parallel_tool_calls: true, tool_choice: { type: 'function', name: 'weather' },
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    const request = upstream.requests[0] as { tools?: unknown; tool_choice?: unknown; parallel_tool_calls?: unknown };
+    assert.equal(request.tools, undefined);
+    assert.equal(request.tool_choice, undefined);
+    assert.equal(request.parallel_tool_calls, undefined);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Custom Tool proxies through a Chat function and round-trips with continuation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  // Custom Tools only require upstream Function Tool compatibility: a function-only upstream
+  // (no native Custom support) is selected and receives a Function proxy.
+  const upstream = await startCustomFixture();
+  const shellProxy = {
+    type: 'function',
+    function: {
+      name: 'shell',
+      description: '{"type":"custom","name":"shell","description":"Runs shell"}',
+      parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] },
+    },
+  };
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
       statePath: join(dir, 'state.db'),
     });
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'List files.', tools: [{ type: 'custom', name: 'shell', description: 'Runs shell' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'List files.', tools: [{ type: 'custom', name: 'shell', description: 'Runs shell' }] }),
     });
     assert.equal(first.status, 200);
     const firstEvents = sseTypes(await first.text()) as unknown as Array<{ type: string; item?: { type: string; call_id: string; input: string }; response?: { id: string } }>;
     const call = firstEvents.find((event) => event.type === 'response.output_item.done')?.item;
     assert.deepEqual(call, { id: 'call_shell', type: 'custom_tool_call', status: 'completed', call_id: 'call_shell', name: 'shell', input: 'ls' });
-    assert.equal(incompatible.requests.length, 0);
-    assert.deepEqual(compatible.requests[0], {
+    assert.deepEqual(upstream.requests[0], {
       model: 'gpt-4.1', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'List files.' }],
-      tools: [{ type: 'custom', custom: { name: 'shell', description: 'Runs shell' } }],
+      tools: [shellProxy],
     });
 
     const responseId = firstEvents.find((event) => event.type === 'response.completed')?.response?.id;
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, previous_response_id: responseId,
+        model: 'gpt-4.1', stream: true, previous_response_id: responseId,
         input: [{ type: 'custom_tool_call_output', call_id: 'call_shell', output: 'file.txt' }],
       }),
     });
     assert.equal(second.status, 200);
     assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
-    assert.deepEqual(compatible.requests[1], {
+    assert.deepEqual(upstream.requests[1], {
       model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
       messages: [
         { role: 'user', content: 'List files.' },
-        { role: 'assistant', tool_calls: [{ id: 'call_shell', type: 'custom', custom: { name: 'shell', input: 'ls' } }] },
+        { role: 'assistant', tool_calls: [{ id: 'call_shell', type: 'function', function: { name: 'shell', arguments: '{"input":"ls"}' } }] },
         { role: 'tool', tool_call_id: 'call_shell', content: 'file.txt' },
       ],
-      tools: [{ type: 'custom', custom: { name: 'shell', description: 'Runs shell' } }],
+      tools: [shellProxy],
     });
   } finally {
     await bridge?.close();
-    await incompatible.close();
-    await compatible.close();
+    await upstream.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('custom-incompatible Compatibility Fixture rejects before contacting an upstream', async () => {
+test('Custom Tool runs on a Function-only upstream without native Custom support', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
@@ -1251,14 +1977,163 @@ test('custom-incompatible Compatibility Fixture rejects before contacting an ups
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'List files.', tools: [{ type: 'custom', name: 'shell' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'List files.', tools: [{ type: 'custom', name: 'shell' }] }),
     });
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), {
-      error: { message: 'No upstream supports the requested capabilities', type: 'invalid_request_error', param: null, code: 'unsupported_capabilities' },
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    const request = upstream.requests[0] as { tools: Array<{ type: string; function?: { name: string } }> };
+    assert.equal(request.tools.length, 1);
+    assert.equal(request.tools[0].type, 'function');
+    assert.equal(request.tools[0].function?.name, 'shell');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const loadedWeatherTool: Tool = { type: 'function', name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } };
+const toolSearchProxy = { type: 'function', function: { name: 'tool_search', description: 'Discover tools', parameters: { type: 'object', properties: {} } } };
+
+test('Tool Search discovers, loads tools, and drives a subsequent dynamic tool call', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startToolSearchFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
     });
-    assert.deepEqual(upstream.requests, []);
-    assert.deepEqual(bridge.state.responses(), []);
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Find a weather tool.', tools: [{ type: 'tool_search', description: 'Discover tools' }] }),
+    });
+    assert.equal(first.status, 200);
+    const firstEvents = sseTypes(await first.text()) as unknown as Array<{ type: string; item?: { type: string; call_id: string; arguments: string; execution: string } }>;
+    assert.deepEqual(
+      firstEvents.find((event) => event.type === 'response.output_item.done')?.item,
+      { id: 'call_ts', type: 'tool_search_call', status: 'completed', call_id: 'call_ts', execution: 'client', arguments: '{}' },
+    );
+    assert.deepEqual(upstream.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [{ role: 'user', content: 'Find a weather tool.' }],
+      tools: [toolSearchProxy],
+    });
+
+    const responseId = (firstEvents.find((event) => event.type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        model: 'gpt-4.1', stream: true, previous_response_id: responseId,
+        input: [{ type: 'tool_search_output', call_id: 'call_ts', tools: [loadedWeatherTool] }],
+      }),
+    });
+    assert.equal(second.status, 200);
+    const secondEvents = sseTypes(await second.text()) as unknown as Array<{ type: string; item?: { type: string; call_id: string; name: string; arguments: string } }>;
+    assert.deepEqual(
+      secondEvents.find((event) => event.type === 'response.output_item.done')?.item,
+      { id: 'call_weather', type: 'function_call', status: 'completed', call_id: 'call_weather', name: 'get_weather', arguments: '{"city":"Paris"}' },
+    );
+    assert.deepEqual(upstream.requests[1], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'user', content: 'Find a weather tool.' },
+        { role: 'assistant', tool_calls: [{ id: 'call_ts', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'call_ts', content: toolSearchOutputContent([loadedWeatherTool]) },
+      ],
+      tools: [toolSearchProxy, { type: 'function', function: { name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } }],
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Tool Search is proxied while Hosted Web Search still degrades alongside it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4.1', stream: true, input: 'Find an example.',
+        tools: [{ type: 'tool_search', description: 'Discover tools' }, { type: 'web_search' }],
+        tool_choice: { type: 'web_search' },
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    const events = sseTypes(body);
+    assert.equal(events.at(-1)?.type, 'response.completed');
+    assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
+    assert.equal(body.includes('url_citation'), false);
+    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools: Array<{ type: string; function: { name: string } }>; tool_choice: unknown; parallel_tool_calls?: unknown };
+    assert.deepEqual(request.tools, [toolSearchProxy]);
+    assert.equal(request.tool_choice, 'auto');
+    assert.equal(request.parallel_tool_calls, undefined);
+    assert.equal(request.messages.some(({ role, content }) => role === 'system' && content.includes('web search is unavailable')), true);
+    assert.deepEqual(request.messages.at(-1), { role: 'user', content: 'Find an example.' });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Tool Search loaded Namespace tool continues across a Response Chain', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startToolSearchNamespaceFixture();
+  const loadedNamespace: Tool = { type: 'namespace', name: 'weather', description: 'Weather tools', tools: [{ type: 'function', name: 'get_forecast' }] };
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, parallelToolCalls: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Find tools.', tools: [{ type: 'tool_search', description: 'Discover tools' }] }),
+    });
+    const firstId = (sseTypes(await first.text()).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, previous_response_id: firstId, input: [{ type: 'tool_search_output', call_id: 'call_ts', tools: [loadedNamespace] }] }),
+    });
+    const secondBody = await second.text();
+    const secondId = (sseTypes(secondBody).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
+    const secondCall = (sseTypes(secondBody) as unknown as Array<{ type: string; item?: { type: string; name: string; namespace: string } }>)
+      .find((event) => event.type === 'response.output_item.done')?.item;
+    assert.deepEqual(secondCall, { id: 'call_ns', type: 'function_call', status: 'completed', call_id: 'call_ns', name: 'get_forecast', arguments: '{}', namespace: 'weather' });
+
+    // The continuation rebuilds the predecessor's Tool Context from its persisted
+    // tool_search_output input; without the loaded namespace alias this turn would fail.
+    const third = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, previous_response_id: secondId, input: [{ type: 'function_call_output', call_id: 'call_ns', output: 'sunny' }] }),
+    });
+    assert.equal(third.status, 200);
+    assert.equal(sseTypes(await third.text()).at(-1)?.type, 'response.completed');
+    const continuation = upstream.requests[2] as { messages: Array<{ role: string; content?: string; tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>; tool_call_id?: string }>; tools: Array<{ type: string; function: { name: string } }> };
+    assert.deepEqual(continuation.tools.map((tool) => tool.function.name), ['tool_search', 'weather__get_forecast']);
+    assert.deepEqual(continuation.messages, [
+      { role: 'user', content: 'Find tools.' },
+      { role: 'assistant', tool_calls: [{ id: 'call_ts', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_ts', content: toolSearchOutputContent([loadedNamespace]) },
+      { role: 'assistant', tool_calls: [{ id: 'call_ns', type: 'function', function: { name: 'weather__get_forecast', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_ns', content: 'sunny' },
+    ]);
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -1291,9 +2166,10 @@ test('Hosted Web Search always degrades to Chat Completions without forging sear
     assert.equal(events.some(({ type }) => type === 'response.web_search_call.in_progress'), false);
     assert.equal(body.includes('url_citation'), false);
     assert.equal(upstream.requests.length, 1);
-    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: unknown };
+    const request = upstream.requests[0] as { messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: unknown; parallel_tool_calls?: unknown };
     assert.equal(request.tools, undefined);
-    assert.equal(request.tool_choice, 'auto');
+    assert.equal(request.tool_choice, undefined);
+    assert.equal(request.parallel_tool_calls, undefined);
     assert.equal(request.messages.some(({ role, content }) => role === 'system' && content.includes('web search is unavailable')), true);
     assert.deepEqual(request.messages.at(-1), { role: 'user', content: 'Find an example.' });
   } finally {
@@ -1315,7 +2191,7 @@ test('Hosted Web Search Response Chain continues via Chat messages without upstr
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
     const first = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }] }),
     });
     const firstBody = await first.text();
     const responseId = (sseTypes(firstBody).find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
@@ -1333,7 +2209,7 @@ test('Hosted Web Search Response Chain continues via Chat messages without upstr
       statePath: join(dir, 'state.db'),
     });
     const second = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, previous_response_id: responseId, input: 'Continue.' }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, previous_response_id: responseId, input: 'Continue.' }),
     });
     assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
     assert.equal(upstream.requests.length, 2);
@@ -1349,7 +2225,7 @@ test('Hosted Web Search Response Chain continues via Chat messages without upstr
   }
 });
 
-test('mixed tools with web_search select a Chat Completions upstream that covers remaining capabilities', async () => {
+test('mixed tools with web_search select a Function-only upstream that proxies Custom Tools', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const functionOnly = await startCompatibilityFixture();
   const fullyCapable = await startCustomFixture();
@@ -1366,7 +2242,7 @@ test('mixed tools with web_search select a Chat Completions upstream that covers
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Research and inspect the workspace.',
+        model: 'gpt-4.1', stream: true, input: 'Research and inspect the workspace.',
         tools: [
           { type: 'web_search' },
           { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } },
@@ -1376,12 +2252,13 @@ test('mixed tools with web_search select a Chat Completions upstream that covers
     });
     assert.equal(response.status, 200);
     assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
-    assert.deepEqual(functionOnly.requests, []);
-    assert.equal(fullyCapable.requests.length, 1);
-    const request = fullyCapable.requests[0] as { tools: unknown[] };
+    // Custom Tools only need Function Tool compatibility, so the first Function-only upstream wins.
+    assert.equal(functionOnly.requests.length, 1);
+    assert.deepEqual(fullyCapable.requests, []);
+    const request = functionOnly.requests[0] as { tools: unknown[] };
     assert.deepEqual(request.tools, [
       { type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } },
-      { type: 'custom', custom: { name: 'shell', description: 'Runs shell' } },
+      { type: 'function', function: { name: 'shell', description: '{"type":"custom","name":"shell","description":"Runs shell"}', parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } } },
     ]);
   } finally {
     await bridge?.close();
@@ -1391,30 +2268,30 @@ test('mixed tools with web_search select a Chat Completions upstream that covers
   }
 });
 
-test('mixed-tools rejects partial capability coverage before contacting an upstream', async () => {
+test('mixed-tools reject when no upstream provides Function Tool compatibility', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const functionOnly = await startCompatibilityFixture();
+  const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: functionOnly.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { parallelToolCalls: true } }],
       statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Research and inspect the workspace.',
+        model: 'gpt-4.1', stream: true, input: 'Research and inspect the workspace.',
         tools: [{ type: 'web_search' }, { type: 'function', name: 'weather' }, { type: 'custom', name: 'shell' }],
       }),
     });
     assert.equal(response.status, 400);
     assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_capabilities');
-    assert.deepEqual(functionOnly.requests, []);
+    assert.deepEqual(upstream.requests, []);
     assert.deepEqual(bridge.state.responses(), []);
   } finally {
     await bridge?.close();
-    await functionOnly.close();
+    await upstream.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -1431,21 +2308,21 @@ test('maps Reasoning Effort to upstream reasoning_effort', async () => {
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'high' } }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { effort: 'high' } }),
     });
     assert.equal(response.status, 200);
     assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
     assert.equal((upstream.requests[0] as { reasoning_effort?: string }).reasoning_effort, 'high');
     const scalarResponse = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: 'max' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: 'max' }),
     });
     assert.equal(scalarResponse.status, 200);
     assert.equal(sseTypes(await scalarResponse.text()).at(-1)?.type, 'response.completed');
     assert.equal((upstream.requests[1] as { reasoning_effort?: string }).reasoning_effort, 'max');
     const ultraResponse = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'ultra' } }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { effort: 'ultra' } }),
     });
     assert.equal(ultraResponse.status, 200);
     assert.equal(sseTypes(await ultraResponse.text()).at(-1)?.type, 'response.completed');
@@ -1469,19 +2346,19 @@ test('omits upstream reasoning_effort when Reasoning Effort is absent', async ()
     });
     const withoutReasoning = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
     });
     assert.equal(withoutReasoning.status, 200);
     await withoutReasoning.text();
     const ignoredFields = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { summary: 'auto', mode: 'pro' } }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { summary: 'auto', mode: 'pro' } }),
     });
     assert.equal(ignoredFields.status, 200);
     await ignoredFields.text();
     const nullReasoning = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: null }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: null }),
     });
     assert.equal(nullReasoning.status, 200);
     await nullReasoning.text();
@@ -1507,12 +2384,12 @@ test('rejects invalid Reasoning Effort before creating Response state', async ()
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'bad-effort' };
     const invalidScalar = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: 'invalid' }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: 'invalid' }),
     });
     assert.equal(invalidScalar.status, 400);
     assert.equal((await invalidScalar.json() as { error: { code: string } }).error.code, 'invalid_reasoning');
     const badEffort = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'invalid' } }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { effort: 'invalid' } }),
     });
     assert.equal(badEffort.status, 400);
     assert.equal((await badEffort.json() as { error: { code: string } }).error.code, 'invalid_reasoning');
@@ -1546,13 +2423,13 @@ test('Idempotent Request conflicts when only Reasoning Effort differs', async ()
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'effort-once' };
     const first = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'low' } }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { effort: 'low' } }),
     });
     assert.equal(first.status, 200);
     await first.text();
     const before = { events: bridge.state.events(), responses: bridge.state.responses(), attempts: bridge.state.attempts() };
     const conflict = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'high' } }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { effort: 'high' } }),
     });
     assert.equal(conflict.status, 409);
     assert.deepEqual(await conflict.json(), {
@@ -1580,13 +2457,13 @@ test('Idempotent Request ignores non-effort reasoning fields in the digest', asy
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'ignore-fields' };
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers,
-      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'medium', summary: 'auto' } }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { effort: 'medium', summary: 'auto' } }),
     });
     assert.equal(first.status, 200);
     const firstBody = await first.text();
     const replay = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers,
-      body: JSON.stringify({ stream: true, input: 'Hello', reasoning: { effort: 'medium', mode: 'pro' } }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello', reasoning: { effort: 'medium', mode: 'pro' } }),
     });
     assert.equal(await replay.text(), firstBody);
     assert.equal(upstream.requests.length, 1);
@@ -1610,7 +2487,9 @@ test('forced web_search tool_choice degrades to auto', async () => {
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }], tool_choice: { type: 'web_search' },
+        model: 'gpt-4.1', stream: true, input: 'Find an example.',
+        tools: [{ type: 'web_search' }, { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } }],
+        tool_choice: { type: 'web_search' }, parallel_tool_calls: true,
       }),
     });
     assert.equal(response.status, 200);
@@ -1621,7 +2500,41 @@ test('forced web_search tool_choice degrades to auto', async () => {
         { role: 'system', content: 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.' },
         { role: 'user', content: 'Find an example.' },
       ],
+      tools: [{ type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } }],
+      parallel_tool_calls: true,
       tool_choice: 'auto',
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('forced web_search without Chat tools omits tool_choice and parallel_tool_calls', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4.1', stream: true, input: 'Find an example.', tools: [{ type: 'web_search' }], tool_choice: { type: 'web_search' }, parallel_tool_calls: true,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual(upstream.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true },
+      messages: [
+        { role: 'system', content: 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.' },
+        { role: 'user', content: 'Find an example.' },
+      ],
     });
   } finally {
     await bridge?.close();
@@ -1643,7 +2556,7 @@ test('mixed tools keep Function and Custom after web_search degradation', async 
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Research and inspect the workspace.',
+        model: 'gpt-4.1', stream: true, input: 'Research and inspect the workspace.',
         tools: [
           { type: 'web_search' },
           { type: 'function', name: 'weather', description: 'Gets weather', parameters: { type: 'object' } },
@@ -1665,7 +2578,7 @@ test('mixed tools keep Function and Custom after web_search degradation', async 
     assert.equal(String(request.messages[0]?.content).includes('web search is unavailable'), true);
     assert.deepEqual(request.tools, [
       { type: 'function', function: { name: 'weather', description: 'Gets weather', parameters: { type: 'object' } } },
-      { type: 'custom', custom: { name: 'shell', description: 'Runs shell' } },
+      { type: 'function', function: { name: 'shell', description: '{"type":"custom","name":"shell","description":"Runs shell"}', parameters: { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] } } },
     ]);
   } finally {
     await bridge?.close();
@@ -1686,7 +2599,7 @@ test('web_search_preview is rejected before contacting an upstream', async () =>
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Find an example.', tools: [{ type: 'web_search_preview' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Find an example.', tools: [{ type: 'web_search_preview' }] }),
     });
     assert.equal(response.status, 400);
     assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
@@ -1705,12 +2618,12 @@ test('parallel-incompatible Compatibility Fixture rejects before contacting an u
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, customTools: true, parallelToolCalls: false } }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true, parallelToolCalls: false } }],
       statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Weather?', parallel_tool_calls: true, tools: [{ type: 'function', name: 'weather' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Weather?', parallel_tool_calls: true, tools: [{ type: 'function', name: 'weather' }] }),
     });
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
@@ -1741,11 +2654,11 @@ test('declared-capability-client-4xx Compatibility Fixture does not switch upstr
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
     });
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
-      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+      error: { message: 'invalid tool', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
     });
     assert.equal(rejected.requests.length, 1);
     assert.equal(fallback.requests.length, 0);
@@ -1767,16 +2680,16 @@ test('Idempotency-Key does not turn a pre-stream upstream rejection into SSE', a
       apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'failed-once' };
-    const body = JSON.stringify({ stream: true, input: 'Hello' });
+    const body = JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' });
     const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
     assert.equal(first.status, 400);
     assert.deepEqual(await first.json(), {
-      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+      error: { message: 'invalid tool', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
     });
     const replay = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body });
     assert.equal(replay.status, 400);
     assert.deepEqual(await replay.json(), {
-      error: { message: 'Upstream rejected request', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
+      error: { message: 'invalid tool', type: 'invalid_request_error', param: null, code: 'upstream_rejected' },
     });
     assert.equal(upstream.requests.length, 2);
     assert.deepEqual(bridge.state.attempts(), []);
@@ -1797,10 +2710,10 @@ test('idempotency-in-progress replays persisted events then follows the Response
       apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'once' };
-    const request = { stream: true, input: 'Hello' };
+    const request = { model: 'gpt-4.1', stream: true, input: 'Hello' };
     const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
     for (let tries = 0; bridge.state.events().length < 2 && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta']);
+    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta']);
     const second = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
     upstream.release();
     const [firstBody, secondBody] = await Promise.all([first.text(), second.text()]);
@@ -1823,7 +2736,7 @@ test('idempotency-terminal replays original SSE and rejects a conflicting reques
       apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
     });
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'once' };
-    const request = { stream: true, input: 'Hello' };
+    const request = { model: 'gpt-4.1', stream: true, input: 'Hello' };
     const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(request) });
     upstream.release();
     const firstBody = await first.text();
@@ -1833,7 +2746,7 @@ test('idempotency-terminal replays original SSE and rejects a conflicting reques
     assert.equal(await replay.text(), firstBody);
     const before = { events: bridge.state.events(), responses: bridge.state.responses(), attempts: bridge.state.attempts() };
     const conflict = await fetch(`${bridge.url}/v1/responses`, {
-      method: 'POST', headers, body: JSON.stringify({ stream: true, input: 'Different' }),
+      method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Different' }),
     });
     assert.equal(conflict.status, 409);
     assert.deepEqual(await conflict.json(), {
@@ -1868,14 +2781,14 @@ test('failover-before-output Compatibility Fixture retries the full Response Cha
     const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
     const first = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers,
-      body: JSON.stringify({ stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Weather?', tools: [{ type: 'function', name: 'weather' }] }),
     });
     const firstEvents = sseTypes(await first.text());
     const previousResponseId = (firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } }).response.id;
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers,
       body: JSON.stringify({
-        stream: true, previous_response_id: previousResponseId,
+        model: 'gpt-4.1', stream: true, previous_response_id: previousResponseId,
         input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
       }),
     });
@@ -1921,10 +2834,10 @@ test('failure-after-output Compatibility Fixture fails without another Attempt o
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
     });
     const events = sseTypes(await response.text());
-    assert.deepEqual(events.map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.failed']);
+    assert.deepEqual(events.map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.failed']);
     assert.equal(primary.requests.length, 1);
     assert.equal(fallback.requests.length, 0);
     assert.equal(bridge.state.attempts().length, 1);
@@ -1939,12 +2852,13 @@ test('failure-after-output Compatibility Fixture fails without another Attempt o
 
 test('first-event timeout switches to the next compatible upstream before output', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const slow = await startScriptedFixture([{ waitMs: 100 }]);
+  // Hang until the first-event timeout aborts; never emit a body that could race the timer.
+  const slow = await startScriptedFixture([{ waitMs: 60_000, frames: ['data: [DONE]\r\n\r\n'] }]);
   const fallback = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
-      apiKey: 'bridge-key', firstEventTimeoutMs: 10,
+      apiKey: 'bridge-key', firstEventTimeoutMs: 50,
       upstreams: [
         { baseUrl: slow.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
         { baseUrl: fallback.url, apiKey: 'upstream-key', capabilities: supportedCapabilities },
@@ -1953,7 +2867,7 @@ test('first-event timeout switches to the next compatible upstream before output
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
     });
     assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
     assert.equal(slow.requests.length, 1);
@@ -1990,7 +2904,7 @@ test('a valid first upstream event prevents a first-event timeout', async () => 
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
     });
     assert.equal(sseTypes(await response.text()).at(-1)?.type, 'response.completed');
     assert.equal(primary.requests.length, 1);
@@ -2019,7 +2933,7 @@ test('all-upstreams-fail Compatibility Fixture returns a pre-output error after 
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
     });
     assert.equal(response.status, 503);
     assert.deepEqual(sseTypes(await response.text()), []);
@@ -2050,16 +2964,16 @@ test('client disconnect aborts the active Attempt and cancels the Response', asy
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', signal: abort.signal,
       headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
-      body: JSON.stringify({ stream: true, input: 'Hello' }),
+      body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'Hello' }),
     });
     for (let tries = 0; bridge.state.events().length < 2 && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     abort.abort();
     await assert.rejects(() => response.text());
     for (let tries = 0; bridge.state.responses()[0]?.status !== 'cancelled' && tries < 50; tries += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.deepEqual(bridge.state.responses(), [{ status: 'cancelled', outputText: 'first ' }]);
-    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.output_text.delta', 'response.cancelled']);
+    assert.deepEqual(bridge.state.events().map(({ type }) => type), ['response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.cancelled']);
     assert.equal(bridge.state.attempts().length, 1);
-    assert.equal(captured.lines.some((line) => line.includes('"event":"http_request_completed"') && line.includes('"error_code":"client_disconnected"')), true);
+    assert.equal(captured.lines.some((line) => line.includes('http_request_completed') && line.includes('error_code=client_disconnected')), true);
   } finally {
     captured.restore();
     upstream.release();
@@ -2082,7 +2996,7 @@ test('rejects Tool Namespace children that are not Function Tools', async () => 
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Run shell.',
+        model: 'gpt-4.1', stream: true, input: 'Run shell.',
         tools: [{
           type: 'namespace', name: 'ops', description: 'Ops tools',
           tools: [{ type: 'custom', name: 'shell' }],
@@ -2101,7 +3015,7 @@ test('rejects Tool Namespace children that are not Function Tools', async () => 
 
 test('Function-only Tool Namespace continues a Response Chain via Completion aliases', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const alias = 'crm_get_customer_profile_e3d1fa98';
+  const alias = 'crm__get_customer_profile';
   const streams = [
     [
       `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_crm","type":"function","function":{"name":"${alias}","arguments":"{\\\"customer_id\\\":\\\"1\\\"}"}}]}}]}\r\n\r\n`,
@@ -2147,13 +3061,15 @@ test('Function-only Tool Namespace continues a Response Chain via Completion ali
       }),
     });
     assert.equal(first.status, 200);
-    const firstEvents = sseTypes(await first.text());
+    const firstBody = await first.text();
+    const firstEvents = sseTypes(firstBody);
     const firstResponse = firstEvents.find(({ type }) => type === 'response.completed') as unknown as { response: { id: string } };
     const call = firstEvents.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown };
     assert.deepEqual(call.item, {
       id: 'call_crm', type: 'function_call', status: 'completed', call_id: 'call_crm',
       name: 'get_customer_profile', namespace: 'crm', arguments: '{"customer_id":"1"}',
     });
+    assert.equal(firstBody.includes(alias), false, 'Chat alias must not leak to the Responses client');
 
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -2211,7 +3127,7 @@ test('Tool Namespace aliases stay legal and at most 64 characters for overlong n
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
   const namespace = `ns_${'x'.repeat(80)}`;
   const name = `fn_${'y'.repeat(80)}`;
-  const alias = 'ns_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_2db6913b';
+  const alias = namespaceToolAlias(namespace, name);
   const streams = [[
     `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_long","type":"function","function":{"name":"${alias}","arguments":"{}"}}]}}]}\r\n\r\n`,
     'data: [DONE]\r\n\r\n',
@@ -2227,16 +3143,18 @@ test('Tool Namespace aliases stay legal and at most 64 characters for overlong n
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Call long tool.',
+        model: 'gpt-4.1', stream: true, input: 'Call long tool.',
         tools: [{ type: 'namespace', name: namespace, description: 'Long names', tools: [{ type: 'function', name }] }],
       }),
     });
     assert.equal(response.status, 200);
-    const events = sseTypes(await response.text());
+    const body = await response.text();
+    const events = sseTypes(body);
     assert.deepEqual((events.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
       id: 'call_long', type: 'function_call', status: 'completed', call_id: 'call_long',
       name, namespace, arguments: '{}',
     });
+    assert.equal(body.includes(alias), false, 'Chat alias must not leak to the Responses client');
     const forwarded = (upstream.requests[0] as { tools: Array<{ function: { name: string } }> }).tools[0].function.name;
     assert.equal(forwarded, alias);
     assert.equal(forwarded.length, 64);
@@ -2248,14 +3166,9 @@ test('Tool Namespace aliases stay legal and at most 64 characters for overlong n
   }
 });
 
-test('Tool Namespace aliases disambiguate conflicts with peer Function names', async () => {
+test('Tool Namespace alias collisions with a peer Function name are rejected before upstream contact', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const alias = 'crm_get_customer_profile_e3d1fa981';
-  const streams = [[
-    `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_crm","type":"function","function":{"name":"${alias}","arguments":"{}"}}]}}]}\r\n\r\n`,
-    'data: [DONE]\r\n\r\n',
-  ]];
-  const upstream = await startFunctionFixture(streams);
+  const upstream = await startCompatibilityFixture();
   let bridge: RunningBridge | undefined;
   try {
     bridge = await startBridge({
@@ -2266,9 +3179,9 @@ test('Tool Namespace aliases disambiguate conflicts with peer Function names', a
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Lookup.',
+        model: 'gpt-4.1', stream: true, input: 'Lookup.',
         tools: [
-          { type: 'function', name: 'crm_get_customer_profile_e3d1fa98' },
+          { type: 'function', name: 'crm__get_customer_profile' },
           {
             type: 'namespace', name: 'crm', description: 'CRM tools',
             tools: [{ type: 'function', name: 'get_customer_profile' }],
@@ -2276,16 +3189,9 @@ test('Tool Namespace aliases disambiguate conflicts with peer Function names', a
         ],
       }),
     });
-    assert.equal(response.status, 200);
-    const events = sseTypes(await response.text());
-    assert.deepEqual((events.find(({ type }) => type === 'response.output_item.done') as unknown as { item: unknown }).item, {
-      id: 'call_crm', type: 'function_call', status: 'completed', call_id: 'call_crm',
-      name: 'get_customer_profile', namespace: 'crm', arguments: '{}',
-    });
-    assert.deepEqual(
-      (upstream.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map((tool) => tool.function.name),
-      ['crm_get_customer_profile_e3d1fa98', alias],
-    );
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
+    assert.deepEqual(upstream.requests, []);
   } finally {
     await bridge?.close();
     await upstream.close();
@@ -2306,7 +3212,7 @@ test('rejects Tool Namespace input missing required fields', async () => {
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Lookup.',
+        model: 'gpt-4.1', stream: true, input: 'Lookup.',
         tools: [{ type: 'namespace', name: 'crm', tools: [{ type: 'function', name: 'get_customer_profile' }] }],
       }),
     });
@@ -2333,7 +3239,7 @@ test('rejects duplicate Function names inside a Tool Namespace', async () => {
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Lookup.',
+        model: 'gpt-4.1', stream: true, input: 'Lookup.',
         tools: [{
           type: 'namespace', name: 'crm', description: 'CRM tools',
           tools: [
@@ -2360,13 +3266,13 @@ test('Tool Namespace requests require functionTools capability', async () => {
   try {
     bridge = await startBridge({
       apiKey: 'bridge-key',
-      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { customTools: true } }],
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { parallelToolCalls: true } }],
       statePath: join(dir, 'state.db'),
     });
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'Lookup.',
+        model: 'gpt-4.1', stream: true, input: 'Lookup.',
         tools: [{
           type: 'namespace', name: 'crm', description: 'CRM tools',
           tools: [{ type: 'function', name: 'get_customer_profile' }],
@@ -2385,7 +3291,7 @@ test('Tool Namespace requests require functionTools capability', async () => {
 
 test('Codex mixed-tools Compatibility Fixture continues Namespaced Function calls on Completion', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
-  const spawnAlias = 'multi_agent_v1_spawn_agent_ba58fe27';
+  const spawnAlias = 'multi_agent_v1__spawn_agent';
   const spawnArgs = '{"agent_type":"explorer","message":"Find the bridge entrypoint."}';
   const streams = [
     [
@@ -2427,6 +3333,7 @@ test('Codex mixed-tools Compatibility Fixture continues Namespaced Function call
       id: 'call_spawn', type: 'function_call', status: 'completed', call_id: 'call_spawn',
       name: 'spawn_agent', namespace: 'multi_agent_v1', arguments: spawnArgs,
     });
+    assert.equal(firstBody.includes(spawnAlias), false, 'Chat alias must not leak to the Responses client');
 
     const second = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
@@ -2449,11 +3356,11 @@ test('Codex mixed-tools Compatibility Fixture continues Namespaced Function call
     assert.equal(request.tools.some((tool) => tool.type === 'web_search' || tool.function?.name === 'web_search'), false);
     assert.deepEqual(request.tools.map((tool) => tool.function.name), [
       'exec_command',
-      'multi_agent_v1_close_agent_4e4a21c0',
-      'multi_agent_v1_resume_agent_01cc6017',
-      'multi_agent_v1_send_input_ba78fa14',
+      'multi_agent_v1__close_agent',
+      'multi_agent_v1__resume_agent',
+      'multi_agent_v1__send_input',
       spawnAlias,
-      'multi_agent_v1_wait_agent_619dd87b',
+      'multi_agent_v1__wait_agent',
     ]);
     assert.equal(request.tools.every((tool) => tool.function.strict === false), true);
     assert.equal(request.tool_choice, undefined);
@@ -2490,7 +3397,7 @@ test('Codex mixed-tools Compatibility Fixture rejects illegal Tool Namespace bef
     const response = await fetch(`${bridge.url}/v1/responses`, {
       method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
       body: JSON.stringify({
-        stream: true, input: 'hi',
+        model: 'gpt-4.1', stream: true, input: 'hi',
         tools: [
           { type: 'function', name: 'exec_command' },
           {
@@ -2504,6 +3411,559 @@ test('Codex mixed-tools Compatibility Fixture rejects illegal Tool Namespace bef
     assert.equal(response.status, 400);
     assert.equal((await response.json() as { error: { code: string } }).error.code, 'unsupported_tools');
     assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('terminal Compatibility Fixture maps multiline LF SSE length and usage to an incomplete Response', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{
+    frames: [
+      'event: message\ndata: {"choices":[\ndata: {"delta":{"content":"Hello"},"finish_reason":"length"}]}\n\n',
+      'data: {"usage":{"prompt_tokens":2,"completion_tokens":3}}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ],
+  }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'hello' }),
+    });
+    assert.equal(response.status, 200);
+    const events = sseTypes(await response.text()) as Array<{ type: string; response?: { status?: string; usage?: unknown; incomplete_details?: unknown } }>;
+    assert.deepEqual(events.map(({ type }) => type), [
+      'response.created', 'response.in_progress', 'response.output_item.added', 'response.output_text.delta', 'response.output_item.done', 'response.incomplete',
+    ]);
+    const terminal = events.at(-1)?.response;
+    assert.equal(terminal?.status, 'incomplete');
+    assert.deepEqual(terminal?.usage, { input_tokens: 2, output_tokens: 3, total_tokens: 5, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } });
+    assert.deepEqual(terminal?.incomplete_details, { reason: 'max_output_tokens' });
+    assert.deepEqual(bridge.state.responses(), [{ status: 'incomplete', outputText: 'Hello' }]);
+    assert.deepEqual(upstream.requests[0], {
+      model: 'gpt-4.1', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'hello' }],
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Completion length persists default usage and does not reuse its Idempotency-Key as SSE', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ choices: [{ message: { content: 'Cut short' }, finish_reason: 'length' }] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json', 'idempotency-key': 'separate-delivery' };
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: false, input: 'hello' }) });
+    assert.equal(response.status, 200);
+    const body = await response.json() as { id: string; status: string; incomplete_details?: unknown; usage?: unknown; output: unknown[] };
+    assert.deepEqual({ ...body, id: '<local-response-id>' }, {
+      id: '<local-response-id>', object: 'response', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+      model: 'gpt-4.1', output: [{
+        id: `msg_${body.id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'Cut short' }],
+      }],
+    });
+    const stream = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'hello' }) });
+    assert.equal(stream.status, 409);
+    assert.equal((await stream.json() as { error: { code: string } }).error.code, 'idempotency_key_conflict');
+    assert.equal(upstream.requests.length, 1);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('SSE Compatibility Fixture preserves normalized errors before and after semantic output', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([
+    { frames: ['event: error\ndata: {"error":{"message":"Invalid tool","type":"upstream_error","param":"tools","code":"invalid_tool"}}\n\n'] },
+    { frames: ['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', 'event: error\ndata: {"error":{"message":"Interrupted","type":"upstream_error","param":null,"code":"stream_interrupted"}}\n\n'] },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db'),
+    });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const beforeOutput = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'first' }) });
+    assert.equal(beforeOutput.status, 502);
+    assert.deepEqual(await beforeOutput.json(), {
+      error: { message: 'Invalid tool', type: 'upstream_error', param: 'tools', code: 'invalid_tool' },
+    });
+    const afterOutput = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-4.1', stream: true, input: 'second' }) });
+    assert.equal(afterOutput.status, 200);
+    const terminal = sseTypes(await afterOutput.text()).at(-1) as unknown as { type: string; response: { error: unknown } };
+    assert.equal(terminal.type, 'response.failed');
+    assert.deepEqual(terminal.response.error, { message: 'Interrupted', type: 'upstream_error', param: null, code: 'stream_interrupted' });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming reasoning_content produces a reasoning Output Item and restores it on continuation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([
+    { frames: [
+      'data: {"choices":[{"delta":{"reasoning_content":"Let me think."}}]}\r\n\r\n',
+      'data: {"choices":[{"delta":{"content":"Hi there."}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+    { frames: [
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const firstEvents = sseTypes(await first.text());
+    const completed = firstEvents.find((event) => event.type === 'response.completed') as unknown as { response: { id: string; output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> } };
+    assert.deepEqual(completed.response.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(completed.response.output[0]!.summary![0]!.text, 'Let me think.');
+    assert.equal(completed.response.output[1]!.content![0]!.text, 'Hi there.');
+    assert.deepEqual(firstEvents.filter((event) => event.type === 'response.reasoning_summary_text.delta').map((event) => (event as unknown as { output_index: number }).output_index), [0]);
+    const second = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-test', stream: true, previous_response_id: completed.response.id, input: 'more' }) });
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual((upstream.requests[1] as { messages: Array<{ role: string; reasoning_content?: string; content?: string }> }).messages, [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', reasoning_content: 'Let me think.', content: 'Hi there.' },
+      { role: 'user', content: 'more' },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming preserves reasoning, text and sharded tool call Output Item order', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"reasoning_content":"Planning."}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"Checking "}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\""}}]}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris\\"}"}}]}}]}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Check weather.', tools: [{ type: 'function', name: 'weather' }] }) });
+    const events = sseTypes(await response.text()) as unknown as Array<{ type: string; output_index?: number; item?: { type: string }; response?: { output: Array<{ type: string }> } }>;
+    assert.deepEqual(events.find((event) => event.type === 'response.completed')?.response?.output.map((item) => item.type), ['reasoning', 'message', 'function_call']);
+    assert.deepEqual(events.filter((event) => event.type === 'response.output_item.done').map((event) => event.item!.type), ['reasoning', 'message', 'function_call']);
+    assert.deepEqual(events.filter((event) => event.type === 'response.reasoning_summary_text.delta').map((event) => event.output_index), [0]);
+    assert.deepEqual(events.filter((event) => event.type === 'response.output_text.delta').map((event) => event.output_index), [1]);
+    assert.deepEqual(events.filter((event) => event.type === 'response.function_call_arguments.delta').map((event) => event.output_index), [2, 2]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response reconstructs reasoning from reasoning_content', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ id: 'chatcmpl_x', model: 'gpt-test', choices: [{ message: { role: 'assistant', content: 'Answer.', reasoning_content: 'Because.' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> };
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'Because.');
+    assert.equal(body.output[1]!.content![0]!.text, 'Answer.');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response reconstructs reasoning from a leading think block', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({ id: 'chatcmpl_y', model: 'gpt-test', choices: [{ message: { role: 'assistant', content: '<think>hidden reasoning</think>visible answer' }, finish_reason: 'stop' }] });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> };
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'hidden reasoning');
+    assert.equal(body.output[1]!.content![0]!.text, 'visible answer');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response keeps a reasoning-only Output Item when content is null', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({
+    id: 'chatcmpl_r', model: 'gpt-test',
+    choices: [{ message: { role: 'assistant', content: null, reasoning_content: 'solo plan', reasoning_details: [{ text: ' detail' }] }, finish_reason: 'stop' }],
+  });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }> }> };
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'solo plan detail');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('non-stream Response omits an empty message when content is only a think block', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startJsonFixture({
+    id: 'chatcmpl_t', model: 'gpt-test',
+    choices: [{ message: { role: 'assistant', content: '<think>only reasoning</think>' }, finish_reason: 'stop' }],
+  });
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: false, input: 'hi' }) });
+    const body = await response.json() as { output: Array<{ type: string; summary?: Array<{ text: string }> }> };
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning']);
+    assert.equal(body.output[0]!.summary![0]!.text, 'only reasoning');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming leading think shards into a reasoning Output Item then text', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"content":"<thin"}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"k>plan"}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"</thi"}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{"content":"nk>answer"}}]}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const events = sseTypes(await response.text()) as unknown as Array<{ type: string; response?: { output: Array<{ type: string; summary?: Array<{ text: string }>; content?: Array<{ text: string }> }> } }>;
+    const completed = events.find((event) => event.type === 'response.completed')!;
+    assert.deepEqual(completed.response!.output.map((item) => item.type), ['reasoning', 'message']);
+    assert.equal(completed.response!.output[0]!.summary![0]!.text, 'plan');
+    assert.equal(completed.response!.output[1]!.content![0]!.text, 'answer');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming restores reasoning alongside a Function Tool call on continuation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([
+    { frames: [
+      'data: {"choices":[{"delta":{"reasoning_content":"Need weather."}}]}\r\n\r\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Paris\\"}"}}]}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+    { frames: [
+      'data: {"choices":[{"delta":{"content":"sunny"}}]}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ] },
+  ]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const headers = { authorization: 'Bearer bridge-key', 'content-type': 'application/json' };
+    const tool = { type: 'function', name: 'weather', parameters: { type: 'object', properties: { city: { type: 'string' } } } };
+    const first = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'weather?', tools: [tool] }) });
+    const firstEvents = sseTypes(await first.text()) as unknown as Array<{ type: string; response?: { id: string; output: Array<{ type: string }> } }>;
+    const firstCompleted = firstEvents.find((event) => event.type === 'response.completed')!;
+    assert.deepEqual(firstCompleted.response!.output.map((item) => item.type), ['reasoning', 'function_call']);
+    const second = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, previous_response_id: firstCompleted.response!.id, tools: [tool],
+        input: [{ type: 'function_call_output', call_id: 'call_weather', output: 'sunny' }],
+      }),
+    });
+    assert.equal(sseTypes(await second.text()).at(-1)?.type, 'response.completed');
+    assert.deepEqual((upstream.requests[1] as { messages: Array<{ role: string; reasoning_content?: string; tool_calls?: unknown[]; content?: string }> }).messages, [
+      { role: 'user', content: 'weather?' },
+      { role: 'assistant', reasoning_content: 'Need weather.', tool_calls: [{ id: 'call_weather', type: 'function', function: { name: 'weather', arguments: '{"city":"Paris"}' } }] },
+      { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
+    ]);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming does not fabricate a completed reasoning item when the upstream truncates mid-reasoning', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"reasoning_content":"partial plan"}}]}\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const events = sseTypes(await response.text());
+    assert.equal(events.at(-1)?.type, 'response.failed');
+    assert.equal(events.some((event) => event.type === 'response.output_item.done'), false);
+    assert.equal(events.some((event) => event.type === 'response.reasoning_summary_text.done'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming does not fabricate a completed tool call when the upstream truncates mid-call', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{"}}]}}]}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'Check weather.', tools: [{ type: 'function', name: 'weather' }] }) });
+    const events = sseTypes(await response.text());
+    // The tool call was announced in_progress but never received an id/name; the Response
+    // fails and no output_item.done is fabricated for the unfinished call.
+    assert.equal(events.at(-1)?.type, 'response.failed');
+    assert.equal(events.some((event) => event.type === 'response.output_item.done'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('streaming does not fabricate a completed message when the upstream truncates mid-text', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"content":"partial answer"}}]}\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({ apiKey: 'bridge-key', upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }], statePath: join(dir, 'state.db') });
+    const response = await fetch(`${bridge.url}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }) });
+    const events = sseTypes(await response.text());
+    // The text item was announced in_progress but the stream ended without [DONE]; the
+    // Response fails and no output_item.done is fabricated for the unfinished message.
+    assert.equal(events.at(-1)?.type, 'response.failed');
+    assert.equal(events.some((event) => event.type === 'response.output_item.done'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejects a missing model without contacting the upstream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: false, input: 'hello' }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'invalid_model');
+    assert.deepEqual(upstream.requests, []);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('stream finishes on finish_reason without waiting for [DONE]', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"content":"Done"},"finish_reason":"stop"}]}\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }),
+    });
+    const events = sseTypes(await response.text());
+    assert.equal(response.status, 200);
+    assert.equal(events.at(-1)?.type, 'response.completed');
+    assert.equal(bridge.state.responses().at(-1)?.status, 'completed');
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ignores empty placeholder error fields in an otherwise successful Chat stream', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"content":"ok"}}],"error":null}\r\n\r\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"error":""}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test', stream: true, input: 'hi' }),
+    });
+    const events = sseTypes(await response.text());
+    assert.equal(response.status, 200);
+    assert.equal(events.at(-1)?.type, 'response.completed');
+    assert.equal(events.some((event) => event.type === 'response.failed'), false);
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('forces stream_options.include_usage even when the client disables it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, input: 'hi',
+        stream_options: { include_usage: false },
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    assert.deepEqual((upstream.requests[0] as { stream_options?: unknown }).stream_options, { include_usage: true });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Custom Tool raw argument fallback survives Compatibility Fixture conversion', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startScriptedFixture([{ frames: [
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell","type":"function","function":{"name":"shell","arguments":"ls -la"}}]}}]}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ] }]);
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: { functionTools: true } }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, input: 'List files.',
+        tools: [{ type: 'custom', name: 'shell', description: 'Runs shell' }],
+      }),
+    });
+    const events = sseTypes(await response.text()) as unknown as Array<{ type: string; item?: { type: string; input?: string; name?: string } }>;
+    assert.equal(response.status, 200);
+    const call = events.find((event) => event.type === 'response.output_item.done')?.item;
+    assert.deepEqual(call, {
+      id: 'call_shell', type: 'custom_tool_call', status: 'completed', call_id: 'call_shell', name: 'shell', input: 'ls -la',
+    });
+  } finally {
+    await bridge?.close();
+    await upstream.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('forwards the Chat control allowlist and omits non-allowlisted fields', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-'));
+  const upstream = await startCompatibilityFixture();
+  let bridge: RunningBridge | undefined;
+  try {
+    bridge = await startBridge({
+      apiKey: 'bridge-key',
+      upstreams: [{ baseUrl: upstream.url, apiKey: 'upstream-key', capabilities: supportedCapabilities }],
+      statePath: join(dir, 'state.db'),
+    });
+    const response = await fetch(`${bridge.url}/v1/responses`, {
+      method: 'POST', headers: { authorization: 'Bearer bridge-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test', stream: true, input: 'hi',
+        temperature: 0.2, top_p: 0.8, presence_penalty: 0.1, frequency_penalty: 0.2,
+        logit_bias: { '42': 1 }, logprobs: true, top_logprobs: 2, seed: 7, stop: ['END'],
+        response_format: { type: 'text' }, n: 1, user: 'acceptance-user',
+        metadata: { secret: 'nope' }, store: false, include: ['file_search_call.results'],
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    const request = upstream.requests[0] as Record<string, unknown>;
+    assert.equal(request.temperature, 0.2);
+    assert.equal(request.top_p, 0.8);
+    assert.equal(request.presence_penalty, 0.1);
+    assert.equal(request.frequency_penalty, 0.2);
+    assert.deepEqual(request.logit_bias, { '42': 1 });
+    assert.equal(request.logprobs, true);
+    assert.equal(request.top_logprobs, 2);
+    assert.equal(request.seed, 7);
+    assert.deepEqual(request.stop, ['END']);
+    assert.deepEqual(request.response_format, { type: 'text' });
+    assert.equal(request.n, 1);
+    assert.equal(request.user, 'acceptance-user');
+    assert.equal(request.metadata, undefined);
+    assert.equal(request.store, undefined);
+    assert.equal(request.include, undefined);
   } finally {
     await bridge?.close();
     await upstream.close();

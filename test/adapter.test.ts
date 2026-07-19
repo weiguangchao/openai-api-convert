@@ -3,24 +3,32 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   ALIAS_HASH_LEN,
+  CUSTOM_PROXY_PARAMETERS,
   INPUT_ECHO_TYPES,
   REASONING_EFFORTS,
   TOOL_NAME_MAX,
+  TOOL_SEARCH_PROXY_NAME,
+  TOOL_SEARCH_PROXY_PARAMETERS,
   WEB_SEARCH_UNAVAILABLE_HINT,
-  buildNamespaceAliasMaps,
+  buildCustomProxyDescription,
+  buildToolContext,
+  extractCustomInput,
+  extractReasoningText,
+  LeadingThinkParser,
+  splitLeadingThink,
   namespaceToolAlias,
   normalizeFunctionTool,
   normalizeInput,
   normalizeTools,
   parseReasoningEffort,
-  sanitizeToolNamePart,
   toChatMessages,
   toChatToolChoice,
   toChatTools,
+  toolSearchOutputContent,
 } from '../src/adapter.js';
 import type { StoredResponse, Tool } from '../src/types.js';
 
-const hash8 = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, ALIAS_HASH_LEN);
+const shortHash = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, ALIAS_HASH_LEN);
 
 const baseResponse = (overrides: Partial<StoredResponse> = {}): StoredResponse => ({
   id: 'r1', model: 'm', input: [], tools: [], parallelToolCalls: false, output: [], ...overrides,
@@ -29,12 +37,12 @@ const baseResponse = (overrides: Partial<StoredResponse> = {}): StoredResponse =
 // ---- constants ----
 
 test('INPUT_ECHO_TYPES is the set of echoed type names', () => {
-  assert.deepEqual([...INPUT_ECHO_TYPES].sort(), ['custom_tool_call', 'function_call', 'reasoning', 'web_search_call']);
+  assert.deepEqual([...INPUT_ECHO_TYPES].sort(), ['custom_tool_call', 'function_call', 'reasoning', 'tool_search_call', 'web_search_call']);
 });
 
-test('TOOL_NAME_MAX is 64 and ALIAS_HASH_LEN is 8', () => {
+test('TOOL_NAME_MAX is 64 and ALIAS_HASH_LEN is 16', () => {
   assert.strictEqual(TOOL_NAME_MAX, 64);
-  assert.strictEqual(ALIAS_HASH_LEN, 8);
+  assert.strictEqual(ALIAS_HASH_LEN, 16);
 });
 
 test('WEB_SEARCH_UNAVAILABLE_HINT is the exact constant string', () => {
@@ -78,10 +86,9 @@ test('normalizeInput: message with empty or non-array content returns undefined'
   assert.strictEqual(normalizeInput([{ type: 'message', role: 'user', content: 'hi' }]), undefined);
 });
 
-test('normalizeInput: assistant message and echo types are dropped, suffix kept', () => {
+test('normalizeInput: echo types are dropped and the suffix is kept', () => {
   const suffix = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }];
   for (const echo of [
-    { type: 'message', role: 'assistant', content: [] },
     { type: 'function_call' },
     { type: 'custom_tool_call' },
     { type: 'web_search_call' },
@@ -89,6 +96,12 @@ test('normalizeInput: assistant message and echo types are dropped, suffix kept'
   ]) {
     assert.deepEqual(normalizeInput([echo, ...suffix]), [{ type: 'message', role: 'user', content: 'hi' }]);
   }
+});
+
+test('normalizeInput: preserves explicit assistant messages, including an empty content array', () => {
+  assert.deepEqual(normalizeInput([{ type: 'message', role: 'assistant', content: [] }]), [
+    { type: 'message', role: 'assistant', content: [] },
+  ]);
 });
 
 test('normalizeInput: all-echo input returns undefined', () => {
@@ -116,6 +129,18 @@ test('normalizeInput: function_call_output and custom_tool_call_output kept with
   assert.deepEqual(normalizeInput([{ type: 'custom_tool_call_output', call_id: 'c2', output: 'r2' }]), [{ type: 'custom_tool_call_output', call_id: 'c2', output: 'r2' }]);
 });
 
+test('normalizeInput: paired inline function call and output are kept for store:false clients', () => {
+  assert.deepEqual(normalizeInput([
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Run pwd.' }] },
+    { type: 'function_call', call_id: 'call_pwd', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+    { type: 'function_call_output', call_id: 'call_pwd', output: '/private/tmp' },
+  ]), [
+    { type: 'message', role: 'user', content: 'Run pwd.' },
+    { type: 'function_call', call_id: 'call_pwd', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+    { type: 'function_call_output', call_id: 'call_pwd', output: '/private/tmp' },
+  ]);
+});
+
 test('normalizeInput: tool output with non-string call_id or output returns undefined', () => {
   assert.strictEqual(normalizeInput([{ type: 'function_call_output', call_id: 1, output: 'r' }]), undefined);
   assert.strictEqual(normalizeInput([{ type: 'custom_tool_call_output', call_id: 'c', output: 2 }]), undefined);
@@ -125,6 +150,41 @@ test('normalizeInput: invalid item type or non-object item returns undefined', (
   assert.strictEqual(normalizeInput([{ type: 'something_else' }]), undefined);
   assert.strictEqual(normalizeInput(['x']), undefined);
   assert.strictEqual(normalizeInput([null]), undefined);
+});
+
+// ---- normalizeInput: Tool Search ----
+
+test('normalizeInput: tool_search_call is an echo type dropped before the suffix', () => {
+  assert.deepEqual(
+    normalizeInput([{ type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }]),
+    [{ type: 'message', role: 'user', content: 'hi' }],
+  );
+});
+
+test('normalizeInput: tool_search_output normalizes loaded tools and keeps call_id', () => {
+  assert.deepEqual(
+    normalizeInput([{ type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather', description: 'd', parameters: { type: 'object' } }] }]),
+    [{ type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather', description: 'd', parameters: { type: 'object' } }] }],
+  );
+});
+
+test('normalizeInput: tool_search_output with missing call_id or invalid tools returns undefined', () => {
+  assert.strictEqual(normalizeInput([{ type: 'tool_search_output', tools: [] }]), undefined);
+  assert.strictEqual(normalizeInput([{ type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'file_search' }] }]), undefined);
+  assert.strictEqual(normalizeInput([{ type: 'tool_search_output', call_id: 'ts_1', tools: 'nope' }]), undefined);
+});
+
+test('normalizeInput: paired inline tool_search_call and output are kept for store:false clients', () => {
+  assert.deepEqual(
+    normalizeInput([
+      { type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' },
+      { type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather' }] },
+    ]),
+    [
+      { type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' },
+      { type: 'tool_search_output', call_id: 'ts_1', tools: [{ type: 'function', name: 'get_weather' }] },
+    ],
+  );
 });
 
 // ---- normalizeFunctionTool ----
@@ -149,6 +209,51 @@ test('normalizeFunctionTool: parameters included when defined regardless of type
   assert.deepEqual(normalizeFunctionTool({ name: 'foo', parameters: undefined }), { type: 'function', name: 'foo' });
 });
 
+test('normalizeFunctionTool: nested function form is accepted like direct fields', () => {
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true } }),
+    { type: 'function', name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo' } }),
+    { type: 'function', name: 'foo' },
+  );
+});
+
+test('normalizeFunctionTool: nested name wins, strict falls back to tool level', () => {
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', name: 'direct', function: { name: 'nested' } }),
+    { type: 'function', name: 'nested' },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo' }, strict: true }),
+    { type: 'function', name: 'foo', strict: true },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', function: { name: 'foo', strict: false }, strict: true }),
+    { type: 'function', name: 'foo', strict: false },
+  );
+});
+
+test('normalizeFunctionTool: nested form does not inherit tool-level description or parameters', () => {
+  // name and strict fall back to the tool level, but description and parameters come from `function` only.
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', name: 'top', description: 'top desc', parameters: { type: 'string' }, function: { name: 'fn' } }),
+    { type: 'function', name: 'fn' },
+  );
+  assert.deepEqual(
+    normalizeFunctionTool({ type: 'function', name: 'top', description: 'top desc', function: { name: 'fn', description: 'fn desc', parameters: { type: 'object' } } }),
+    { type: 'function', name: 'fn', description: 'fn desc', parameters: { type: 'object' } },
+  );
+});
+
+test('normalizeFunctionTool: nested form with missing or invalid name returns undefined', () => {
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: { name: '' } }), undefined);
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: { description: 'd' } }), undefined);
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: 'nope' }), undefined);
+  assert.strictEqual(normalizeFunctionTool({ type: 'function', function: { name: 'foo', description: 1 } }), undefined);
+});
+
 // ---- normalizeTools ----
 
 test('normalizeTools: undefined and non-array return undefined', () => {
@@ -166,6 +271,17 @@ test('normalizeTools: function tool normalized', () => {
   assert.strictEqual(normalizeTools([{ type: 'function' }]), undefined);
   assert.strictEqual(normalizeTools([{ type: 'function', name: '' }]), undefined);
   assert.strictEqual(normalizeTools([{ type: 'function', name: 'foo', description: 1 }]), undefined);
+});
+
+test('normalizeTools: nested function form is accepted and canonicalized', () => {
+  assert.deepEqual(
+    normalizeTools([{ type: 'function', function: { name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true } }]),
+    [{ type: 'function', name: 'foo', description: 'd', parameters: { type: 'object' }, strict: true }],
+  );
+  assert.deepEqual(
+    normalizeTools([{ type: 'function', function: { name: 'bar' } }]),
+    [{ type: 'function', name: 'bar' }],
+  );
 });
 
 test('normalizeTools: custom tool normalized', () => {
@@ -202,123 +318,247 @@ test('normalizeTools: unknown tool type returns undefined', () => {
   assert.strictEqual(normalizeTools([{ type: 'other', name: 'x' }]), undefined);
 });
 
-// ---- sanitizeToolNamePart ----
-
-test('sanitizeToolNamePart: replaces non [a-zA-Z0-9_-] with _', () => {
-  assert.strictEqual(sanitizeToolNamePart('abc 123!@#'), 'abc_123___');
-  assert.strictEqual(sanitizeToolNamePart('a.b-c_d'), 'a_b-c_d');
-  assert.strictEqual(sanitizeToolNamePart(''), '');
-  assert.strictEqual(sanitizeToolNamePart('weird/stuff'), 'weird_stuff');
+test('normalizeTools: tool_search normalized with optional description; execution is not stored', () => {
+  assert.deepEqual(normalizeTools([{ type: 'tool_search' }]), [{ type: 'tool_search' }]);
+  assert.deepEqual(normalizeTools([{ type: 'tool_search', description: 'Discover tools' }]), [{ type: 'tool_search', description: 'Discover tools' }]);
+  assert.deepEqual(normalizeTools([{ type: 'tool_search', execution: 'server', parameters: {} }]), [{ type: 'tool_search' }]);
+  assert.strictEqual(normalizeTools([{ type: 'tool_search', description: 1 }]), undefined);
+  // execution is never stored, so any value is accepted and dropped rather than validated.
+  assert.deepEqual(normalizeTools([{ type: 'tool_search', execution: 'bogus' }]), [{ type: 'tool_search' }]);
 });
 
 // ---- namespaceToolAlias ----
 
-test('namespaceToolAlias: basic alias is sanitized prefix + hash', () => {
-  const ns = 'weather';
-  const name = 'get_forecast';
-  const hash = hash8(`${ns}\0${name}`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set()), `weather_get_forecast_${hash}`);
+test('namespaceToolAlias: short name is namespace__name with no hash', () => {
+  assert.strictEqual(namespaceToolAlias('weather', 'get_forecast'), 'weather__get_forecast');
 });
 
-test('namespaceToolAlias: prefix derived from sanitized namespace_name', () => {
-  const ns = 'wea.ther';
-  const name = 'get.forecast';
-  const hash = hash8(`${ns}\0${name}`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set()), `wea_ther_get_forecast_${hash}`);
+test('namespaceToolAlias: preserves raw namespace and name characters', () => {
+  assert.strictEqual(namespaceToolAlias('wea.ther', 'get.forecast'), 'wea.ther__get.forecast');
+  assert.strictEqual(namespaceToolAlias('', ''), '__');
 });
 
 test('namespaceToolAlias: alias length never exceeds TOOL_NAME_MAX', () => {
-  const alias = namespaceToolAlias('a'.repeat(200), 'b'.repeat(200), new Set());
+  const alias = namespaceToolAlias('a'.repeat(200), 'b'.repeat(200));
   assert.ok(alias.length <= TOOL_NAME_MAX, `alias too long: ${alias.length}`);
 });
 
-test('namespaceToolAlias: prefix not starting alnum gets ns_ prefix', () => {
-  const ns = '-foo';
-  const name = 'bar';
-  const hash = hash8(`${ns}\0${name}`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set()), `ns_-foo_bar_${hash}`);
+test('namespaceToolAlias: overlong name truncates to 64 with a short hash suffix', () => {
+  const ns = 'a'.repeat(200);
+  const name = 'b'.repeat(200);
+  const fullName = `${ns}__${name}`;
+  const hash = shortHash(fullName);
+  const alias = namespaceToolAlias(ns, name);
+  assert.strictEqual(alias, `${'a'.repeat(46)}__${hash}`);
+  assert.strictEqual(alias.length, TOOL_NAME_MAX);
 });
 
-test('namespaceToolAlias: empty namespace and name yields ns_ prefix', () => {
-  const hash = hash8('\0');
-  assert.strictEqual(namespaceToolAlias('', '', new Set()), `ns__${hash}`);
-});
+// ---- buildToolContext ----
 
-test('namespaceToolAlias: collision appends hash+n', () => {
-  const ns = 'ns';
-  const name = 'fn';
-  const hash = hash8(`${ns}\0${name}`);
-  const base = `ns_fn_${hash}`;
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set([base])), `${base}1`);
-  assert.strictEqual(namespaceToolAlias(ns, name, new Set([base, `${base}1`, `${base}2`])), `${base}3`);
-});
-
-test('namespaceToolAlias: throws after more than 1000 conflicts', () => {
-  const ns = 'ns';
-  const name = 'fn';
-  const hash = hash8(`${ns}\0${name}`);
-  const base = `ns_fn_${hash}`;
-  const reserved = new Set<string>([base]);
-  for (let i = 1; i <= 1000; i += 1) reserved.add(`${base}${i}`);
-  assert.throws(() => namespaceToolAlias(ns, name, reserved), /Tool Namespace alias conflict/);
-});
-
-// ---- buildNamespaceAliasMaps ----
-
-test('buildNamespaceAliasMaps: maps namespace children to aliases, reserves top-level names', () => {
+test('buildToolContext: maps namespace aliases and records custom proxy names', () => {
   const tools: Tool[] = [
     { type: 'function', name: 'top_fn' },
     { type: 'custom', name: 'top_custom' },
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
   ];
-  const { aliasToRef, refToAlias } = buildNamespaceAliasMaps(tools);
-  const alias = `ns_child_${hash8('ns\0child')}`;
+  const { aliasToRef, refToAlias, customNames } = buildToolContext(tools);
+  const alias = 'ns__child';
   assert.strictEqual(refToAlias.get('ns\0child'), alias);
   assert.deepEqual(aliasToRef.get(alias), { name: 'child', namespace: 'ns' });
   assert.strictEqual(refToAlias.has('top_fn'), false);
   assert.strictEqual(aliasToRef.has('top_fn'), false);
+  assert.deepEqual([...customNames], ['top_custom']);
 });
 
-test('buildNamespaceAliasMaps: duplicate namespace+child name throws', () => {
+test('buildToolContext: duplicate namespace+child name throws', () => {
   const tools: Tool[] = [
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
     { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
   ];
-  assert.throws(() => buildNamespaceAliasMaps(tools), /Tool Namespace alias conflict/);
+  assert.throws(() => buildToolContext(tools), /Tool Namespace alias conflict/);
 });
 
-test('buildNamespaceAliasMaps: different namespaces with same child name do not conflict', () => {
+test('buildToolContext: alias colliding with a peer Function name throws', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'ns__child' },
+    { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
+  ];
+  assert.throws(() => buildToolContext(tools), /Tool Namespace alias conflict/);
+});
+
+test('buildToolContext: alias colliding with a Custom proxy name throws', () => {
+  const tools: Tool[] = [
+    { type: 'custom', name: 'ns__child' },
+    { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'child' }] },
+  ];
+  assert.throws(() => buildToolContext(tools), /Tool Namespace alias conflict/);
+});
+
+test('buildToolContext: custom name colliding with a Function name throws', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'shared' },
+    { type: 'custom', name: 'shared' },
+  ];
+  assert.throws(() => buildToolContext(tools), /Tool name conflict/);
+});
+
+test('buildToolContext: duplicate custom names throw', () => {
+  const tools: Tool[] = [
+    { type: 'custom', name: 'shell' },
+    { type: 'custom', name: 'shell' },
+  ];
+  assert.throws(() => buildToolContext(tools), /Tool name conflict/);
+});
+
+test('buildToolContext: different namespaces with same child name do not conflict', () => {
   const tools: Tool[] = [
     { type: 'namespace', name: 'ns1', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
     { type: 'namespace', name: 'ns2', description: 'd', tools: [{ type: 'function', name: 'fn' }] },
   ];
-  const { refToAlias } = buildNamespaceAliasMaps(tools);
+  const { refToAlias } = buildToolContext(tools);
   assert.ok(refToAlias.has('ns1\0fn'));
   assert.ok(refToAlias.has('ns2\0fn'));
   assert.notStrictEqual(refToAlias.get('ns1\0fn'), refToAlias.get('ns2\0fn'));
 });
 
+// ---- Tool Search context ----
+
+test('buildToolContext: tool_search registers the fixed proxy name', () => {
+  const { toolSearchNames, customNames, aliasToRef } = buildToolContext([{ type: 'tool_search', description: 'd' }]);
+  assert.deepEqual([...toolSearchNames], [TOOL_SEARCH_PROXY_NAME]);
+  assert.deepEqual([...customNames], []);
+  assert.equal(aliasToRef.has(TOOL_SEARCH_PROXY_NAME), false);
+});
+
+test('buildToolContext: a Function named tool_search conflicts with the proxy', () => {
+  assert.throws(() => buildToolContext([{ type: 'tool_search' }, { type: 'function', name: 'tool_search' }]), /Tool name conflict/);
+  assert.throws(() => buildToolContext([{ type: 'function', name: 'tool_search' }, { type: 'tool_search' }]), /Tool name conflict/);
+});
+
+test('buildToolContext: a Custom named tool_search conflicts with the proxy', () => {
+  assert.throws(() => buildToolContext([{ type: 'tool_search' }, { type: 'custom', name: 'tool_search' }]), /Tool name conflict/);
+});
+
+test('buildToolContext: duplicate tool_search tools conflict', () => {
+  assert.throws(() => buildToolContext([{ type: 'tool_search' }, { type: 'tool_search' }]), /Tool name conflict/);
+});
+
+test('buildToolContext: tool_search coexists with namespace and function tools', () => {
+  const tools: Tool[] = [
+    { type: 'tool_search' },
+    { type: 'namespace', name: 'ns', description: 'd', tools: [{ type: 'function', name: 'tool_search_child' }] },
+    { type: 'function', name: 'get_weather' },
+  ];
+  const { toolSearchNames, refToAlias } = buildToolContext(tools);
+  assert.deepEqual([...toolSearchNames], [TOOL_SEARCH_PROXY_NAME]);
+  assert.ok(refToAlias.has('ns\0tool_search_child'));
+});
+
+// ---- Custom Tool proxy ----
+
+test('buildCustomProxyDescription: embeds the original Custom tool definition as JSON', () => {
+  assert.equal(buildCustomProxyDescription({ type: 'custom', name: 'shell' }), '{"type":"custom","name":"shell"}');
+  assert.equal(
+    buildCustomProxyDescription({ type: 'custom', name: 'shell', description: 'Runs shell', format: 'text' }),
+    '{"type":"custom","name":"shell","description":"Runs shell","format":"text"}',
+  );
+});
+
+test('CUSTOM_PROXY_PARAMETERS: a single required string input', () => {
+  assert.deepEqual(CUSTOM_PROXY_PARAMETERS, {
+    type: 'object', properties: { input: { type: 'string' } }, required: ['input'],
+  });
+});
+
+test('extractCustomInput: prefers the string input envelope and falls back to raw arguments', () => {
+  assert.equal(extractCustomInput('{"input":"ls -la"}'), 'ls -la');
+  assert.equal(extractCustomInput('{"input":"ls","extra":1}'), 'ls');
+  // empty -> raw (empty)
+  assert.equal(extractCustomInput(''), '');
+  // non-JSON -> raw
+  assert.equal(extractCustomInput('not json'), 'not json');
+  // non-object JSON -> raw
+  assert.equal(extractCustomInput('42'), '42');
+  assert.equal(extractCustomInput('"plain"'), '"plain"');
+  assert.equal(extractCustomInput('null'), 'null');
+  assert.equal(extractCustomInput('[]'), '[]');
+  // missing input -> raw
+  assert.equal(extractCustomInput('{"other":1}'), '{"other":1}');
+  // non-string input -> raw
+  assert.equal(extractCustomInput('{"input":5}'), '{"input":5}');
+  assert.equal(extractCustomInput('{"input":{"x":1}}'), '{"input":{"x":1}}');
+});
+
 // ---- toChatTools ----
 
-test('toChatTools: drops web_search and preserves function/custom', () => {
+test('toChatTools: drops web_search, keeps functions and proxies custom as a function', () => {
   const tools: Tool[] = [
     { type: 'web_search' },
     { type: 'function', name: 'fn', description: 'd', strict: true },
     { type: 'custom', name: 'c', description: 'd', format: 'text' },
   ];
   assert.deepEqual(toChatTools(tools), [
-    { type: 'function', function: { name: 'fn', description: 'd', strict: true } },
-    { type: 'custom', custom: { name: 'c', description: 'd', format: 'text' } },
+    { type: 'function', function: { name: 'fn', description: 'd', parameters: { type: 'object', properties: {} }, strict: true } },
+    { type: 'function', function: { name: 'c', description: buildCustomProxyDescription({ type: 'custom', name: 'c', description: 'd', format: 'text' }), parameters: CUSTOM_PROXY_PARAMETERS } },
   ]);
 });
 
 test('toChatTools: expands namespace children into function tools with aliases', () => {
-  const hash = hash8('weather\0get_forecast');
   const tools: Tool[] = [
     { type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast', description: 'd', strict: true }] },
   ];
   assert.deepEqual(toChatTools(tools), [
-    { type: 'function', function: { name: `weather_get_forecast_${hash}`, description: 'd', strict: true } },
+    { type: 'function', function: { name: 'weather__get_forecast', description: 'd', parameters: { type: 'object', properties: {} }, strict: true } },
+  ]);
+});
+
+test('toChatTools: normalizes missing/null/non-object function parameters to an object schema', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'no_params' },
+    { type: 'function', name: 'null_params', parameters: null },
+    { type: 'function', name: 'array_params', parameters: [{ type: 'string' }] },
+  ];
+  assert.deepEqual(toChatTools(tools), [
+    { type: 'function', function: { name: 'no_params', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'null_params', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'array_params', parameters: { type: 'object', properties: {} } } },
+  ]);
+});
+
+test('toChatTools: keeps an object schema but ensures parameters.type is object', () => {
+  const tools: Tool[] = [
+    { type: 'function', name: 'typed', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } },
+    { type: 'function', name: 'missing_type', parameters: { properties: { city: { type: 'string' } } } },
+    { type: 'function', name: 'wrong_type', parameters: { type: 'string', description: 'x' } },
+  ];
+  assert.deepEqual(toChatTools(tools), [
+    { type: 'function', function: { name: 'typed', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } },
+    { type: 'function', function: { name: 'missing_type', parameters: { type: 'object', properties: { city: { type: 'string' } } } } },
+    { type: 'function', function: { name: 'wrong_type', parameters: { type: 'object', description: 'x' } } },
+  ]);
+});
+
+// ---- toChatTools: Tool Search ----
+
+test('toChatTools: tool_search proxies as the fixed tool_search function with empty parameters', () => {
+  assert.deepEqual(toChatTools([{ type: 'tool_search', description: 'Discover tools' }]), [
+    { type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, description: 'Discover tools', parameters: TOOL_SEARCH_PROXY_PARAMETERS } },
+  ]);
+  assert.deepEqual(toChatTools([{ type: 'tool_search' }]), [
+    { type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, parameters: TOOL_SEARCH_PROXY_PARAMETERS } },
+  ]);
+});
+
+test('toChatTools: tool_search sits alongside function and custom tools', () => {
+  const tools: Tool[] = [
+    { type: 'tool_search', description: 'Discover tools' },
+    { type: 'function', name: 'get_weather' },
+    { type: 'custom', name: 'shell' },
+  ];
+  assert.deepEqual(toChatTools(tools), [
+    { type: 'function', function: { name: 'tool_search', description: 'Discover tools', parameters: TOOL_SEARCH_PROXY_PARAMETERS } },
+    { type: 'function', function: { name: 'get_weather', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'shell', description: buildCustomProxyDescription({ type: 'custom', name: 'shell' }), parameters: CUSTOM_PROXY_PARAMETERS } },
   ]);
 });
 
@@ -338,10 +578,9 @@ test('toChatToolChoice: function with name returns function choice', () => {
 
 test('toChatToolChoice: namespace function resolves alias', () => {
   const tools: Tool[] = [{ type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast' }] }];
-  const hash = hash8('weather\0get_forecast');
   assert.deepEqual(
     toChatToolChoice({ type: 'function', name: 'get_forecast', namespace: 'weather' }, tools),
-    { type: 'function', function: { name: `weather_get_forecast_${hash}` } },
+    { type: 'function', function: { name: 'weather__get_forecast' } },
   );
 });
 
@@ -380,10 +619,10 @@ test('toChatMessages: function_call output maps to function tool_call', () => {
   );
 });
 
-test('toChatMessages: custom_tool_call output maps to custom tool_call', () => {
+test('toChatMessages: custom_tool_call output maps to a proxied function tool_call', () => {
   assert.deepEqual(
     toChatMessages(baseResponse({ output: [{ id: 'o1', type: 'custom_tool_call', status: 'completed', call_id: 'c1', name: 'fn', input: 'data' }] })),
-    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'custom', custom: { name: 'fn', input: 'data' } }] }],
+    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'fn', arguments: '{"input":"data"}' } }] }],
   );
 });
 
@@ -399,10 +638,9 @@ test('toChatMessages: assistant message with both text and tool_calls', () => {
 
 test('toChatMessages: function_call with namespace resolves alias', () => {
   const tools: Tool[] = [{ type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast' }] }];
-  const hash = hash8('weather\0get_forecast');
   assert.deepEqual(
     toChatMessages(baseResponse({ tools, output: [{ id: 'o1', type: 'function_call', status: 'completed', call_id: 'c1', name: 'get_forecast', arguments: '{}', namespace: 'weather' }] })),
-    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: `weather_get_forecast_${hash}`, arguments: '{}' } }] }],
+    [{ role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'weather__get_forecast', arguments: '{}' } }] }],
   );
 });
 
@@ -417,6 +655,62 @@ test('toChatMessages: no text and no tool_calls yields no assistant message', ()
   assert.deepEqual(
     toChatMessages(baseResponse({ output: [{ id: 'o1', type: 'web_search_call', status: 'completed' }] })),
     [],
+  );
+});
+
+// ---- toChatMessages: Tool Search ----
+
+const loadedWeatherTool = { type: 'function', name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } as const;
+
+test('toChatMessages: tool_search_call output maps to a tool_search function tool_call', () => {
+  assert.deepEqual(
+    toChatMessages(baseResponse({ output: [{ id: 'ts_1', type: 'tool_search_call', status: 'completed', call_id: 'ts_1', execution: 'client', arguments: '{}' }] })),
+    [{ role: 'assistant', tool_calls: [{ id: 'ts_1', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] }],
+  );
+});
+
+test('toChatMessages: inline tool_search_call input maps to a tool_search function tool_call', () => {
+  assert.deepEqual(
+    toChatMessages(baseResponse({ input: [{ type: 'tool_search_call', call_id: 'ts_1', arguments: '{}' }] })),
+    [{ role: 'assistant', tool_calls: [{ id: 'ts_1', type: 'function', function: { name: 'tool_search', arguments: '{}' } }] }],
+  );
+});
+
+test('toChatMessages: tool_search_output input maps to a tool message carrying the loaded tools', () => {
+  assert.deepEqual(
+    toChatMessages(baseResponse({ input: [{ type: 'tool_search_output', call_id: 'ts_1', tools: [loadedWeatherTool] }] })),
+    [{ role: 'tool', tool_call_id: 'ts_1', content: toolSearchOutputContent([loadedWeatherTool]) }],
+  );
+});
+
+test('toChatMessages: tool_search_call output continues alongside loaded function calls', () => {
+  const tools: Tool[] = [{ type: 'tool_search' }, loadedWeatherTool];
+  assert.deepEqual(
+    toChatMessages(baseResponse({ tools, output: [
+      { id: 'ts_1', type: 'tool_search_call', status: 'completed', call_id: 'ts_1', execution: 'client', arguments: '{}' },
+      { id: 'c1', type: 'function_call', status: 'completed', call_id: 'c1', name: 'get_weather', arguments: '{"city":"Paris"}' },
+    ] })),
+    [{ role: 'assistant', tool_calls: [
+      { id: 'ts_1', type: 'function', function: { name: 'tool_search', arguments: '{}' } },
+      { id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Paris"}' } },
+    ] }],
+  );
+});
+
+test('toChatMessages: a namespace call resolves via a tool loaded by tool_search_output', () => {
+  // The namespace tool is not declared in response.tools; it was discovered in-line, so
+  // the alias must be rebuilt from the persisted tool_search_output input on continuation.
+  const loadedNamespace: Tool[] = [{ type: 'namespace', name: 'weather', description: 'd', tools: [{ type: 'function', name: 'get_forecast' }] }];
+  assert.deepEqual(
+    toChatMessages(baseResponse({
+      tools: [],
+      input: [{ type: 'tool_search_output', call_id: 'ts_1', tools: loadedNamespace }],
+    output: [{ id: 'c1', type: 'function_call', status: 'completed', call_id: 'c1', name: 'get_forecast', arguments: '{}', namespace: 'weather' }],
+    })),
+    [
+      { role: 'tool', tool_call_id: 'ts_1', content: toolSearchOutputContent(loadedNamespace) },
+      { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'weather__get_forecast', arguments: '{}' } }] },
+    ],
   );
 });
 
@@ -456,4 +750,103 @@ test('parseReasoningEffort: valid scalar effort returns the effort', () => {
 test('parseReasoningEffort: invalid or non-string effort returns null', () => {
   assert.strictEqual(parseReasoningEffort({ effort: 'invalid' }), null);
   assert.strictEqual(parseReasoningEffort({ effort: 5 }), null);
+});
+
+
+// ---- reasoning extraction helpers ----
+
+test('extractReasoningText concatenates reasoning_content, reasoning and reasoning_details text', () => {
+  assert.equal(extractReasoningText({}), '');
+  assert.equal(extractReasoningText({ reasoning_content: 'a' }), 'a');
+  assert.equal(extractReasoningText({ reasoning: 'b' }), 'b');
+  assert.equal(extractReasoningText({ reasoning_content: 'a', reasoning: 'b' }), 'ab');
+  assert.equal(extractReasoningText({ reasoning_details: [{ type: 'reasoning_text', text: 'c' }, { text: 'd' }, { noise: 1 }] }), 'cd');
+  assert.equal(extractReasoningText({ reasoning_content: 'a', reasoning_details: [{ text: 'b' }] }), 'ab');
+});
+
+test('splitLeadingThink: no leading think returns content untouched', () => {
+  assert.deepEqual(splitLeadingThink('hello'), { reasoning: '', text: 'hello' });
+  assert.deepEqual(splitLeadingThink(''), { reasoning: '', text: '' });
+});
+
+test('splitLeadingThink: leading think block splits reasoning and text', () => {
+  assert.deepEqual(splitLeadingThink('<think>reasoning</think>answer'), { reasoning: 'reasoning', text: 'answer' });
+  assert.deepEqual(splitLeadingThink('<think>reasoning</think>'), { reasoning: 'reasoning', text: '' });
+});
+
+test('splitLeadingThink: unclosed leading think consumes the remainder as reasoning', () => {
+  assert.deepEqual(splitLeadingThink('<think>ongoing'), { reasoning: 'ongoing', text: '' });
+});
+
+test('LeadingThinkParser: non-think content streams as text', () => {
+  const parser = new LeadingThinkParser();
+  assert.deepEqual(parser.feed('hello world'), { reasoning: '', text: 'hello world' });
+  assert.deepEqual(parser.feed(' more'), { reasoning: '', text: ' more' });
+  assert.deepEqual(parser.flush(), { reasoning: '', text: '' });
+});
+
+test('LeadingThinkParser classifies a leading think block and trailing text across chunks', () => {
+  const parser = new LeadingThinkParser();
+  const out: Array<{ reasoning: string; text: string }> = [];
+  for (const c of ['<think>', 'reasoning', ' here', '</think>', 'answer']) out.push(parser.feed(c));
+  out.push(parser.flush());
+  assert.equal(out.map((part) => part.reasoning).join(''), 'reasoning here');
+  assert.equal(out.map((part) => part.text).join(''), 'answer');
+});
+
+test('LeadingThinkParser flushes a partial tag prefix as text when it is not a think block', () => {
+  const parser = new LeadingThinkParser();
+  assert.deepEqual(parser.feed('<'), { reasoning: '', text: '' });
+  assert.deepEqual(parser.feed('hello'), { reasoning: '', text: '<hello' });
+  assert.deepEqual(parser.flush(), { reasoning: '', text: '' });
+});
+
+test('LeadingThinkParser treats an unclosed leading think as reasoning at flush', () => {
+  const parser = new LeadingThinkParser();
+  assert.deepEqual(parser.feed('<think>still'), { reasoning: '', text: '' });
+  assert.deepEqual(parser.flush(), { reasoning: 'still', text: '' });
+});
+
+// ---- toChatMessages reasoning restoration ----
+
+test('toChatMessages restores reasoning_content on the assistant message', () => {
+  const messages = toChatMessages(baseResponse({
+    input: [{ type: 'message', role: 'user', content: 'hi' }],
+    output: [
+      { id: 'rs_r1', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: 'plan' }] },
+      { id: 'msg_r1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
+    ],
+  }));
+  assert.deepEqual(messages, [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', reasoning_content: 'plan', content: 'answer' },
+  ]);
+});
+
+test('toChatMessages restores reasoning alongside tool calls in one assistant message', () => {
+  const messages = toChatMessages(baseResponse({
+    input: [{ type: 'message', role: 'user', content: 'hi' }],
+    tools: [{ type: 'function', name: 'weather', parameters: { type: 'object' } }],
+    output: [
+      { id: 'rs_r1', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: 'plan' }] },
+      { id: 'call_w', type: 'function_call', status: 'completed', call_id: 'call_w', name: 'weather', arguments: '{"city":"Paris"}' },
+    ],
+  }));
+  assert.deepEqual(messages, [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', reasoning_content: 'plan', tool_calls: [{ id: 'call_w', type: 'function', function: { name: 'weather', arguments: '{"city":"Paris"}' } }] },
+  ]);
+});
+
+test('toChatMessages omits reasoning_content when the ancestor produced no reasoning', () => {
+  const messages = toChatMessages(baseResponse({
+    input: [{ type: 'message', role: 'user', content: 'hi' }],
+    output: [
+      { id: 'msg_r1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
+    ],
+  }));
+  assert.deepEqual(messages, [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'answer' },
+  ]);
 });

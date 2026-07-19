@@ -4,8 +4,10 @@ upstreams:
     apiKey: ""
     capabilities:
       functionTools: true
-      customTools: true
       parallelToolCalls: true
+    # Provider-native request option, needed for a DeepSeek V4 forced Function probe:
+    # thinking:
+    #   type: disabled
 port: 8417
 firstEventTimeoutMs: 30000
 outputIdleTimeoutMs: 60000
@@ -18,3 +20,6 @@ logging:
   level: info
   # path defaults to dirname(statePath)/logs/
   retentionDays: 7
+# Required only in ignored config.test.yaml before running npm test:
+# releasePreflight:
+#   model: ""

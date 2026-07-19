@@ -62,7 +62,7 @@ launchd 示例：
 
 将示例中的可执行路径替换为 `command -v openai-api-convert` 的结果。
 
-日志同时写入 `logs/` 与 stdout JSON Lines。SQLite 状态库启动时仅自动前向迁移；升级前备份由部署方负责。
+日志同时写入 `logs/` 与 stdout，采用单行文本格式：UTC ISO 8601 时间、级别、`[bridge]`、事件名及 `key=value` 字段。简单标量直接输出，其余值使用单行 JSON；此格式不兼容此前的 stdout JSON Lines。SQLite 状态库启动时仅自动前向迁移；升级前备份由部署方负责。
 
 ## 发布
 

@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { AppError } from './types.js';
 
 export const requestIds = new WeakMap<ServerResponse, string>();
 const errorCodes = new WeakMap<ServerResponse, string>();
 
-export const sendError = (response: ServerResponse, status: number, message: string, code: string) => {
+export const sendError = (response: ServerResponse, status: number, message: string, code: string, details?: { type?: string; param?: string | null }) => {
   errorCodes.set(response, code);
   response.writeHead(status, { 'content-type': 'application/json', 'x-request-id': requestIds.get(response) ?? randomUUID() });
-  response.end(JSON.stringify({ error: { message, type: 'invalid_request_error', param: null, code } }));
+  response.end(JSON.stringify({ error: { message, type: details?.type ?? 'invalid_request_error', param: details?.param ?? null, code } }));
 };
 
 export const setErrorCode = (response: ServerResponse, code: string) => {

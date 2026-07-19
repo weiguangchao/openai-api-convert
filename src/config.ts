@@ -2,14 +2,15 @@ import { chmod, mkdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
-import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, StatePolicy, Upstream } from './types.js';
+import type { BridgeOptions, CapabilityProfile, LogLevel, LoggingPolicy, ReleasePreflightPolicy, StatePolicy, Upstream, UpstreamThinkingPolicy } from './types.js';
 
 type RecordValue = Record<string, unknown>;
-const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy', 'logging']);
-const upstreamKeys = new Set(['baseUrl', 'apiKey', 'capabilities']);
-const capabilityKeys = new Set(['functionTools', 'customTools', 'parallelToolCalls']);
+const rootKeys = new Set(['apiKey', 'upstreams', 'statePath', 'port', 'firstEventTimeoutMs', 'outputIdleTimeoutMs', 'statePolicy', 'logging', 'releasePreflight']);
+const upstreamKeys = new Set(['baseUrl', 'apiKey', 'capabilities', 'thinking']);
+const capabilityKeys = new Set(['functionTools', 'parallelToolCalls']);
 const statePolicyKeys = new Set(['responseRetentionDays', 'attemptRetentionDays', 'cleanupThresholdBytes', 'hardLimitBytes']);
 const loggingKeys = new Set(['level', 'path', 'retentionDays']);
+const releasePreflightKeys = new Set(['model']);
 const logLevels = new Set<LogLevel>(['debug', 'info', 'error']);
 
 const object = (value: unknown, path: string): RecordValue => {
@@ -40,6 +41,14 @@ const capabilities = (value: unknown, path: string): CapabilityProfile | undefin
   return profile as CapabilityProfile;
 };
 
+const thinking = (value: unknown, path: string): UpstreamThinkingPolicy | undefined => {
+  if (value === undefined) return undefined;
+  const policy = object(value, path);
+  rejectUnknown(policy, new Set(['type']), path);
+  if (policy.type !== 'enabled' && policy.type !== 'disabled') throw new Error(`${path}.type must be enabled or disabled`);
+  return { type: policy.type };
+};
+
 const upstreams = (value: unknown): Upstream[] => {
   if (!Array.isArray(value) || value.length === 0) throw new Error('Configuration.upstreams must be a non-empty array');
   return value.map((entry, index) => {
@@ -50,6 +59,7 @@ const upstreams = (value: unknown): Upstream[] => {
       baseUrl: requiredText(upstream.baseUrl, `${path}.baseUrl`),
       apiKey: requiredText(upstream.apiKey, `${path}.apiKey`),
       capabilities: capabilities(upstream.capabilities, `${path}.capabilities`),
+      thinking: thinking(upstream.thinking, `${path}.thinking`),
     };
   });
 };
@@ -70,6 +80,13 @@ const logging = (value: unknown, configDir: string, statePath: string): LoggingP
   const configuredPath = policy.path === undefined ? join(dirname(statePath), 'logs') : requiredText(policy.path, 'Configuration.logging.path');
   const logPath = policy.path === undefined || isAbsolute(configuredPath) ? configuredPath : resolve(configDir, configuredPath);
   return { level: level as LogLevel, path: logPath, retentionDays };
+};
+
+const releasePreflight = (value: unknown): ReleasePreflightPolicy | undefined => {
+  if (value === undefined) return undefined;
+  const policy = object(value, 'Configuration.releasePreflight');
+  rejectUnknown(policy, releasePreflightKeys, 'Configuration.releasePreflight');
+  return { model: requiredText(policy.model, 'Configuration.releasePreflight.model') };
 };
 
 export const loadBridgeConfiguration = async (path = resolve('config.yaml')): Promise<BridgeOptions> => {
@@ -100,5 +117,6 @@ export const loadBridgeConfiguration = async (path = resolve('config.yaml')): Pr
     outputIdleTimeoutMs: optionalPositiveInteger(configuration.outputIdleTimeoutMs, 'Configuration.outputIdleTimeoutMs'),
     statePolicy: statePolicy(configuration.statePolicy),
     logging: logging(configuration.logging, dirname(path), statePath),
+    releasePreflight: releasePreflight(configuration.releasePreflight),
   };
 };

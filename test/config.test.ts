@@ -39,7 +39,7 @@ const startConfiguredBridge = async (configPath: string, env?: NodeJS.ProcessEnv
       reject(new Error(`Bridge exited before startup (${code}): ${output}`));
     });
   });
-  return child;
+  return { child, output: () => output };
 };
 
 const runRejectedConfiguration = async (source: string) => {
@@ -67,7 +67,7 @@ const runRejectedConfiguration = async (source: string) => {
   }
 };
 
-test('CLI starts from config.yaml and ignores legacy environment configuration', async () => {
+test('CLI logs the actual loopback address and port after startup', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
   const port = await reservePort();
   await writeFile(join(dir, 'config.yaml'), [
@@ -80,13 +80,20 @@ test('CLI starts from config.yaml and ignores legacy environment configuration',
     '',
   ].join('\n'));
   await chmod(join(dir, 'config.yaml'), 0o600);
-  const child = await startConfiguredBridge(join(dir, 'config.yaml'), {
+  const { child, output } = await startConfiguredBridge(join(dir, 'config.yaml'), {
       ...process.env,
       BRIDGE_API_KEY: 'environment-key',
       UPSTREAM_POOL: '[]',
       STATE_STORE_PATH: join(dir, 'environment.db'),
   });
   try {
+    const startupLogs = output().split('\n')
+      .filter((line) => line.includes('INFO [bridge] bridge_started'));
+    assert.equal(startupLogs.length, 1);
+    const [startupLog] = startupLogs;
+    assert.match(startupLog, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z INFO \[bridge\] bridge_started\b/);
+    assert.match(startupLog, /\baddress=127\.0\.0\.1\b/);
+    assert.match(startupLog, new RegExp(`\\bport=${port}\\b`));
     const ready = await fetch(`http://127.0.0.1:${port}/readyz`, { headers: { authorization: 'Bearer yaml-key' } });
     assert.equal(ready.status, 503);
   } finally {
@@ -163,6 +170,7 @@ test('CLI rejects missing, mistyped, and unknown YAML configuration before start
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    wireApi: responses\n', 'Configuration.upstreams[0].wireApi'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    wireApi: chat\n', 'Configuration.upstreams[0].wireApi'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    capabilities:\n      webSearch: true\n', 'Configuration.upstreams[0].capabilities.webSearch'],
+    ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\n    thinking:\n      type: automatic\n', 'Configuration.upstreams[0].thinking.type'],
     ['apiKey: yaml-key\nupstreams:\n  - baseUrl: http://127.0.0.1:1\n    apiKey: upstream-key\nlogging:\n  level: verbose\n', 'Configuration.logging.level'],
   ]) {
     const rejected = await runRejectedConfiguration(source);
@@ -201,6 +209,26 @@ test('loadBridgeConfiguration parses logging overrides for level, path, and rete
   }
 });
 
+test('loadBridgeConfiguration parses an explicit upstream Thinking policy', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
+  const configPath = join(dir, 'config.yaml');
+  try {
+    await writeFile(configPath, [
+      'apiKey: yaml-key',
+      'upstreams:',
+      '  - baseUrl: http://127.0.0.1:1',
+      '    apiKey: upstream-key',
+      '    thinking:',
+      '      type: disabled',
+      '',
+    ].join('\n'));
+    const configuration = await loadBridgeConfiguration(configPath);
+    assert.deepEqual(configuration.upstreams[0].thinking, { type: 'disabled' });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('loadBridgeConfiguration defaults logging to info, 7 days, and dirname(statePath)/logs/', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
   const configPath = join(dir, 'config.yaml');
@@ -220,6 +248,27 @@ test('loadBridgeConfiguration defaults logging to info, 7 days, and dirname(stat
       path: join(dir, 'logs'),
       retentionDays: 7,
     });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadBridgeConfiguration parses an explicit Release Preflight Model', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'response-bridge-config-'));
+  const configPath = join(dir, 'config.yaml');
+  try {
+    await writeFile(configPath, [
+      'apiKey: yaml-key',
+      'upstreams:',
+      '  - baseUrl: http://127.0.0.1:1',
+      '    apiKey: upstream-key',
+      `statePath: ${join(dir, 'state.db')}`,
+      'releasePreflight:',
+      '  model: smoke-model',
+      '',
+    ].join('\n'));
+    const configuration = await loadBridgeConfiguration(configPath);
+    assert.equal(configuration.releasePreflight?.model, 'smoke-model');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -290,7 +339,7 @@ test('CLI writes Traffic Log files to the configured logging.path', async () => 
     '',
   ].join('\n'));
   await chmod(join(dir, 'config.yaml'), 0o600);
-  const child = await startConfiguredBridge(join(dir, 'config.yaml'));
+  const { child } = await startConfiguredBridge(join(dir, 'config.yaml'));
   try {
     const logFiles = await readdir(logPath);
     assert.ok(logFiles.length > 0, 'expected log files under configured logging.path');

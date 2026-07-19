@@ -1,5 +1,5 @@
 import type { ServerResponse } from 'node:http';
-import type { AttemptCompletion, BridgeLogger, OutputItem, ResponseEvent } from './types.js';
+import type { AttemptCompletion, BridgeLogger, OutputItem, ResponseEvent, ResponsesUsage } from './types.js';
 import type { StateStore } from './state.js';
 import type { StreamEventSink } from './failover-execution.js';
 
@@ -41,8 +41,8 @@ export class HttpStreamEventSink implements StreamEventSink {
     }
   }
 
-  terminal(status: 'completed' | 'failed' | 'cancelled', outputText: string, event: ResponseEvent, attempt: AttemptCompletion | undefined) {
-    this.#store.terminal(this.#responseId, status, outputText, event, attempt);
+  terminal(status: 'completed' | 'failed' | 'cancelled' | 'incomplete', outputText: string, event: ResponseEvent, attempt: AttemptCompletion | undefined, usage?: ResponsesUsage) {
+    this.#store.terminal(this.#responseId, status, outputText, event, attempt, usage);
     this.#write(event);
   }
 

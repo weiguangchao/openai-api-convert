@@ -4,41 +4,49 @@ import winston from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
 import type { BridgeLog, LogFields, LogLevel, LoggingPolicy } from './types.js';
 
-export const toLogEntry = (level: LogLevel, event: string, fields: LogFields = {}) => ({
+const standardFields = new Set(['requestId', 'responseId', 'durationMs', 'errorCode']);
+
+export const toLogEntry = (level: LogLevel, event: string, fields: LogFields = {}) => Object.fromEntries(Object.entries({
   timestamp: new Date().toISOString(),
   level,
   event,
-  request_id: fields.requestId ?? null,
-  response_id: fields.responseId ?? null,
-  duration_ms: fields.durationMs ?? 0,
-  error_code: fields.errorCode ?? null,
-  ...Object.fromEntries(Object.entries(fields).filter(([key]) => !['requestId', 'responseId', 'durationMs', 'errorCode'].includes(key))),
-});
+  request_id: fields.requestId,
+  response_id: fields.responseId,
+  duration_ms: fields.durationMs,
+  error_code: fields.errorCode,
+  ...Object.fromEntries(Object.entries(fields).filter(([key]) => !standardFields.has(key))),
+}).filter(([, value]) => value !== null && value !== undefined));
+
+type BridgeLogEntry = ReturnType<typeof toLogEntry>;
+
+const isBareValue = (value: unknown): value is string | number => (typeof value === 'number' && Number.isFinite(value))
+  || (typeof value === 'string' && /^[A-Za-z0-9._:/@%+=?&-]+$/.test(value));
+
+const formatValue = (value: unknown) => isBareValue(value) ? String(value) : JSON.stringify(value);
+
+export const formatBridgeLogEntry = (entry: BridgeLogEntry) => {
+  const fields = Object.entries(entry)
+    .filter(([key]) => !['timestamp', 'level', 'event'].includes(key))
+    .map(([key, value]) => `${key}=${formatValue(value)}`);
+  const prefix = `${entry.timestamp} ${String(entry.level).toUpperCase()} [bridge] ${entry.event}`;
+  return fields.length ? `${prefix} ${fields.join(' ')}` : prefix;
+};
 
 export const createBridgeLogger = async (statePath: string, logging?: LoggingPolicy) => {
   const level = logging?.level ?? 'info';
   const retentionDays = logging?.retentionDays ?? 7;
   const logDir = logging?.path ?? join(dirname(statePath), 'logs');
   await mkdir(logDir, { recursive: true });
-  const entryFormat = winston.format((info) => {
-    const entry = (info as { bridgeEntry?: ReturnType<typeof toLogEntry> }).bridgeEntry;
-    if (!entry) return info;
-    Object.assign(info, entry);
-    info.message = entry.event;
-    return info;
-  })();
+  const lineFormat = winston.format.printf((info) => {
+    const entry = (info as { bridgeEntry?: BridgeLogEntry }).bridgeEntry;
+    return entry ? formatBridgeLogEntry(entry) : `${info.level.toUpperCase()} ${info.message}`;
+  });
   const logger = winston.createLogger({
     level,
     transports: [
       new winston.transports.Console({
         level,
-        format: winston.format.combine(
-          entryFormat,
-          winston.format.printf((info) => {
-            const entry = (info as { bridgeEntry?: ReturnType<typeof toLogEntry> }).bridgeEntry;
-            return JSON.stringify(entry ?? { level: info.level, event: info.message });
-          }),
-        ),
+        format: lineFormat,
       }),
       new DailyRotateFile({
         level,
@@ -46,14 +54,7 @@ export const createBridgeLogger = async (statePath: string, logging?: LoggingPol
         filename: 'bridge-%DATE%.log',
         datePattern: 'YYYY-MM-DD',
         maxFiles: `${retentionDays}d`,
-        format: winston.format.combine(
-          entryFormat,
-          winston.format.printf((info) => {
-            const entry = (info as { bridgeEntry?: ReturnType<typeof toLogEntry> }).bridgeEntry;
-            if (!entry) return `${info.level} ${info.message}`;
-            return `${entry.timestamp} ${entry.level.toUpperCase()} ${entry.event}\n${JSON.stringify(entry, null, 2)}`;
-          }),
-        ),
+        format: lineFormat,
       }),
     ],
   });

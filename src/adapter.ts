@@ -1,32 +1,65 @@
 import { createHash } from 'node:crypto';
-import type { ChatMessage, ChatToolCall, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, Result, StoredResponse, Tool } from './types.js';
+import type { ChatContentPart, ChatMessage, ChatToolCall, CustomTool, FunctionTool, InputItem, OutputItem, ResponseEvent, ResponsesPayload, ResponsesUsage, Result, StoredResponse, Tool } from './types.js';
 
-export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'web_search_call', 'reasoning']);
+export const INPUT_ECHO_TYPES = new Set(['function_call', 'custom_tool_call', 'tool_search_call', 'web_search_call', 'reasoning']);
 
 export const normalizeInput = (input: unknown): InputItem[] | undefined => {
   if (typeof input === 'string' && input.length > 0) return [{ type: 'message', role: 'user', content: input }];
   if (!Array.isArray(input) || input.length === 0) return undefined;
+  const inlineCallIndexes = new Set<number>();
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!item || typeof item !== 'object') continue;
+    const value = item as Record<string, unknown>;
+    if ((value.type !== 'function_call' && value.type !== 'custom_tool_call' && value.type !== 'tool_search_call') || typeof value.call_id !== 'string') continue;
+    const outputType = value.type === 'function_call' ? 'function_call_output' : value.type === 'custom_tool_call' ? 'custom_tool_call_output' : 'tool_search_output';
+    if (input.slice(index + 1).some((next) => next && typeof next === 'object'
+      && (next as Record<string, unknown>).type === outputType && (next as Record<string, unknown>).call_id === value.call_id)) {
+      inlineCallIndexes.add(index);
+    }
+  }
   type Classified = { kind: 'echo' } | { kind: 'item'; item: InputItem };
   const classified: Classified[] = [];
-  for (const item of input) {
+  for (const [index, item] of input.entries()) {
     if (!item || typeof item !== 'object') return undefined;
     const value = item as Record<string, unknown>;
-    if (value.type === 'message' && value.role === 'assistant') {
-      classified.push({ kind: 'echo' });
+    if (value.type === 'function_call' && inlineCallIndexes.has(index)
+      && typeof value.call_id === 'string' && typeof value.name === 'string' && typeof value.arguments === 'string'
+      && (value.namespace === undefined || typeof value.namespace === 'string')) {
+      classified.push({
+        kind: 'item',
+        item: {
+          type: 'function_call', call_id: value.call_id, name: value.name, arguments: value.arguments,
+          ...(typeof value.namespace === 'string' ? { namespace: value.namespace } : {}),
+        },
+      });
+      continue;
+    }
+    if (value.type === 'custom_tool_call' && inlineCallIndexes.has(index)
+      && typeof value.call_id === 'string' && typeof value.name === 'string' && typeof value.input === 'string') {
+      classified.push({ kind: 'item', item: { type: 'custom_tool_call', call_id: value.call_id, name: value.name, input: value.input } });
+      continue;
+    }
+    if (value.type === 'tool_search_call' && inlineCallIndexes.has(index)
+      && typeof value.call_id === 'string' && typeof value.arguments === 'string') {
+      classified.push({ kind: 'item', item: { type: 'tool_search_call', call_id: value.call_id, arguments: value.arguments } });
       continue;
     }
     if (typeof value.type === 'string' && INPUT_ECHO_TYPES.has(value.type)) {
       classified.push({ kind: 'echo' });
       continue;
     }
-    if (value.type === 'message' && (value.role === 'user' || value.role === 'developer') && Array.isArray(value.content)) {
-      const text = value.content.map((part) => {
-        if (!part || typeof part !== 'object') return undefined;
-        const content = part as Record<string, unknown>;
-        return content.type === 'input_text' && typeof content.text === 'string' ? content.text : undefined;
-      });
-      if (!text.length || text.some((part) => part === undefined)) return undefined;
-      classified.push({ kind: 'item', item: { type: 'message', role: value.role, content: text.join('') } });
+    if (value.type === 'message' && (value.role === 'user' || value.role === 'assistant' || value.role === 'system' || value.role === 'developer') && Array.isArray(value.content)) {
+      const content = normalizeMessageContent(value.content, value.role);
+      if (!content) return undefined;
+      classified.push({ kind: 'item', item: { type: 'message', role: value.role, content, ...(typeof value.id === 'string' ? { id: value.id } : {}) } });
+      continue;
+    }
+    if (value.type === 'tool_search_output') {
+      if (typeof value.call_id !== 'string') return undefined;
+      const tools = normalizeTools(value.tools);
+      if (!tools) return undefined;
+      classified.push({ kind: 'item', item: { type: 'tool_search_output', call_id: value.call_id, tools } });
       continue;
     }
     if ((value.type !== 'function_call_output' && value.type !== 'custom_tool_call_output') || typeof value.call_id !== 'string' || typeof value.output !== 'string') return undefined;
@@ -41,19 +74,79 @@ export const normalizeInput = (input: unknown): InputItem[] | undefined => {
   return items.length ? items : undefined;
 };
 
+const normalizeMessageContent = (content: unknown[], role: 'user' | 'assistant' | 'system' | 'developer'): string | ChatContentPart[] | undefined => {
+  if (!content.length) return role === 'assistant' ? [] : undefined;
+  const parts: ChatContentPart[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') return undefined;
+    const value = part as Record<string, unknown>;
+    if ((value.type === 'input_text' || (value.type === 'output_text' && role === 'assistant')) && typeof value.text === 'string') {
+      parts.push({ type: 'text', text: value.text });
+      continue;
+    }
+    if (value.type === 'refusal' && role === 'assistant' && typeof value.refusal === 'string') {
+      parts.push({ type: 'refusal', refusal: value.refusal });
+      continue;
+    }
+    if (value.type === 'input_image' && role === 'user' && typeof value.image_url === 'string'
+      && (value.detail === undefined || typeof value.detail === 'string')) {
+      parts.push({ type: 'image_url', image_url: { url: value.image_url, ...(typeof value.detail === 'string' ? { detail: value.detail } : {}) } });
+      continue;
+    }
+    if (value.type === 'input_file' && role === 'user'
+      && (value.file_id === undefined || typeof value.file_id === 'string')
+      && (value.filename === undefined || typeof value.filename === 'string')
+      && (value.file_data === undefined || typeof value.file_data === 'string')
+      && (typeof value.file_id === 'string' || typeof value.filename === 'string' || typeof value.file_data === 'string')) {
+      parts.push({ type: 'file', file: {
+        ...(typeof value.file_id === 'string' ? { file_id: value.file_id } : {}),
+        ...(typeof value.filename === 'string' ? { filename: value.filename } : {}),
+        ...(typeof value.file_data === 'string' ? { file_data: value.file_data } : {}),
+      } });
+      continue;
+    }
+    const audio = value.input_audio;
+    if (value.type === 'input_audio' && role === 'user' && audio && typeof audio === 'object'
+      && typeof (audio as Record<string, unknown>).data === 'string' && typeof (audio as Record<string, unknown>).format === 'string') {
+      parts.push({ type: 'input_audio', input_audio: { data: String((audio as Record<string, unknown>).data), format: String((audio as Record<string, unknown>).format) } });
+      continue;
+    }
+    return undefined;
+  }
+  return parts.every((part) => part.type === 'text') ? parts.map((part) => (part as { text: string }).text).join('') : parts;
+};
+
 export const TOOL_NAME_MAX = 64;
-export const ALIAS_HASH_LEN = 8;
+export const ALIAS_HASH_LEN = 16;
 
 export const normalizeFunctionTool = (value: Record<string, unknown>): FunctionTool | undefined => {
-  if (typeof value.name !== 'string' || value.name.length === 0) return undefined;
-  if (value.description !== undefined && typeof value.description !== 'string') return undefined;
-  if (value.strict !== undefined && typeof value.strict !== 'boolean') return undefined;
+  const nested = value.function;
+  const fn = nested && typeof nested === 'object' && !Array.isArray(nested) ? nested as Record<string, unknown> : undefined;
+  const name = fn && typeof fn.name === 'string' ? fn.name : (typeof value.name === 'string' ? value.name : undefined);
+  if (typeof name !== 'string' || name.length === 0) return undefined;
+  const description = fn ? fn.description : value.description;
+  const parameters = fn ? fn.parameters : value.parameters;
+  const strict = fn && fn.strict !== undefined ? fn.strict : value.strict;
+  if (description !== undefined && typeof description !== 'string') return undefined;
+  if (strict !== undefined && typeof strict !== 'boolean') return undefined;
   return {
-    type: 'function', name: value.name,
-    ...(typeof value.description === 'string' ? { description: value.description } : {}),
-    ...(value.parameters !== undefined ? { parameters: value.parameters } : {}),
-    ...(typeof value.strict === 'boolean' ? { strict: value.strict } : {}),
+    type: 'function', name,
+    ...(typeof description === 'string' ? { description } : {}),
+    ...(parameters !== undefined ? { parameters } : {}),
+    ...(typeof strict === 'boolean' ? { strict } : {}),
   };
+};
+
+// Function Tool Schema Normalization: the persisted Tool Context keeps the original
+// downstream `parameters` untouched, but the Chat proxy payload must always carry an
+// object JSON Schema so strict OpenAI-compatible upstreams accept the tool.
+export const normalizeChatFunctionParameters = (parameters: unknown): Record<string, unknown> => {
+  if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) {
+    return { type: 'object', properties: {} };
+  }
+  const normalized: Record<string, unknown> = { ...(parameters as Record<string, unknown>) };
+  if (normalized.type !== 'object') normalized.type = 'object';
+  return normalized;
 };
 
 export const normalizeTools = (tools: unknown): Tool[] | undefined => {
@@ -86,46 +179,78 @@ export const normalizeTools = (tools: unknown): Tool[] | undefined => {
       normalized.push({ type: 'namespace', name: value.name, description: value.description, tools: children });
       continue;
     }
-    if ((value.type !== 'function' && value.type !== 'custom') || typeof value.name !== 'string' || value.name.length === 0) return undefined;
-    if (value.description !== undefined && typeof value.description !== 'string') return undefined;
     if (value.type === 'function') {
       const normalizedFunction = normalizeFunctionTool(value);
       if (!normalizedFunction) return undefined;
       normalized.push(normalizedFunction);
-    } else {
+      continue;
+    }
+    if (value.type === 'custom') {
+      if (typeof value.name !== 'string' || value.name.length === 0) return undefined;
+      if (value.description !== undefined && typeof value.description !== 'string') return undefined;
       normalized.push({
         type: 'custom', name: value.name,
         ...(typeof value.description === 'string' ? { description: value.description } : {}),
         ...(value.format === undefined ? {} : { format: value.format }),
       });
+      continue;
     }
+    if (value.type === 'tool_search') {
+      // Tool Search is a client-executed discovery protocol proxied as a fixed Chat function;
+      // only the optional description is preserved. execution is never stored: this bridge
+      // always proxies tool_search as client-executed and restores execution:'client'.
+      if (value.description !== undefined && value.description !== null && typeof value.description !== 'string') return undefined;
+      normalized.push({ type: 'tool_search', ...(typeof value.description === 'string' ? { description: value.description } : {}) });
+      continue;
+    }
+    return undefined;
   }
   return normalized;
 };
 
-export const sanitizeToolNamePart = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-export const namespaceToolAlias = (namespace: string, name: string, reserved: Set<string>) => {
-  const hash = createHash('sha256').update(`${namespace}\0${name}`).digest('hex').slice(0, ALIAS_HASH_LEN);
-  const readable = sanitizeToolNamePart(`${namespace}_${name}`);
-  const maxPrefix = TOOL_NAME_MAX - 1 - hash.length;
-  let prefix = readable.slice(0, Math.max(maxPrefix, 0)).replace(/_+$/g, '');
-  if (!prefix || !/^[a-zA-Z0-9]/.test(prefix)) prefix = `ns_${prefix}`.slice(0, Math.max(maxPrefix, 2));
-  let alias = `${prefix}_${hash}`.slice(0, TOOL_NAME_MAX);
-  let n = 0;
-  while (reserved.has(alias)) {
-    n += 1;
-    const suffix = `_${hash}${n}`;
-    alias = `${prefix.slice(0, Math.max(TOOL_NAME_MAX - suffix.length, 1))}${suffix}`.slice(0, TOOL_NAME_MAX);
-    if (n > 1000) throw new Error('Tool Namespace alias conflict');
+// Tool Namespace alias mirrors CC Switch's flatten_namespace_tool_name: the Chat
+// function name is `namespace__name`; only names exceeding the 64-byte limit are
+// truncated and suffixed with a short SHA-256 hash so overlong aliases stay unique.
+export const namespaceToolAlias = (namespace: string, name: string) => {
+  const fullName = `${namespace}__${name}`;
+  if (Buffer.byteLength(fullName, 'utf8') <= TOOL_NAME_MAX) return fullName;
+  const hash = createHash('sha256').update(fullName).digest('hex').slice(0, ALIAS_HASH_LEN);
+  const suffix = `__${hash}`;
+  const prefixLen = TOOL_NAME_MAX - Buffer.byteLength(suffix, 'utf8');
+  let prefix = '';
+  let used = 0;
+  for (const ch of fullName) {
+    const size = Buffer.byteLength(ch, 'utf8');
+    if (used + size > prefixLen) break;
+    used += size;
+    prefix += ch;
   }
-  return alias;
+  return `${prefix}${suffix}`;
 };
 
-export const buildNamespaceAliasMaps = (tools: Tool[]) => {
+// Tool Context: the reversible mapping from the Chat function names actually sent to
+// the Completion upstream back to the original Function, Custom, Namespace, or Tool Search
+// semantics. Custom Tools proxy as plain Chat functions carrying their own name, so the
+// context only needs to remember which function names are Custom proxies; Tool Search is
+// the fixed `tool_search` proxy name. It is rebuilt from the persisted Response tools
+// during continuation rather than from the current request.
+export const buildToolContext = (tools: Tool[]) => {
   const reserved = new Set<string>();
+  const customNames = new Set<string>();
+  const toolSearchNames = new Set<string>();
   for (const tool of tools) {
-    if (tool.type === 'function' || tool.type === 'custom') reserved.add(tool.name);
+    if (tool.type === 'tool_search') {
+      // Tool Search proxies as the fixed `tool_search` Chat function, so that name is
+      // reserved and a client Function/Custom named `tool_search` would collide on reverse.
+      if (toolSearchNames.has(TOOL_SEARCH_PROXY_NAME) || reserved.has(TOOL_SEARCH_PROXY_NAME) || customNames.has(TOOL_SEARCH_PROXY_NAME)) throw new Error('Tool name conflict');
+      toolSearchNames.add(TOOL_SEARCH_PROXY_NAME);
+      continue;
+    }
+    if (tool.type !== 'function' && tool.type !== 'custom') continue;
+    if (reserved.has(tool.name) || customNames.has(tool.name) || toolSearchNames.has(tool.name)) throw new Error('Tool name conflict');
+    if (tool.type === 'custom') customNames.add(tool.name);
+    else reserved.add(tool.name);
   }
   const aliasToRef = new Map<string, { name: string; namespace: string }>();
   const refToAlias = new Map<string, string>();
@@ -134,21 +259,52 @@ export const buildNamespaceAliasMaps = (tools: Tool[]) => {
     for (const child of tool.tools) {
       const key = `${tool.name}\0${child.name}`;
       if (refToAlias.has(key)) throw new Error('Tool Namespace alias conflict');
-      const alias = namespaceToolAlias(tool.name, child.name, reserved);
+      const alias = namespaceToolAlias(tool.name, child.name);
+      if (reserved.has(alias) || customNames.has(alias) || toolSearchNames.has(alias)) throw new Error('Tool Namespace alias conflict');
       reserved.add(alias);
       aliasToRef.set(alias, { name: child.name, namespace: tool.name });
       refToAlias.set(key, alias);
     }
   }
-  return { aliasToRef, refToAlias };
+  return { aliasToRef, refToAlias, customNames, toolSearchNames };
+};
+
+// Custom Tool proxy description embeds the original Custom tool definition so the model
+// observes the original semantics while the upstream only sees a Function tool.
+export const buildCustomProxyDescription = (tool: CustomTool): string => {
+  const original: Record<string, unknown> = { type: 'custom', name: tool.name };
+  if (tool.description !== undefined) original.description = tool.description;
+  if (tool.format !== undefined) original.format = tool.format;
+  return JSON.stringify(original);
+};
+
+// Custom Tool proxy parameters: a single required string `input` carrying the free-form
+// Custom input. The schema is fixed regardless of the original `format`.
+export const CUSTOM_PROXY_PARAMETERS = { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] };
+
+// Tool Search proxies as a fixed Chat function named `tool_search` with an empty object
+// parameter schema so generic Chat upstreams can host the client-executed discovery loop.
+export const TOOL_SEARCH_PROXY_NAME = 'tool_search';
+export const TOOL_SEARCH_PROXY_PARAMETERS = { type: 'object', properties: {} };
+
+// Tool Search output is the loaded tool definitions; they are serialized into the Chat
+// `tool` message content so the upstream model observes what the discovery returned. The
+// same tools are also placed in the Chat `tools` array so they can be called directly.
+export const toolSearchOutputContent = (tools: Tool[]) => JSON.stringify(tools);
+
+// Reverse conversion prefers `{ input: string }`; empty, non-JSON, non-object, missing
+// or non-string input falls back to the raw arguments so free-form input is never lost.
+export const extractCustomInput = (args: string): string => {
+  let parsed: unknown;
+  try { parsed = JSON.parse(args); } catch { return args; }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return args;
+  const input = (parsed as Record<string, unknown>).input;
+  return typeof input === 'string' ? input : args;
 };
 
 export const toChatTools = (tools: Tool[]) => {
-  const { refToAlias } = buildNamespaceAliasMaps(tools);
-  const chatTools: Array<
-    | { type: 'function'; function: { name: string; description?: string; parameters?: unknown; strict?: boolean } }
-    | { type: 'custom'; custom: { name: string; description?: string; format?: unknown } }
-  > = [];
+  const { refToAlias } = buildToolContext(tools);
+  const chatTools: Array<{ type: 'function'; function: { name: string; description?: string; parameters?: unknown; strict?: boolean } }> = [];
   for (const tool of tools) {
     if (tool.type === 'web_search') continue;
     if (tool.type === 'namespace') {
@@ -160,11 +316,24 @@ export const toChatTools = (tools: Tool[]) => {
           function: {
             name: alias,
             ...(child.description === undefined ? {} : { description: child.description }),
-            ...(child.parameters === undefined ? {} : { parameters: child.parameters }),
+            parameters: normalizeChatFunctionParameters(child.parameters),
             ...(child.strict === undefined ? {} : { strict: child.strict }),
           },
         });
       }
+      continue;
+    }
+    if (tool.type === 'tool_search') {
+      // Tool Search proxied as the fixed `tool_search` Chat function; the optional
+      // client description is passed through so the model knows when to discover tools.
+      chatTools.push({
+        type: 'function',
+        function: {
+          name: TOOL_SEARCH_PROXY_NAME,
+          ...(tool.description === undefined ? {} : { description: tool.description }),
+          parameters: TOOL_SEARCH_PROXY_PARAMETERS,
+        },
+      });
       continue;
     }
     if (tool.type === 'function') {
@@ -173,17 +342,19 @@ export const toChatTools = (tools: Tool[]) => {
         function: {
           name: tool.name,
           ...(tool.description === undefined ? {} : { description: tool.description }),
-          ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
+          parameters: normalizeChatFunctionParameters(tool.parameters),
           ...(tool.strict === undefined ? {} : { strict: tool.strict }),
         },
       });
     } else {
+      // Custom Tool proxied as a Function with a single required string `input`;
+      // the original Custom definition is embedded in the description.
       chatTools.push({
-        type: 'custom',
-        custom: {
+        type: 'function',
+        function: {
           name: tool.name,
-          ...(tool.description === undefined ? {} : { description: tool.description }),
-          ...(tool.format === undefined ? {} : { format: tool.format }),
+          description: buildCustomProxyDescription(tool),
+          parameters: CUSTOM_PROXY_PARAMETERS,
         },
       });
     }
@@ -196,7 +367,7 @@ export const toChatToolChoice = (toolChoice: unknown, tools: Tool[]) => {
   const value = toolChoice as Record<string, unknown>;
   if (value.type !== 'function' || typeof value.name !== 'string') return undefined;
   if (typeof value.namespace === 'string') {
-    const alias = buildNamespaceAliasMaps(tools).refToAlias.get(`${value.namespace}\0${value.name}`);
+    const alias = buildToolContext(tools).refToAlias.get(`${value.namespace}\0${value.name}`);
     if (!alias) return null;
     return { type: 'function' as const, function: { name: alias } };
   }
@@ -206,19 +377,52 @@ export const toChatToolChoice = (toolChoice: unknown, tools: Tool[]) => {
 export const WEB_SEARCH_UNAVAILABLE_HINT = 'Hosted web search is unavailable on this upstream. Do not claim you performed a live web search, cite live results, or invent search calls.';
 
 export const toChatMessages = (response: StoredResponse): ChatMessage[] => {
-  const { refToAlias } = buildNamespaceAliasMaps(response.tools);
-  const messages: ChatMessage[] = response.input.map((item) => item.type === 'message'
-    ? { role: item.role === 'developer' ? 'system' : 'user', content: item.content }
-    : { role: 'tool', tool_call_id: item.call_id, content: item.output });
-  const toolCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call');
+  // The Tool Context for this Response is the declared tools plus any tools dynamically
+  // loaded by tool_search_output items in its own input; both are persisted, so the
+  // alias map is rebuilt from them rather than from the current request tools.
+  const loadedTools = response.input
+    .filter((item): item is Extract<InputItem, { type: 'tool_search_output' }> => item.type === 'tool_search_output')
+    .flatMap((item) => item.tools);
+  const { refToAlias } = buildToolContext([...response.tools, ...loadedTools]);
+  const messages: ChatMessage[] = response.input.flatMap((item): ChatMessage[] => {
+    if (item.type === 'message') return [{ role: item.role === 'developer' || item.role === 'system' ? 'system' : item.role, content: item.content }];
+    if (item.type === 'function_call') {
+      const alias = item.namespace ? refToAlias.get(`${item.namespace}\0${item.name}`) : undefined;
+      if (item.namespace && !alias) throw new Error('Tool Namespace alias missing');
+      return [{
+        role: 'assistant',
+        tool_calls: [{ id: item.call_id, type: 'function', function: { name: alias ?? item.name, arguments: item.arguments } }],
+      }];
+    }
+    if (item.type === 'custom_tool_call') return [{
+      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: JSON.stringify({ input: item.input }) } }],
+    }];
+    if (item.type === 'tool_search_call') return [{
+      role: 'assistant', tool_calls: [{ id: item.call_id, type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, arguments: item.arguments } }],
+    }];
+    if (item.type === 'tool_search_output') return [{
+      role: 'tool', tool_call_id: item.call_id, content: toolSearchOutputContent(item.tools),
+    }];
+    return [{ role: 'tool', tool_call_id: item.call_id, content: item.output }];
+  });
+  const reasoning = response.output.filter((item): item is Extract<OutputItem, { type: 'reasoning' }> => item.type === 'reasoning');
+  // A single Chat assistant turn carries reasoning, text and tool calls together, so the
+  // reasoning Output Items of this Response are reattached as the assistant message
+  // reasoning_content; this preserves the reasoning<->tool-call association reversibly.
+  const reasoningContent = reasoning.map((item) => item.summary.map((part) => part.text).join('')).join('');
+  const toolCalls = response.output.filter((item): item is Extract<OutputItem, { type: 'function_call' | 'custom_tool_call' | 'tool_search_call' }> => item.type === 'function_call' || item.type === 'custom_tool_call' || item.type === 'tool_search_call');
   const text = response.output.find((item): item is Extract<OutputItem, { type: 'message' }> => item.type === 'message');
-  if (text || toolCalls.length) {
+  if (reasoningContent || text || toolCalls.length) {
     messages.push({
       role: 'assistant',
+      ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
       ...(text ? { content: text.content.map((part) => part.text).join('') } : {}),
       ...(toolCalls.length ? { tool_calls: toolCalls.map((item): ChatToolCall => {
-        if (item.type !== 'function_call') {
-          return { id: item.call_id, type: 'custom', custom: { name: item.name, input: item.input } };
+        if (item.type === 'custom_tool_call') {
+          return { id: item.call_id, type: 'function', function: { name: item.name, arguments: JSON.stringify({ input: item.input }) } };
+        }
+        if (item.type === 'tool_search_call') {
+          return { id: item.call_id, type: 'function', function: { name: TOOL_SEARCH_PROXY_NAME, arguments: item.arguments } };
         }
         const alias = item.namespace ? refToAlias.get(`${item.namespace}\0${item.name}`) : undefined;
         if (item.namespace && !alias) throw new Error('Tool Namespace alias missing');
@@ -242,71 +446,269 @@ export const parseReasoningEffort = (reasoning: unknown): string | undefined | n
   return typeof effort === 'string' && REASONING_EFFORTS.has(effort) ? effort : null;
 };
 
-export type NamespaceAliases = ReturnType<typeof buildNamespaceAliasMaps>;
-type UpstreamToolCall = { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown }; custom?: { name?: unknown; input?: unknown } };
-type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] } }> };
+export type ToolContext = ReturnType<typeof buildToolContext>;
+type UpstreamToolCall = { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } };
+export type ReasoningSources = { reasoning_content?: unknown; reasoning?: unknown; reasoning_details?: unknown };
+type UpstreamChunk = { choices?: Array<{ delta?: { content?: unknown; tool_calls?: UpstreamToolCall[] } & ReasoningSources; finish_reason?: unknown }>; usage?: unknown };
 
+const usageNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : 0;
+export const toResponsesUsage = (usage: unknown): ResponsesUsage => {
+  const source = usage && typeof usage === 'object' ? usage as Record<string, unknown> : {};
+  const inputDetails = source.prompt_tokens_details && typeof source.prompt_tokens_details === 'object' ? source.prompt_tokens_details as Record<string, unknown> : {};
+  const outputDetails = source.completion_tokens_details && typeof source.completion_tokens_details === 'object' ? source.completion_tokens_details as Record<string, unknown> : {};
+  const cacheCreationTokens = usageNumber(inputDetails.cache_creation_tokens ?? source.cache_creation_input_tokens);
+  const inputTokens = usageNumber(source.prompt_tokens ?? source.input_tokens);
+  const outputTokens = usageNumber(source.completion_tokens ?? source.output_tokens);
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: usageNumber(source.total_tokens) || (inputTokens + outputTokens),
+    input_tokens_details: {
+      cached_tokens: usageNumber(inputDetails.cached_tokens ?? source.cache_read_input_tokens),
+      ...(cacheCreationTokens ? { cache_creation_tokens: cacheCreationTokens } : {}),
+    },
+    output_tokens_details: { reasoning_tokens: usageNumber(outputDetails.reasoning_tokens ?? source.reasoning_tokens) },
+  };
+};
+
+// Reasoning sources carried by a Chat delta or message object, distinct from content.
+// Leading <think> blocks inside content are parsed separately by LeadingThinkParser.
+export const extractReasoningText = (value: ReasoningSources): string => {
+  let reasoning = '';
+  if (typeof value.reasoning_content === 'string') reasoning += value.reasoning_content;
+  if (typeof value.reasoning === 'string') reasoning += value.reasoning;
+  if (Array.isArray(value.reasoning_details)) {
+    for (const detail of value.reasoning_details) {
+      if (detail && typeof detail === 'object' && typeof (detail as Record<string, unknown>).text === 'string') {
+        reasoning += (detail as Record<string, unknown>).text as string;
+      }
+    }
+  }
+  return reasoning;
+};
+
+export const THINK_OPEN = '<think>';
+export const THINK_CLOSE = '</think>';
+
+// One-shot split of a leading <think>...</think> block from content (non-stream path).
+// An unclosed leading <think> consumes the remainder as reasoning; content without a
+// leading <think> is returned untouched.
+export const splitLeadingThink = (content: string): { reasoning: string; text: string } => {
+  if (!content.startsWith(THINK_OPEN)) return { reasoning: '', text: content };
+  const after = content.slice(THINK_OPEN.length);
+  const close = after.indexOf(THINK_CLOSE);
+  if (close === -1) return { reasoning: after, text: '' };
+  return { reasoning: after.slice(0, close), text: after.slice(close + THINK_CLOSE.length) };
+};
+
+// Streaming leading-<think> parser. Each content delta is classified into reasoning
+// (inside the leading <think> block) and text (everything after, or all of it when no
+// leading <think> is present). Partial tags spanning chunk boundaries are buffered so a
+// tag is never split across reasoning/text output. Only the leading block is treated as
+// reasoning; any later <think> is ordinary text.
+export class LeadingThinkParser {
+  #phase: 'probing' | 'in_think' | 'after' = 'probing';
+  #buffer = '';
+
+  feed(chunk: string): { reasoning: string; text: string } {
+    if (this.#phase === 'after') return { reasoning: '', text: chunk };
+    if (this.#phase === 'probing') {
+      this.#buffer += chunk;
+      if (this.#buffer.startsWith(THINK_OPEN)) {
+        this.#phase = 'in_think';
+        const rest = this.#buffer.slice(THINK_OPEN.length);
+        this.#buffer = '';
+        return this.#drainInThink(rest);
+      }
+      if (this.#buffer.length < THINK_OPEN.length && THINK_OPEN.startsWith(this.#buffer)) {
+        return { reasoning: '', text: '' };
+      }
+      const text = this.#buffer;
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning: '', text };
+    }
+    return this.#drainInThink(chunk);
+  }
+
+  #drainInThink(chunk: string): { reasoning: string; text: string } {
+    this.#buffer += chunk;
+    const close = this.#buffer.indexOf(THINK_CLOSE);
+    if (close !== -1) {
+      const reasoning = this.#buffer.slice(0, close);
+      const text = this.#buffer.slice(close + THINK_CLOSE.length);
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning, text };
+    }
+    // Keep the tail that could still be a partial </think>; emit the rest as reasoning.
+    const safe = Math.max(0, this.#buffer.length - (THINK_CLOSE.length - 1));
+    const reasoning = this.#buffer.slice(0, safe);
+    this.#buffer = this.#buffer.slice(safe);
+    return { reasoning, text: '' };
+  }
+
+  flush(): { reasoning: string; text: string } {
+    if (this.#phase === 'probing') {
+      const text = this.#buffer;
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning: '', text };
+    }
+    if (this.#phase === 'in_think') {
+      // An unclosed leading <think> consumes the buffered remainder as reasoning.
+      const reasoning = this.#buffer;
+      this.#buffer = '';
+      this.#phase = 'after';
+      return { reasoning, text: '' };
+    }
+    return { reasoning: '', text: '' };
+  }
+}
+
+type TrackedCall = { id?: string; name?: string; kind: 'function' | 'custom' | 'tool_search'; input: string; outputIndex: number };
+
+// Chat-to-Responses streaming state machine. Reasoning, text and every tool-call kind
+// share one Output Item slot allocator: each item is assigned the next consecutive slot
+// the first time it is observable, later shards reuse that slot, and the terminal output
+// is finalized in slot order. Tool calls keep their Chat call index within the tool-call
+// range so parallel and out-of-order chunks retain a stable order. No completed item is
+// ever fabricated for output that did not finish.
 export class StreamTranslator {
   outputStarted = false;
   outputText = '';
+  reasoningText = '';
   output: OutputItem[] = [];
+  usage: ResponsesUsage = toResponsesUsage(undefined);
+  finishReason: 'completed' | 'incomplete' | undefined;
   #nextOutputIndex = 0;
+  #reasoningOutputIndex: number | undefined;
   #textOutputIndex: number | undefined;
-  #calls = new Map<number, { id?: string; name?: string; kind: 'function' | 'custom'; input: string; outputIndex: number }>();
+  #toolBaseOffset: number | undefined;
+  #calls = new Map<number, TrackedCall>();
+  #think = new LeadingThinkParser();
   #id: string;
-  #aliases: NamespaceAliases;
+  #toolContext: ToolContext;
 
-  constructor(id: string, aliases: NamespaceAliases) {
+  constructor(id: string, toolContext: ToolContext) {
     this.#id = id;
-    this.#aliases = aliases;
+    this.#toolContext = toolContext;
   }
 
   feed(data: string): ResponseEvent[] {
     const chunk = JSON.parse(data) as UpstreamChunk;
     const delta = chunk.choices?.[0]?.delta;
     const events: ResponseEvent[] = [];
+    if (chunk.usage !== undefined) this.usage = toResponsesUsage(chunk.usage);
+    if (chunk.choices?.some((choice) => choice.finish_reason !== undefined && choice.finish_reason !== null)) {
+      this.finishReason = chunk.choices.some((choice) => choice.finish_reason === 'length') ? 'incomplete' : 'completed';
+    }
+    const reasoningDelta = delta ? extractReasoningText(delta) : '';
+    if (reasoningDelta) events.push(...this.#appendReasoning(reasoningDelta));
     if (typeof delta?.content === 'string' && delta.content.length) {
-      if (this.#textOutputIndex === undefined) this.#textOutputIndex = this.#nextOutputIndex++;
-      this.outputStarted = true;
-      this.outputText += delta.content;
-      events.push({ type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta: delta.content });
+      const { reasoning, text } = this.#think.feed(delta.content);
+      if (reasoning) events.push(...this.#appendReasoning(reasoning));
+      if (text) events.push(...this.#appendText(text));
     }
     for (const call of delta?.tool_calls ?? []) {
       if (!Number.isInteger(call.index) || Number(call.index) < 0) throw new Error('Invalid upstream Tool call');
-      if (call.type !== undefined && call.type !== 'function' && call.type !== 'custom') throw new Error('Invalid upstream Tool call');
-      const kind = call.type === 'custom' ? 'custom' : 'function';
-      const current = this.#calls.get(Number(call.index)) ?? {
-        kind, input: '', outputIndex: Number(call.index) + (this.#textOutputIndex === undefined ? 0 : 1),
-      };
-      if (current.kind !== kind) throw new Error('Inconsistent upstream Tool call');
-      this.#nextOutputIndex = Math.max(this.#nextOutputIndex, current.outputIndex + 1);
+      // Custom Tools proxy as Chat functions, so the upstream only emits function calls;
+      // the Tool Context (customNames) restores Custom semantics on the reverse path.
+      if (call.type !== undefined && call.type !== 'function') throw new Error('Invalid upstream Tool call');
+      const index = Number(call.index);
+      const isNew = !this.#calls.has(index);
+      if (isNew) {
+        // Tool calls occupy a contiguous range starting at the slot reached when the first
+        // call is observed; the Chat call index orders parallel and out-of-order calls.
+        if (this.#toolBaseOffset === undefined) this.#toolBaseOffset = this.#nextOutputIndex;
+        const initialName = typeof call.function?.name === 'string' ? call.function.name : undefined;
+        const kind = initialName && this.#toolContext.toolSearchNames.has(initialName) ? 'tool_search'
+          : initialName && this.#toolContext.customNames.has(initialName) ? 'custom'
+          : 'function';
+        const outputIndex = this.#toolBaseOffset + index;
+        this.#calls.set(index, { kind, input: '', outputIndex });
+        this.#nextOutputIndex = Math.max(this.#nextOutputIndex, outputIndex + 1);
+      }
+      const current = this.#calls.get(index)!;
       if (typeof call.id === 'string') current.id = call.id;
-      const name = current.kind === 'function' ? call.function?.name : call.custom?.name;
-      const inputDelta = current.kind === 'function' ? call.function?.arguments : call.custom?.input;
-      if (typeof name === 'string') current.name = name;
+      if (typeof call.function?.name === 'string') current.name = call.function.name;
+      if (isNew) {
+        events.push({
+          type: 'response.output_item.added', output_index: current.outputIndex,
+          item: { id: current.id ?? `tc_${index}`, type: current.kind === 'function' ? 'function_call' : current.kind === 'custom' ? 'custom_tool_call' : 'tool_search_call', status: 'in_progress' },
+        });
+      }
+      const inputDelta = call.function?.arguments;
       if (typeof inputDelta === 'string') {
         this.outputStarted = true;
         current.input += inputDelta;
-        events.push({
-          type: current.kind === 'function' ? 'response.function_call_arguments.delta' : 'response.custom_tool_call_input.delta',
-          item_id: current.id ?? `tc_${Number(call.index)}`, output_index: current.outputIndex, delta: inputDelta,
-        });
+        // Custom proxy arguments are the `{ input: string }` transport envelope; only the
+        // final extracted input is exposed, so no input delta is streamed for Custom calls.
+        if (current.kind === 'function') {
+          events.push({
+            type: 'response.function_call_arguments.delta',
+            item_id: current.id ?? `tc_${index}`, output_index: current.outputIndex, delta: inputDelta,
+          });
+        }
       }
-      this.#calls.set(Number(call.index), current);
     }
     return events;
   }
 
+  #appendReasoning(delta: string): ResponseEvent[] {
+    this.outputStarted = true;
+    this.reasoningText += delta;
+    if (this.#reasoningOutputIndex === undefined) {
+      this.#reasoningOutputIndex = this.#nextOutputIndex++;
+      return [
+        { type: 'response.output_item.added', output_index: this.#reasoningOutputIndex, item: { id: `rs_${this.#id}`, type: 'reasoning', status: 'in_progress', summary: [] } },
+        { type: 'response.reasoning_summary_text.delta', item_id: `rs_${this.#id}`, output_index: this.#reasoningOutputIndex, summary_index: 0, delta },
+      ];
+    }
+    return [{ type: 'response.reasoning_summary_text.delta', item_id: `rs_${this.#id}`, output_index: this.#reasoningOutputIndex, summary_index: 0, delta }];
+  }
+
+  #appendText(delta: string): ResponseEvent[] {
+    this.outputStarted = true;
+    this.outputText += delta;
+    if (this.#textOutputIndex === undefined) {
+      this.#textOutputIndex = this.#nextOutputIndex++;
+      return [
+        { type: 'response.output_item.added', output_index: this.#textOutputIndex, item: { id: `msg_${this.#id}`, type: 'message', status: 'in_progress', role: 'assistant', content: [] } },
+        { type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta },
+      ];
+    }
+    return [{ type: 'response.output_text.delta', item_id: `msg_${this.#id}`, output_index: this.#textOutputIndex, content_index: 0, delta }];
+  }
+
   finalize(): ResponseEvent[] {
     const events: ResponseEvent[] = [];
+    // Flush any buffered <think> classification so an unclosed leading tag still produces
+    // reasoning and a deferred non-think prefix reaches the text item.
+    const flushed = this.#think.flush();
+    if (flushed.reasoning) events.push(...this.#appendReasoning(flushed.reasoning));
+    else if (flushed.text) events.push(...this.#appendText(flushed.text));
     const orderedOutput: Array<{ index: number; item: OutputItem }> = [];
+    if (this.reasoningText && this.#reasoningOutputIndex !== undefined) orderedOutput.push({
+      index: this.#reasoningOutputIndex,
+      item: { id: `rs_${this.#id}`, type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: this.reasoningText }] },
+    });
     if (this.outputText && this.#textOutputIndex !== undefined) orderedOutput.push({
       index: this.#textOutputIndex,
       item: { id: `msg_${this.#id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: this.outputText }] },
     });
     for (const [index, call] of [...this.#calls.entries()].sort(([left], [right]) => left - right)) {
       if (!call.id || !call.name) throw new Error('Incomplete upstream Tool call');
-      const resolved = call.kind === 'function' ? this.#aliases.aliasToRef.get(call.name) : undefined;
+      if (call.kind === 'tool_search') {
+        // Tool Search has no dedicated argument delta/done event in the Responses SSE
+        // lifecycle, so only the completed tool_search_call item is emitted.
+        orderedOutput.push({
+          index: call.outputIndex,
+          item: { id: call.id, type: 'tool_search_call', status: 'completed', call_id: call.id, execution: 'client', arguments: call.input },
+        });
+        continue;
+      }
+      const resolved = call.kind === 'function' ? this.#toolContext.aliasToRef.get(call.name) : undefined;
       orderedOutput.push({
         index: call.outputIndex,
         item: call.kind === 'function'
@@ -315,11 +717,14 @@ export class StreamTranslator {
             name: resolved?.name ?? call.name, arguments: call.input,
             ...(resolved ? { namespace: resolved.namespace } : {}),
           }
-          : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: call.input },
+          : { id: call.id, type: 'custom_tool_call', status: 'completed', call_id: call.id, name: call.name, input: extractCustomInput(call.input) },
       });
       events.push(call.kind === 'function'
         ? { type: 'response.function_call_arguments.done', item_id: call.id, output_index: call.outputIndex, arguments: call.input }
-        : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: call.input });
+        : { type: 'response.custom_tool_call_input.done', item_id: call.id, output_index: call.outputIndex, input: extractCustomInput(call.input) });
+    }
+    if (this.reasoningText && this.#reasoningOutputIndex !== undefined) {
+      events.push({ type: 'response.reasoning_summary_text.done', item_id: `rs_${this.#id}`, output_index: this.#reasoningOutputIndex, summary_index: 0, text: this.reasoningText });
     }
     this.output = orderedOutput.sort((left, right) => left.index - right.index).map(({ item }) => item);
     for (const [index, item] of this.output.entries()) {
@@ -329,38 +734,79 @@ export class StreamTranslator {
   }
 }
 
-type BuiltRequest = { upstreamBody: Record<string, unknown>; namespaceAliases: NamespaceAliases; model: string };
+type BuiltRequest = { upstreamBody: Record<string, unknown>; toolContext: ToolContext; model: string };
 
 export const buildChatRequest = (payload: ResponsesPayload, effectiveTools: Tool[], ancestors: StoredResponse[], input: InputItem[], degradeWebSearch: boolean, reasoningEffort: string | undefined): Result<BuiltRequest> => {
   let chatTools: ReturnType<typeof toChatTools>;
-  let namespaceAliases: ReturnType<typeof buildNamespaceAliasMaps>;
+  let toolContext: ReturnType<typeof buildToolContext>;
   let chatToolChoice: ReturnType<typeof toChatToolChoice> | 'auto' | undefined;
+  let hasChatTools = false;
   try {
     chatTools = toChatTools(effectiveTools);
-    namespaceAliases = buildNamespaceAliasMaps(effectiveTools);
+    toolContext = buildToolContext(effectiveTools);
     const forcedWebSearchChoice = payload.tool_choice !== undefined && typeof payload.tool_choice === 'object' && payload.tool_choice !== null
       && (payload.tool_choice as { type?: unknown }).type === 'web_search';
     const mappedToolChoice = toChatToolChoice(payload.tool_choice, effectiveTools);
     if (mappedToolChoice === null) {
       return { ok: false, error: { status: 400, message: 'tool_choice targets an unknown Tool Namespace function', code: 'unsupported_tools' } };
     }
-    chatToolChoice = degradeWebSearch && forcedWebSearchChoice ? 'auto' : mappedToolChoice;
-  } catch {
-    return { ok: false, error: { status: 400, message: 'Tool Namespace aliases conflict', code: 'unsupported_tools' } };
+    hasChatTools = chatTools.length > 0;
+    const forcedWebSearchDegrade = degradeWebSearch && forcedWebSearchChoice;
+    // Without Chat tools, tool_choice and parallel_tool_calls are no longer valid
+    // and strict upstreams reject them; drop both regardless of the client request.
+    chatToolChoice = !hasChatTools ? undefined
+      : forcedWebSearchDegrade ? 'auto'
+      : mappedToolChoice;
+  } catch (error) {
+    return { ok: false, error: { status: 400, message: error instanceof Error ? error.message : 'Tool name conflict', code: 'unsupported_tools' } };
   }
+  if (typeof payload.model !== 'string' || !payload.model) {
+    return { ok: false, error: { status: 400, message: 'model must be a non-empty string', code: 'invalid_model' } };
+  }
+  const model = payload.model;
+  // toChatMessages rebuilds Tool Context from response.tools plus tool_search_output in
+  // that response's own input; strip loaded tools already folded into effectiveTools so
+  // Inline Namespace aliases still resolve without duplicating Tool Search loads.
+  const loadedFromInput = input
+    .filter((item): item is Extract<InputItem, { type: 'tool_search_output' }> => item.type === 'tool_search_output')
+    .flatMap((item) => item.tools);
+  const toolsForCurrentInput = effectiveTools.filter((tool) => !loadedFromInput.includes(tool));
+  let rawMessages: ChatMessage[];
+  try {
+    rawMessages = [
+      ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
+      ...ancestors.flatMap(toChatMessages),
+      ...toChatMessages({ id: '', model, input, tools: toolsForCurrentInput, parallelToolCalls: false, output: [] }),
+    ];
+  } catch (error) {
+    return { ok: false, error: { status: 400, message: error instanceof Error ? error.message : 'Tool Namespace alias missing', code: 'unsupported_tools' } };
+  }
+  const instructions = typeof payload.instructions === 'string' && payload.instructions.length ? payload.instructions : undefined;
+  const systemPrefix = rawMessages.filter((message): message is Extract<ChatMessage, { role: 'system' }> => message.role === 'system');
   const messages: ChatMessage[] = [
-    ...(degradeWebSearch ? [{ role: 'system' as const, content: WEB_SEARCH_UNAVAILABLE_HINT }] : []),
-    ...ancestors.flatMap(toChatMessages),
-    ...toChatMessages({ id: '', model: '', input, tools: [], parallelToolCalls: false, output: [] }),
+    ...(instructions || systemPrefix.length ? [{ role: 'system' as const, content: [instructions, ...systemPrefix.map(({ content }) => typeof content === 'string' ? content : '')].filter(Boolean).join('\n') }] : []),
+    ...rawMessages.filter((message) => message.role !== 'system'),
   ];
-  const model = typeof payload.model === 'string' ? payload.model : 'gpt-4.1';
-  const parallelToolCalls = payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls);
+  const parallelToolCalls = hasChatTools
+    && (payload.parallel_tool_calls === true || ancestors.some((item) => item.parallelToolCalls));
+  const stream = payload.stream === true;
+  const explicitCeiling = payload.max_completion_tokens ?? payload.max_tokens;
+  const maxOutputTokens = explicitCeiling ?? payload.max_output_tokens;
+  const ceilingKey = payload.max_completion_tokens !== undefined ? 'max_completion_tokens'
+    : payload.max_tokens !== undefined ? 'max_tokens'
+      : /^o(?:\d|[-_])/i.test(model) ? 'max_completion_tokens' : 'max_tokens';
+  const controls = Object.fromEntries([
+    'temperature', 'top_p', 'presence_penalty', 'frequency_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'seed', 'stop', 'response_format', 'n', 'user',
+  ].flatMap((key) => payload[key as keyof ResponsesPayload] === undefined ? [] : [[key, payload[key as keyof ResponsesPayload]]]));
   const upstreamBody: Record<string, unknown> = {
-    model, stream: true, stream_options: { include_usage: true }, messages,
+    model, stream, messages,
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
+    ...(maxOutputTokens === undefined ? {} : { [ceilingKey]: maxOutputTokens }),
+    ...controls,
     ...(chatTools.length ? { tools: chatTools } : {}),
     ...(parallelToolCalls ? { parallel_tool_calls: true } : {}),
     ...(chatToolChoice === undefined ? {} : { tool_choice: chatToolChoice }),
     ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
   };
-  return { ok: true, value: { upstreamBody, namespaceAliases, model } };
+  return { ok: true, value: { upstreamBody, toolContext, model } };
 };
