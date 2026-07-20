@@ -81,6 +81,5 @@ config.test.yaml
 .pnp.*
 
 
-docs/research
 response-bridge.db
 logs/
